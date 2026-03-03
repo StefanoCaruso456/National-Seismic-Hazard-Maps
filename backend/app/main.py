@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
@@ -8,6 +9,7 @@ from pinecone import Pinecone
 from pydantic import BaseModel, Field, ValidationError
 
 from app.config import settings
+from app.ingest import FORTRAN_EXTENSIONS, chunk_fortran_file, discover_fortran_files, token_count
 
 
 class QueryRequest(BaseModel):
@@ -30,6 +32,21 @@ class QueryResponse(BaseModel):
 
 class SearchResponse(BaseModel):
     matches: list[Citation] = Field(default_factory=list)
+
+
+class PineconeDebugResponse(BaseModel):
+    configured_index: str
+    configured_namespace: str
+    available_indexes: list[str] = Field(default_factory=list)
+    index_description: dict[str, Any] = Field(default_factory=dict)
+    index_stats: dict[str, Any] = Field(default_factory=dict)
+
+
+class RepoScanResponse(BaseModel):
+    repo_root: str
+    fortran_extensions: list[str]
+    file_count: int
+    sample_files: list[str] = Field(default_factory=list)
 
 
 openai_client: OpenAI | None = None
@@ -75,6 +92,116 @@ def get_pinecone_index():
     if pinecone_client is None:
         pinecone_client = Pinecone(api_key=settings.pinecone_api_key)
     return pinecone_client.Index(settings.pinecone_index_name)
+
+
+def require_debug_mode() -> None:
+    if not settings.app_debug:
+        # Avoid exposing internal diagnostics on a public deployment by default.
+        raise HTTPException(status_code=404, detail="Not found")
+
+
+def safe_list_indexes(pc: Pinecone) -> list[str]:
+    try:
+        indexes = pc.list_indexes()
+    except Exception:
+        return []
+
+    # Pinecone clients have returned different shapes across versions: handle common cases.
+    if isinstance(indexes, list):
+        return [getattr(i, "name", str(i)) for i in indexes]
+    if hasattr(indexes, "names"):
+        try:
+            return list(indexes.names())
+        except Exception:
+            return []
+    if hasattr(indexes, "indexes"):
+        try:
+            return [i.get("name") for i in indexes.indexes if isinstance(i, dict) and i.get("name")]
+        except Exception:
+            return []
+    return []
+
+
+@app.get("/api/debug/pinecone", response_model=PineconeDebugResponse)
+def debug_pinecone() -> PineconeDebugResponse:
+    require_debug_mode()
+    if not settings.pinecone_api_key:
+        raise HTTPException(status_code=503, detail="PINECONE_API_KEY is not configured")
+
+    pc = Pinecone(api_key=settings.pinecone_api_key)
+    available = safe_list_indexes(pc)
+
+    description: dict[str, Any] = {}
+    try:
+        if hasattr(pc, "describe_index"):
+            desc_obj = pc.describe_index(settings.pinecone_index_name)
+            # Pydantic can serialize dicts; fallback to string for non-serializable objects.
+            description = desc_obj if isinstance(desc_obj, dict) else getattr(desc_obj, "to_dict", lambda: {})()
+            if not description:
+                description = {"raw": str(desc_obj)}
+    except Exception as exc:
+        description = {"error": str(exc)}
+
+    stats: dict[str, Any] = {}
+    try:
+        index = pc.Index(settings.pinecone_index_name)
+        if hasattr(index, "describe_index_stats"):
+            stats_obj = index.describe_index_stats()
+            stats = stats_obj if isinstance(stats_obj, dict) else getattr(stats_obj, "to_dict", lambda: {})()
+            if not stats:
+                stats = {"raw": str(stats_obj)}
+    except Exception as exc:
+        stats = {"error": str(exc)}
+
+    return PineconeDebugResponse(
+        configured_index=settings.pinecone_index_name,
+        configured_namespace=settings.pinecone_namespace,
+        available_indexes=available,
+        index_description=description,
+        index_stats=stats,
+    )
+
+
+@app.get("/api/debug/repo-scan", response_model=RepoScanResponse)
+def debug_repo_scan() -> RepoScanResponse:
+    require_debug_mode()
+    repo_root = Path(__file__).resolve().parents[2]
+    files = discover_fortran_files(repo_root=repo_root, extensions=set(FORTRAN_EXTENSIONS))
+    sample = [str(p.relative_to(repo_root)).replace("\\", "/") for p in files[:12]]
+    return RepoScanResponse(
+        repo_root=str(repo_root),
+        fortran_extensions=sorted(FORTRAN_EXTENSIONS),
+        file_count=len(files),
+        sample_files=sample,
+    )
+
+
+@app.get("/api/debug/sample-chunks")
+def debug_sample_chunks(file_path: str) -> dict:
+    require_debug_mode()
+    repo_root = Path(__file__).resolve().parents[2]
+    target = (repo_root / file_path).resolve()
+    if not target.is_file() or repo_root not in target.parents:
+        raise HTTPException(status_code=400, detail="Invalid file_path")
+
+    chunks = chunk_fortran_file(
+        path=target,
+        repo_root=repo_root,
+        min_tokens=200,
+        max_tokens=500,
+    )
+    preview = [
+        {
+            "file_path": c.file_path,
+            "line_start": c.line_start,
+            "line_end": c.line_end,
+            "section_name": c.section_name,
+            "token_count": token_count(c.chunk_text),
+            "text_preview": c.chunk_text[:260],
+        }
+        for c in chunks[:8]
+    ]
+    return {"chunk_count": len(chunks), "preview": preview}
 
 
 def embed_question(question: str) -> list[float]:
@@ -228,7 +355,8 @@ def query(payload: QueryRequest) -> QueryResponse:
         return QueryResponse(
             answer=(
                 "I could not find relevant indexed code for that question. "
-                "Try a more specific function name, file name, or keyword."
+                "Try a more specific function name, file name, or keyword. "
+                "If this keeps happening, your Pinecone namespace may be empty (run ingestion first)."
             ),
             citations=[],
         )

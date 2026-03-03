@@ -46,9 +46,15 @@ Local audit (validates file discovery + chunk sizing; optionally checks Pinecone
 python -m app.audit --repo-root .. --namespace nshmp-main
 ```
 
+End-to-end retrieval smoke test (adds semantic query probe + PASS/FAIL gate summary):
+
+```bash
+python -m app.audit --repo-root .. --namespace nshmp-main --smoke-query "Where is subroutine hazallXL defined?" --top-k 5
+```
+
 Runtime debug endpoints are disabled by default. To enable them, set `APP_DEBUG=true` (local `.env` or Railway env var):
 
-- `GET /api/debug/pinecone` shows index visibility and `describe_index_stats` (vector counts by namespace)
+- `GET /api/debug/pinecone` shows index visibility, raw stats, and parsed `namespace_vector_count`
 - `GET /api/debug/repo-scan` confirms the deployed container can see Fortran files
 - `GET /api/debug/sample-chunks?file_path=src/...` shows a sample chunk preview for one file
 

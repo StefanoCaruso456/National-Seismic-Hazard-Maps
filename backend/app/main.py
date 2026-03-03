@@ -40,6 +40,8 @@ class PineconeDebugResponse(BaseModel):
     available_indexes: list[str] = Field(default_factory=list)
     index_description: dict[str, Any] = Field(default_factory=dict)
     index_stats: dict[str, Any] = Field(default_factory=dict)
+    namespace_vector_count: int | None = None
+    total_vector_count: int | None = None
 
 
 class RepoScanResponse(BaseModel):
@@ -122,6 +124,28 @@ def safe_list_indexes(pc: Pinecone) -> list[str]:
     return []
 
 
+def safe_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def extract_vector_counts(stats: dict[str, Any], namespace: str) -> tuple[int | None, int | None]:
+    if not isinstance(stats, dict):
+        return None, None
+
+    namespace_count: int | None = None
+    namespaces = stats.get("namespaces")
+    if isinstance(namespaces, dict):
+        ns_entry = namespaces.get(namespace)
+        if isinstance(ns_entry, dict):
+            namespace_count = safe_int(ns_entry.get("vector_count"))
+
+    total_count = safe_int(stats.get("total_vector_count"))
+    return namespace_count, total_count
+
+
 @app.get("/api/debug/pinecone", response_model=PineconeDebugResponse)
 def debug_pinecone() -> PineconeDebugResponse:
     require_debug_mode()
@@ -153,12 +177,16 @@ def debug_pinecone() -> PineconeDebugResponse:
     except Exception as exc:
         stats = {"error": str(exc)}
 
+    namespace_vector_count, total_vector_count = extract_vector_counts(stats, settings.pinecone_namespace)
+
     return PineconeDebugResponse(
         configured_index=settings.pinecone_index_name,
         configured_namespace=settings.pinecone_namespace,
         available_indexes=available,
         index_description=description,
         index_stats=stats,
+        namespace_vector_count=namespace_vector_count,
+        total_vector_count=total_vector_count,
     )
 
 

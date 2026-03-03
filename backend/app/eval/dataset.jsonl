@@ -1,0 +1,5 @@
+{"question":"Where is subroutine hazallXL defined?","expected_paths":["src/hazallXL.v5.f","src/hazallXL.v4.f","src/hazallXL.v2.f"],"category":"locate-symbol"}
+{"question":"Where is deaggregation logic implemented?","expected_paths":["src/deaggGRID.f","src/deaggSUBD.f","src/deaggFLTH.f"],"category":"locate-symbol"}
+{"question":"Which files are involved in running WUS hazard scripts?","expected_paths":["scripts/hazrun_wus_2014.sh","conf/WUS"],"category":"workflow"}
+{"question":"What config controls CEUS gridded inputs?","expected_paths":["conf/CEUS/gridded"],"category":"config"}
+{"question":"Where are utility functions for mean RJB handling?","expected_paths":["src/util/getmeanrjf.f","src/util/getmeanrjf.v2.f"],"category":"locate-symbol"}

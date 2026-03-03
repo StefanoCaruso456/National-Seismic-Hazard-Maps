@@ -26,10 +26,10 @@
         <button class="action-btn" id="newChatBtn">+ New chat</button>
 
         <nav class="menu">
-          <button class="menu-item active">Chat</button>
-          <button class="menu-item">Search</button>
-          <button class="menu-item">Code Patterns</button>
-          <button class="menu-item">Dependencies</button>
+          <button class="menu-item active" data-mode="chat">Chat</button>
+          <button class="menu-item" data-mode="search">Search</button>
+          <button class="menu-item" data-mode="patterns">Code Patterns</button>
+          <button class="menu-item" data-mode="dependencies">Dependencies</button>
         </nav>
 
         <div class="sidebar-footer">
@@ -43,8 +43,10 @@
           <button class="icon-btn mobile-only" id="toggleSidebar" aria-label="Toggle sidebar">☰</button>
           <h2>LegacyLens Assistant</h2>
           <div class="topbar-actions">
-            <button class="icon-btn" title="Refresh">⟳</button>
-            <button class="icon-btn" title="Settings">⚙</button>
+            <button class="icon-btn" id="refreshBtn" title="Refresh last prompt">⟳</button>
+            <button class="icon-btn" id="debugToggleBtn" title="Toggle debug panel">⌘</button>
+            <button class="icon-btn" id="exportBtn" title="Export session">⤓</button>
+            <button class="icon-btn" id="settingsBtn" title="Settings">⚙</button>
           </div>
         </header>
 
@@ -56,11 +58,52 @@
           </p>
         </section>
 
+        <section class="insight-strip" id="insightStrip">
+          <div class="insight-left">
+            <span class="mode-pill" id="modePill">Mode: Chat</span>
+            <span class="evidence-pill unknown" id="evidencePill">Evidence: n/a</span>
+            <label for="topKSelect" class="topk-label">Top K</label>
+            <select id="topKSelect" class="topk-select" aria-label="Retrieved chunks">
+              <option value="3">3</option>
+              <option value="5" selected>5</option>
+              <option value="8">8</option>
+              <option value="10">10</option>
+              <option value="12">12</option>
+            </select>
+            <button class="tiny-btn" id="scoreInfoBtn" type="button">How scoring works</button>
+          </div>
+          <div class="insight-right" id="statusLine">Ready</div>
+        </section>
+
+        <section class="score-explainer hidden" id="scoreExplainer">
+          <p>
+            Relevance is a hybrid score from semantic similarity + lexical overlap, normalized to 0-100.
+            Top K controls how many chunks are retrieved per request.
+          </p>
+        </section>
+
+        <section class="pinned-sources hidden" id="pinnedSourcesSection">
+          <div class="pinned-head">
+            <strong>Pinned Sources</strong>
+            <button class="tiny-btn" type="button" id="clearPinsBtn">Clear pins</button>
+          </div>
+          <div class="pinned-list" id="pinnedSources"></div>
+        </section>
+
+        <section class="debug-panel hidden" id="debugPanel">
+          <div class="debug-head">
+            <strong>Debug Trace</strong>
+            <span id="debugStateLabel">off</span>
+          </div>
+          <pre id="debugContent">Debug trace will appear here when enabled.</pre>
+        </section>
+
         <section class="chat-thread" id="chatThread" aria-live="polite"></section>
 
         <footer class="chat-input-wrap">
+          <div class="attachment-list" id="attachmentList"></div>
           <div class="chat-input" role="group" aria-label="Chat input">
-            <input id="fileInput" type="file" hidden />
+            <input id="fileInput" type="file" multiple hidden />
             <button class="icon-btn" id="attachBtn" title="Attach file">＋</button>
             <textarea
               id="questionInput"
@@ -74,10 +117,37 @@
       </main>
     </div>
 
+    <div class="overlay hidden" id="overlay"></div>
+    <aside class="settings-drawer hidden" id="settingsDrawer" aria-label="Settings panel">
+      <div class="settings-head">
+        <h3>Retrieval Settings</h3>
+        <button class="icon-btn" id="closeSettingsBtn" title="Close settings">✕</button>
+      </div>
+      <label class="settings-row">
+        <span>Top K</span>
+        <input id="topKRange" type="range" min="1" max="20" value="5" />
+        <output id="topKValue">5</output>
+      </label>
+      <label class="settings-row toggle-row">
+        <span>Show snippets by default</span>
+        <input id="showSnippetsToggle" type="checkbox" checked />
+      </label>
+      <label class="settings-row toggle-row">
+        <span>Compact citation chips</span>
+        <input id="compactCitationsToggle" type="checkbox" />
+      </label>
+      <label class="settings-row toggle-row">
+        <span>Enable debug trace in requests</span>
+        <input id="debugTraceToggle" type="checkbox" />
+      </label>
+      <button class="action-btn" id="clearSessionBtn" type="button">Clear session</button>
+    </aside>
+
     <template id="messageTemplate">
       <article class="message">
         <div class="avatar"></div>
         <div class="bubble-wrap">
+          <div class="message-meta"></div>
           <p class="bubble"></p>
           <div class="citations"></div>
         </div>

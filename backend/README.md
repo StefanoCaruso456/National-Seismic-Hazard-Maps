@@ -58,6 +58,12 @@ End-to-end retrieval smoke test (adds semantic query probe + PASS/FAIL gate summ
 python -m app.audit --repo-root .. --namespace nshmp-main --smoke-query "Where is subroutine hazallXL defined?" --top-k 5
 ```
 
+Retrieval eval harness (Recall@5/10 + nDCG@10):
+
+```bash
+python -m app.eval.run_eval --dataset app/eval/dataset.jsonl --top-k 10 --out /tmp/legacylens_eval.json
+```
+
 Runtime debug endpoints are disabled by default. To enable them, set `APP_DEBUG=true` (local `.env` or Railway env var):
 
 - `GET /api/debug/pinecone` shows index visibility, raw stats, and parsed `namespace_vector_count`
@@ -68,7 +74,13 @@ Runtime debug endpoints are disabled by default. To enable them, set `APP_DEBUG=
 
 - `POST /api/search` semantic vector search (returns snippets + file/line citations)
 - `POST /api/query` RAG answer generation using retrieved Pinecone context
+- `POST /api/search/upload` multipart search with temporary retrieval scope from attached files
+- `POST /api/query/upload` multipart RAG answer with attached-file chunking + retrieval
+- `GET /api/retrieval-info` retrieval scoring/limits metadata for the UI (`repo_url`, upload limits, score weights)
 - `GET /health` deployment health
+
+`/api/search` and `/api/query` accept `debug=true` in JSON to return retrieval traces.
+`/api/search/upload` and `/api/query/upload` accept multipart field `debug=true` for the same trace payload.
 
 ## Retrieval quality and reliability defaults
 
@@ -80,6 +92,9 @@ The backend uses:
 - Dedup by `file_path + line range`
 - Minimum hybrid score filter (fallback to best available results if no match passes threshold)
 - Optional namespace fallback (`PINECONE_FALLBACK_NAMESPACE`)
+- Attachment-aware temporary retrieval scope (uploads are chunked/embedded per request and merged into ranking)
+- Query rewrite/decomposition for implementation/workflow/config style questions
+- Evidence strength scoring (`High|Medium|Low`) and insufficient-evidence refusal policy
 
 ## Railway settings
 

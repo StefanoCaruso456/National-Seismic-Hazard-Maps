@@ -1,5 +1,7 @@
 const chatThread = document.getElementById("chatThread");
 const hero = document.getElementById("hero");
+const heroTitle = hero.querySelector("h3");
+const heroCopy = hero.querySelector("p");
 const input = document.getElementById("questionInput");
 const sendBtn = document.getElementById("sendBtn");
 const micBtn = document.getElementById("micBtn");
@@ -9,78 +11,920 @@ const newChatBtn = document.getElementById("newChatBtn");
 const sidebar = document.getElementById("sidebar");
 const toggleSidebar = document.getElementById("toggleSidebar");
 const template = document.getElementById("messageTemplate");
+const menuItems = Array.from(document.querySelectorAll(".menu-item"));
+const refreshBtn = document.getElementById("refreshBtn");
+const debugToggleBtn = document.getElementById("debugToggleBtn");
+const settingsBtn = document.getElementById("settingsBtn");
+const exportBtn = document.getElementById("exportBtn");
+const modePill = document.getElementById("modePill");
+const evidencePill = document.getElementById("evidencePill");
+const topKSelect = document.getElementById("topKSelect");
+const topKRange = document.getElementById("topKRange");
+const topKValue = document.getElementById("topKValue");
+const scoreInfoBtn = document.getElementById("scoreInfoBtn");
+const scoreExplainer = document.getElementById("scoreExplainer");
+const statusLine = document.getElementById("statusLine");
+const attachmentList = document.getElementById("attachmentList");
+const pinnedSourcesSection = document.getElementById("pinnedSourcesSection");
+const pinnedSources = document.getElementById("pinnedSources");
+const clearPinsBtn = document.getElementById("clearPinsBtn");
+const debugPanel = document.getElementById("debugPanel");
+const debugContent = document.getElementById("debugContent");
+const debugStateLabel = document.getElementById("debugStateLabel");
+const overlay = document.getElementById("overlay");
+const settingsDrawer = document.getElementById("settingsDrawer");
+const closeSettingsBtn = document.getElementById("closeSettingsBtn");
+const showSnippetsToggle = document.getElementById("showSnippetsToggle");
+const compactCitationsToggle = document.getElementById("compactCitationsToggle");
+const debugTraceToggle = document.getElementById("debugTraceToggle");
+const clearSessionBtn = document.getElementById("clearSessionBtn");
 
-let listening = false;
-let recognition;
+const MODE_CONFIG = {
+  chat: {
+    label: "Chat",
+    placeholder: "Ask anything about National-Seismic-Hazard-Maps...",
+    heroTitle: "What do you want to understand in this legacy codebase?",
+    heroCopy:
+      "Ask about entry points, file I/O, data flow, business rules, and dependencies. Responses include citations with file and line references.",
+  },
+  search: {
+    label: "Search",
+    placeholder: "Search for files, routines, common blocks, or keywords...",
+    heroTitle: "Inspect retrieval hits before asking for synthesis",
+    heroCopy:
+      "Search mode returns raw ranked chunks so you can verify relevance before generating an answer.",
+  },
+  patterns: {
+    label: "Code Patterns",
+    placeholder: "Find recurring coding patterns, common blocks, and routine styles...",
+    heroTitle: "Mine recurring implementation patterns",
+    heroCopy:
+      "Pattern mode extracts repeated structures from retrieved chunks, including common blocks and routine signatures.",
+  },
+  dependencies: {
+    label: "Dependencies",
+    placeholder: "Trace call/use/common dependencies across retrieved code...",
+    heroTitle: "Trace dependency signals quickly",
+    heroCopy:
+      "Dependency mode surfaces call sites, module usage, and shared common blocks from the top retrieved chunks.",
+  },
+};
+
+const DEFAULT_UPLOAD_LIMITS = {
+  maxFiles: 8,
+  maxFileBytes: 1_500_000,
+  maxTotalBytes: 6_000_000,
+};
+
+const state = {
+  mode: "chat",
+  topK: 5,
+  showSnippets: true,
+  compactCitations: false,
+  listening: false,
+  recognition: null,
+  attachments: [],
+  lastRequest: null,
+  history: [],
+  loading: false,
+  retrievalInfo: null,
+  repoUrl: "https://github.com/StefanoCaruso456/National-Seismic-Hazard-Maps",
+  pinnedSources: [],
+  debugPanelOpen: false,
+  debugTraceEnabled: false,
+  lastDebugPayload: null,
+};
 
 function autoResize() {
   input.style.height = "auto";
   input.style.height = `${Math.min(input.scrollHeight, 180)}px`;
 }
 
-function citationText(c) {
-  const file = c.file_path || "unknown";
-  const start = c.line_start ?? "?";
-  const end = c.line_end ?? "?";
-  const score = typeof c.score === "number" ? c.score.toFixed(3) : "n/a";
-  return `${file}:${start}-${end} (score ${score})`;
+function currentTopKMax() {
+  const max = Number(topKRange.max);
+  if (!Number.isFinite(max) || max < 1) return 20;
+  return Math.round(max);
 }
 
-function renderCitation(citationsWrap, item) {
-  const badge = document.createElement("span");
-  badge.textContent = citationText(item);
-  citationsWrap.appendChild(badge);
-
-  if (!item.snippet) return;
-
-  const snippet = document.createElement("pre");
-  snippet.className = "citation-snippet";
-  snippet.textContent = item.snippet;
-  citationsWrap.appendChild(snippet);
+function clampTopK(value) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return 5;
+  return Math.min(currentTopKMax(), Math.max(1, Math.round(num)));
 }
 
-function addMessage(role, text, citations = []) {
+function uploadLimits() {
+  return {
+    maxFiles: Number(state.retrievalInfo?.upload_max_files) || DEFAULT_UPLOAD_LIMITS.maxFiles,
+    maxFileBytes: Number(state.retrievalInfo?.upload_max_file_bytes) || DEFAULT_UPLOAD_LIMITS.maxFileBytes,
+    maxTotalBytes: Number(state.retrievalInfo?.upload_max_total_bytes) || DEFAULT_UPLOAD_LIMITS.maxTotalBytes,
+  };
+}
+
+function normalizedEvidenceLabel(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (raw === "high") return "high";
+  if (raw === "medium") return "medium";
+  if (raw === "low") return "low";
+  return "unknown";
+}
+
+function updateEvidencePill(evidence = null) {
+  const label = normalizedEvidenceLabel(evidence?.label);
+  const score = typeof evidence?.score === "number" ? ` (${Math.round(evidence.score * 100)}%)` : "";
+  evidencePill.className = `evidence-pill ${label}`;
+  const title = evidence?.reason || "Evidence strength unavailable";
+  evidencePill.title = title;
+  evidencePill.textContent =
+    label === "unknown" ? "Evidence: n/a" : `Evidence: ${label[0].toUpperCase()}${label.slice(1)}${score}`;
+}
+
+function encodeRepoPath(path) {
+  return String(path || "")
+    .split("/")
+    .map((part) => encodeURIComponent(part))
+    .join("/");
+}
+
+function sourceLink(item) {
+  const file = item?.file_path || "";
+  if (!file || file.startsWith("uploaded/")) return "";
+  const start = Number(item.line_start) || 1;
+  const end = Number(item.line_end) || start;
+  const repoUrl = state.repoUrl || "https://github.com/StefanoCaruso456/National-Seismic-Hazard-Maps";
+  return `${repoUrl}/blob/main/${encodeRepoPath(file)}#L${start}-L${end}`;
+}
+
+function sourceKey(item) {
+  return `${item.file_path || "unknown"}:${item.line_start || "?"}-${item.line_end || "?"}`;
+}
+
+function renderPinnedSources() {
+  pinnedSources.innerHTML = "";
+  if (!state.pinnedSources.length) {
+    pinnedSourcesSection.classList.add("hidden");
+    return;
+  }
+
+  pinnedSourcesSection.classList.remove("hidden");
+  for (const item of state.pinnedSources) {
+    const node = document.createElement("span");
+    node.className = "pinned-item";
+    const link = sourceLink(item);
+    if (link) {
+      const anchor = document.createElement("a");
+      anchor.href = link;
+      anchor.target = "_blank";
+      anchor.rel = "noopener noreferrer";
+      anchor.textContent = sourceKey(item);
+      node.appendChild(anchor);
+    } else {
+      node.textContent = sourceKey(item);
+    }
+    pinnedSources.appendChild(node);
+  }
+}
+
+function pinSource(item) {
+  const key = sourceKey(item);
+  const exists = state.pinnedSources.some((pinned) => sourceKey(pinned) === key);
+  if (exists) {
+    setStatus("Source already pinned");
+    return;
+  }
+  state.pinnedSources.push(item);
+  renderPinnedSources();
+  setStatus("Source pinned");
+}
+
+function setDebugPanelState(open) {
+  state.debugPanelOpen = Boolean(open);
+  debugPanel.classList.toggle("hidden", !state.debugPanelOpen);
+  debugToggleBtn.classList.toggle("active", state.debugPanelOpen);
+  debugStateLabel.textContent = state.debugPanelOpen ? "on" : "off";
+}
+
+function renderDebugPayload(payload) {
+  state.lastDebugPayload = payload || null;
+  if (!payload) {
+    debugContent.textContent = "Debug trace not returned for this response.";
+    return;
+  }
+  debugContent.textContent = JSON.stringify(payload, null, 2);
+}
+
+function formatDuration(ms) {
+  if (!Number.isFinite(ms)) return "-";
+  if (ms < 1000) return `${Math.round(ms)} ms`;
+  return `${(ms / 1000).toFixed(2)} s`;
+}
+
+function normalizeScore(value) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  return Math.min(1, Math.max(0, value));
+}
+
+function scorePercent(score) {
+  if (score === null) return "n/a";
+  return `${Math.round(score * 100)}%`;
+}
+
+function confidenceLabel(score) {
+  if (score === null) return "Unknown";
+  if (score >= 0.8) return "High";
+  if (score >= 0.6) return "Medium";
+  return "Low";
+}
+
+function setBusy(isBusy) {
+  state.loading = Boolean(isBusy);
+  sendBtn.disabled = state.loading;
+  refreshBtn.disabled = state.loading;
+}
+
+function setStatus(text, tone = "") {
+  statusLine.textContent = text;
+  statusLine.dataset.tone = tone;
+}
+
+function bumpCounter(counter, key) {
+  if (!key) return;
+  const normalized = key.toLowerCase().trim();
+  if (!normalized) return;
+  counter.set(normalized, (counter.get(normalized) || 0) + 1);
+}
+
+function collectMatches(matches, regex, counter) {
+  for (const item of matches) {
+    const source = item.snippet || "";
+    regex.lastIndex = 0;
+    let hit;
+    while ((hit = regex.exec(source)) !== null) {
+      bumpCounter(counter, hit[1]);
+    }
+  }
+}
+
+function topEntries(counter, limit = 5) {
+  return [...counter.entries()].sort((a, b) => b[1] - a[1]).slice(0, limit);
+}
+
+function formatEntryList(counter, limit = 5) {
+  const entries = topEntries(counter, limit);
+  if (!entries.length) return "none detected";
+  return entries.map(([name, count]) => `${name} (${count})`).join(", ");
+}
+
+function syncTopKInputs(nextValue) {
+  const safe = clampTopK(nextValue);
+  state.topK = safe;
+  topKSelect.value = String(safe);
+  topKRange.value = String(safe);
+  topKValue.value = String(safe);
+}
+
+function populateTopKSelect(maxValue) {
+  const safeMax = Math.max(1, Number(maxValue) || 20);
+  topKSelect.innerHTML = "";
+
+  for (let value = 1; value <= safeMax; value += 1) {
+    const option = document.createElement("option");
+    option.value = String(value);
+    option.textContent = String(value);
+    if (value === state.topK) {
+      option.selected = true;
+    }
+    topKSelect.appendChild(option);
+  }
+}
+
+function applyDisplayPreferences() {
+  document.body.classList.toggle("compact-mode", state.compactCitations);
+  document.querySelectorAll(".citation-snippet").forEach((node) => {
+    node.hidden = !state.showSnippets;
+  });
+  document.querySelectorAll(".toggle-snippet-btn").forEach((btn) => {
+    btn.textContent = state.showSnippets ? "Hide snippet" : "Show snippet";
+  });
+}
+
+function updateExplainerText() {
+  if (!state.retrievalInfo) {
+    scoreExplainer.querySelector("p").textContent =
+      "Relevance is a hybrid score from semantic similarity + lexical overlap, normalized to 0-100. Top K controls how many chunks are retrieved per request.";
+    return;
+  }
+
+  const info = state.retrievalInfo;
+  const lexicalPct = Math.round(info.lexical_weight * 100);
+  const semanticPct = 100 - lexicalPct;
+  const minPct = Math.round(info.min_hybrid_score * 100);
+  const maxFiles = Number(info.upload_max_files) || DEFAULT_UPLOAD_LIMITS.maxFiles;
+  const maxFileKb = Math.round(
+    (Number(info.upload_max_file_bytes) || DEFAULT_UPLOAD_LIMITS.maxFileBytes) / 1024,
+  );
+  scoreExplainer.querySelector("p").textContent =
+    `Hybrid relevance uses ${semanticPct}% semantic similarity + ${lexicalPct}% lexical overlap. Results below ~${minPct}% are filtered unless nothing stronger exists. Candidate pool expands by x${info.candidate_multiplier} before reranking. Attachments are chunked in temporary scope (up to ${maxFiles} files, ~${maxFileKb}KB each).`;
+}
+
+function setMode(mode) {
+  if (!MODE_CONFIG[mode]) return;
+  state.mode = mode;
+
+  for (const item of menuItems) {
+    item.classList.toggle("active", item.dataset.mode === mode);
+  }
+
+  const config = MODE_CONFIG[mode];
+  modePill.textContent = `Mode: ${config.label}`;
+  input.placeholder = config.placeholder;
+  heroTitle.textContent = config.heroTitle;
+  heroCopy.textContent = config.heroCopy;
+
+  setStatus(`${config.label} mode ready`);
+
+  if (window.matchMedia("(max-width: 980px)").matches) {
+    sidebar.classList.remove("open");
+  }
+}
+
+function resetSession() {
+  chatThread.innerHTML = "";
+  hero.style.display = "block";
+  input.value = "";
+  autoResize();
+  state.attachments = [];
+  state.pinnedSources = [];
+  state.history = [];
+  state.lastRequest = null;
+  state.lastDebugPayload = null;
+  renderAttachmentList();
+  renderPinnedSources();
+  renderDebugPayload(null);
+  updateEvidencePill(null);
+  setStatus("Session cleared");
+}
+
+function roleLabel(role) {
+  return role === "assistant" ? "Assistant" : "You";
+}
+
+function buildMetaText(role, meta) {
+  const parts = [roleLabel(role)];
+  if (meta.modeLabel) parts.push(meta.modeLabel);
+  if (typeof meta.resultCount === "number") parts.push(`${meta.resultCount} sources`);
+  if (meta.evidenceLabel) parts.push(`evidence ${meta.evidenceLabel}`);
+  if (typeof meta.elapsedMs === "number") parts.push(formatDuration(meta.elapsedMs));
+  parts.push(new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }));
+  return parts.join(" • ");
+}
+
+function citationRange(item) {
+  const file = item.file_path || "unknown";
+  const start = item.line_start ?? "?";
+  const end = item.line_end ?? "?";
+  return `${file}:${start}-${end}`;
+}
+
+async function copyText(text, successMessage = "Copied to clipboard") {
+  if (!text) return;
+  try {
+    if (!navigator.clipboard || !navigator.clipboard.writeText) {
+      throw new Error("Clipboard unavailable");
+    }
+    await navigator.clipboard.writeText(text);
+    setStatus(successMessage);
+  } catch (_err) {
+    setStatus("Clipboard not available in this browser", "warn");
+  }
+}
+
+function renderCitation(citationsWrap, item, index) {
+  const score = normalizeScore(item.score);
+  const rangeText = citationRange(item);
+
+  if (state.compactCitations) {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "citation-chip";
+    chip.textContent = `#${index} ${rangeText} • ${scorePercent(score)}`;
+    chip.title = "Copy citation";
+    chip.addEventListener("click", () => {
+      copyText(rangeText, "Citation copied");
+    });
+    citationsWrap.appendChild(chip);
+    return;
+  }
+
+  const card = document.createElement("article");
+  card.className = "citation-card";
+
+  const header = document.createElement("div");
+  header.className = "citation-head";
+
+  const lead = document.createElement("div");
+  lead.className = "citation-lead";
+
+  const rank = document.createElement("span");
+  rank.className = "citation-rank";
+  rank.textContent = `#${index}`;
+
+  const path = document.createElement("span");
+  path.className = "citation-path";
+  path.textContent = rangeText;
+
+  const scorePill = document.createElement("span");
+  scorePill.className = "citation-score";
+  scorePill.textContent = `${scorePercent(score)} ${confidenceLabel(score)}`;
+
+  lead.append(rank, path, scorePill);
+  header.appendChild(lead);
+
+  const actions = document.createElement("div");
+  actions.className = "citation-actions";
+
+  const copyBtn = document.createElement("button");
+  copyBtn.type = "button";
+  copyBtn.className = "tiny-btn";
+  copyBtn.textContent = "Copy ref";
+  copyBtn.addEventListener("click", () => {
+    copyText(rangeText, "Citation copied");
+  });
+  actions.appendChild(copyBtn);
+
+  const openUrl = sourceLink(item);
+  const openBtn = document.createElement("button");
+  openBtn.type = "button";
+  openBtn.className = "tiny-btn";
+  openBtn.textContent = "Open file";
+  if (openUrl) {
+    openBtn.addEventListener("click", () => {
+      window.open(openUrl, "_blank", "noopener,noreferrer");
+    });
+  } else {
+    openBtn.disabled = true;
+    openBtn.title = "Open file unavailable for uploaded temporary sources";
+  }
+  actions.appendChild(openBtn);
+
+  const pinBtn = document.createElement("button");
+  pinBtn.type = "button";
+  pinBtn.className = "tiny-btn";
+  pinBtn.textContent = "Pin source";
+  pinBtn.addEventListener("click", () => {
+    pinSource(item);
+  });
+  actions.appendChild(pinBtn);
+
+  const scoreTrack = document.createElement("div");
+  scoreTrack.className = "score-track";
+  const scoreFill = document.createElement("div");
+  scoreFill.className = "score-fill";
+  scoreFill.style.width = score === null ? "0%" : `${Math.round(score * 100)}%`;
+  scoreTrack.appendChild(scoreFill);
+
+  card.append(header, actions, scoreTrack);
+
+  const snippetText = (item.snippet || "").trim();
+  if (snippetText) {
+    const snippet = document.createElement("pre");
+    snippet.className = "citation-snippet";
+    snippet.hidden = !state.showSnippets;
+    snippet.textContent = snippetText;
+
+    const toggleBtn = document.createElement("button");
+    toggleBtn.type = "button";
+    toggleBtn.className = "tiny-btn toggle-snippet-btn";
+    toggleBtn.textContent = state.showSnippets ? "Hide snippet" : "Show snippet";
+    toggleBtn.addEventListener("click", () => {
+      snippet.hidden = !snippet.hidden;
+      toggleBtn.textContent = snippet.hidden ? "Show snippet" : "Hide snippet";
+    });
+
+    actions.appendChild(toggleBtn);
+    card.appendChild(snippet);
+  }
+
+  citationsWrap.appendChild(card);
+}
+
+function addMessage(role, text, citations = [], meta = {}) {
   const node = template.content.cloneNode(true);
   const article = node.querySelector(".message");
   const bubble = node.querySelector(".bubble");
   const citationsWrap = node.querySelector(".citations");
+  const metaRow = node.querySelector(".message-meta");
 
   article.classList.add(role);
   bubble.textContent = text;
+  metaRow.textContent = buildMetaText(role, meta);
 
-  citations.forEach((item) => renderCitation(citationsWrap, item));
+  if (role === "assistant") {
+    const copyAnswerBtn = document.createElement("button");
+    copyAnswerBtn.type = "button";
+    copyAnswerBtn.className = "tiny-btn";
+    copyAnswerBtn.textContent = "Copy answer";
+    copyAnswerBtn.addEventListener("click", () => {
+      copyText(text, "Answer copied");
+    });
+    metaRow.appendChild(copyAnswerBtn);
+  }
+
+  if (citations.length) {
+    citations.forEach((item, index) => renderCitation(citationsWrap, item, index + 1));
+  } else {
+    citationsWrap.remove();
+  }
 
   chatThread.appendChild(node);
   chatThread.scrollTop = chatThread.scrollHeight;
+
+  state.history.push({
+    role,
+    text,
+    citations,
+    meta,
+    timestamp: new Date().toISOString(),
+  });
 }
 
-async function submitQuestion() {
-  const question = input.value.trim();
-  if (!question) return;
+function buildSearchSummary(question, matches) {
+  if (!matches.length) {
+    return `No retrieval matches found for "${question}". Try specific routine names, file names, or common block identifiers.`;
+  }
 
-  hero.style.display = "none";
-  addMessage("user", question);
-  input.value = "";
-  autoResize();
-  sendBtn.disabled = true;
+  const top = matches.slice(0, 3).map((item, idx) => {
+    const score = scorePercent(normalizeScore(item.score));
+    return `${idx + 1}. ${citationRange(item)} • ${score}`;
+  });
 
+  return `Retrieved ${matches.length} ranked chunk(s) for "${question}".\nTop hits:\n${top.join("\n")}`;
+}
+
+function generatePatternInsights(question, matches) {
+  if (!matches.length) {
+    return `No pattern insights could be generated for "${question}" because no chunks were retrieved.`;
+  }
+
+  const commonBlocks = new Map();
+  const subroutines = new Map();
+  const functions = new Map();
+  const modules = new Map();
+  const files = new Map();
+  let dimensionMentions = 0;
+
+  for (const item of matches) {
+    bumpCounter(files, item.file_path || "unknown");
+    const snippet = item.snippet || "";
+
+    const dimHits = snippet.match(/\bdimension\s*\(/gi);
+    if (dimHits) dimensionMentions += dimHits.length;
+  }
+
+  collectMatches(matches, /common\s*\/\s*([a-z0-9_]+)/gi, commonBlocks);
+  collectMatches(matches, /\bsubroutine\s+([a-z0-9_]+)/gi, subroutines);
+  collectMatches(matches, /\bfunction\s+([a-z0-9_]+)/gi, functions);
+  collectMatches(matches, /\bmodule\s+([a-z0-9_]+)/gi, modules);
+
+  const lines = [
+    `Pattern insight for "${question}" from ${matches.length} retrieved chunk(s):`,
+    `- Frequent common blocks: ${formatEntryList(commonBlocks)}`,
+    `- Subroutine signatures: ${formatEntryList(subroutines)}`,
+    `- Function signatures: ${formatEntryList(functions)}`,
+    `- Modules: ${formatEntryList(modules)}`,
+    `- Array dimension declarations found: ${dimensionMentions}`,
+    `- Most represented files: ${formatEntryList(files)}`,
+  ];
+
+  return lines.join("\n");
+}
+
+function generateDependencyInsights(question, matches) {
+  if (!matches.length) {
+    return `No dependency insight could be generated for "${question}" because no chunks were retrieved.`;
+  }
+
+  const calls = new Map();
+  const uses = new Map();
+  const includes = new Map();
+  const commonBlocks = new Map();
+
+  collectMatches(matches, /\bcall\s+([a-z0-9_]+)/gi, calls);
+  collectMatches(matches, /\buse\s+([a-z0-9_]+)/gi, uses);
+  collectMatches(matches, /\binclude\s+['\"]?([^'\"\n\s]+)/gi, includes);
+  collectMatches(matches, /common\s*\/\s*([a-z0-9_]+)/gi, commonBlocks);
+
+  const lines = [
+    `Dependency scan for "${question}" across ${matches.length} chunk(s):`,
+    `- CALL targets: ${formatEntryList(calls)}`,
+    `- USE modules: ${formatEntryList(uses)}`,
+    `- INCLUDE files: ${formatEntryList(includes)}`,
+    `- Shared COMMON blocks: ${formatEntryList(commonBlocks)}`,
+    "- Next step: ask a focused follow-up like 'where is <target> defined?' to expand one dependency edge.",
+  ];
+
+  return lines.join("\n");
+}
+
+async function postJson(url, payload) {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  let data = null;
   try {
-    const res = await fetch("/api/query", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question, top_k: 5 }),
-    });
+    data = await response.json();
+  } catch (_err) {
+    // Ignore parse failure; handled below by status text.
+  }
 
-    if (!res.ok) {
-      throw new Error(`Request failed with status ${res.status}`);
+  if (!response.ok) {
+    const detail = data && data.detail ? data.detail : `Request failed with status ${response.status}`;
+    throw new Error(detail);
+  }
+
+  return data || {};
+}
+
+async function postMultipart(url, payload) {
+  const formData = new FormData();
+  formData.append("question", payload.question);
+  formData.append("top_k", String(payload.topK));
+  formData.append("debug", payload.debug ? "true" : "false");
+
+  for (const file of payload.files || []) {
+    formData.append("files", file, file.name);
+  }
+
+  const response = await fetch(url, {
+    method: "POST",
+    body: formData,
+  });
+
+  let data = null;
+  try {
+    data = await response.json();
+  } catch (_err) {
+    // Ignore parse failure; handled below by status text.
+  }
+
+  if (!response.ok) {
+    const detail = data && data.detail ? data.detail : `Request failed with status ${response.status}`;
+    throw new Error(detail);
+  }
+
+  return data || {};
+}
+
+async function runModeQuery(mode, question, files = []) {
+  const hasUploads = Array.isArray(files) && files.length > 0;
+  const debug = state.debugTraceEnabled;
+  const searchRequest = async (topK) => {
+    if (hasUploads) {
+      return postMultipart("/api/search/upload", {
+        question,
+        topK,
+        files,
+        debug,
+      });
     }
 
-    const data = await res.json();
-    addMessage("assistant", data.answer || "No answer returned.", data.citations || []);
+    return postJson("/api/search", {
+      question,
+      top_k: topK,
+      debug,
+    });
+  };
+
+  if (mode === "chat") {
+    const data = hasUploads
+      ? await postMultipart("/api/query/upload", {
+          question,
+          topK: state.topK,
+          files,
+          debug,
+        })
+      : await postJson("/api/query", {
+          question,
+          top_k: state.topK,
+          debug,
+        });
+
+    return {
+      text: data.answer || "No answer returned.",
+      citations: data.citations || [],
+      evidence: data.evidence_strength || {},
+      debug: data.debug || null,
+    };
+  }
+
+  if (mode === "search") {
+    const data = await searchRequest(state.topK);
+    const matches = data.matches || [];
+    return {
+      text: buildSearchSummary(question, matches),
+      citations: matches,
+      evidence: data.evidence_strength || {},
+      debug: data.debug || null,
+    };
+  }
+
+  if (mode === "patterns") {
+    const expandedTopK = Math.min(20, Math.max(state.topK, 6));
+    const data = await searchRequest(expandedTopK);
+    const matches = data.matches || [];
+    return {
+      text: generatePatternInsights(question, matches),
+      citations: matches,
+      evidence: data.evidence_strength || {},
+      debug: data.debug || null,
+    };
+  }
+
+  const expandedTopK = Math.min(20, Math.max(state.topK, 6));
+  const data = await searchRequest(expandedTopK);
+  const matches = data.matches || [];
+  return {
+    text: generateDependencyInsights(question, matches),
+    citations: matches,
+    evidence: data.evidence_strength || {},
+    debug: data.debug || null,
+  };
+}
+
+async function submitQuestion(options = {}) {
+  const currentMode = options.modeOverride || state.mode;
+  if (currentMode !== state.mode) {
+    setMode(currentMode);
+  }
+
+  const question = (options.questionOverride || input.value).trim();
+  if (!question) {
+    setStatus("Type a question first", "warn");
+    return;
+  }
+
+  const displayQuestion =
+    state.attachments.length && !options.questionOverride
+      ? `${question}\n[Attached: ${state.attachments.map((item) => item.name).join(", ")}]`
+      : question;
+
+  hero.style.display = "none";
+  addMessage("user", displayQuestion, [], { modeLabel: MODE_CONFIG[state.mode].label });
+  if (!options.questionOverride) {
+    input.value = "";
+    autoResize();
+  }
+
+  setBusy(true);
+  state.lastRequest = { mode: state.mode, question };
+  setStatus(
+    `Running ${MODE_CONFIG[state.mode].label.toLowerCase()} request${
+      state.attachments.length ? ` with ${state.attachments.length} upload(s)` : ""
+    }...`,
+  );
+
+  const started = performance.now();
+
+  try {
+    const result = await runModeQuery(
+      state.mode,
+      question,
+      state.attachments.map((item) => item.file),
+    );
+    const elapsedMs = performance.now() - started;
+
+    addMessage("assistant", result.text, result.citations, {
+      modeLabel: MODE_CONFIG[state.mode].label,
+      elapsedMs,
+      resultCount: result.citations.length,
+      evidenceLabel: normalizedEvidenceLabel(result.evidence?.label),
+    });
+    updateEvidencePill(result.evidence || null);
+
+    if (state.debugPanelOpen || state.debugTraceEnabled) {
+      renderDebugPayload(result.debug || null);
+      if (!state.debugPanelOpen && result.debug) {
+        setDebugPanelState(true);
+      }
+    }
+
+    const count = result.citations.length;
+    setStatus(
+      `${MODE_CONFIG[state.mode].label}: ${count} source${count === 1 ? "" : "s"} in ${formatDuration(
+        elapsedMs,
+      )}`,
+    );
+
+    if (state.attachments.length) {
+      state.attachments = [];
+      renderAttachmentList();
+    }
   } catch (err) {
     addMessage("assistant", `Error: ${err.message}`);
+    setStatus("Request failed", "warn");
   } finally {
-    sendBtn.disabled = false;
+    setBusy(false);
+  }
+}
+
+function renderAttachmentList() {
+  attachmentList.innerHTML = "";
+
+  for (let i = 0; i < state.attachments.length; i += 1) {
+    const item = state.attachments[i];
+    const chip = document.createElement("span");
+    chip.className = "attachment-chip";
+
+    const label = document.createElement("span");
+    label.textContent = item.name;
+
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "attachment-remove";
+    remove.textContent = "x";
+    remove.dataset.attachmentIndex = String(i);
+    remove.title = "Remove attachment";
+
+    chip.append(label, remove);
+    attachmentList.appendChild(chip);
+  }
+}
+
+function openSettings() {
+  settingsDrawer.classList.remove("hidden");
+  overlay.classList.remove("hidden");
+}
+
+function closeSettings() {
+  settingsDrawer.classList.add("hidden");
+  overlay.classList.add("hidden");
+}
+
+async function refreshLastPrompt() {
+  if (!state.lastRequest) {
+    setStatus("No previous prompt to refresh", "warn");
+    return;
+  }
+
+  await submitQuestion({
+    modeOverride: state.lastRequest.mode,
+    questionOverride: state.lastRequest.question,
+  });
+}
+
+function exportSession() {
+  if (!state.history.length) {
+    setStatus("Session is empty", "warn");
+    return;
+  }
+
+  const payload = {
+    exported_at: new Date().toISOString(),
+    mode: state.mode,
+    top_k: state.topK,
+    debug_trace_enabled: state.debugTraceEnabled,
+    pinned_sources: state.pinnedSources,
+    retrieval_info: state.retrievalInfo,
+    messages: state.history,
+  };
+
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  const stamp = new Date().toISOString().replace(/[T:.]/g, "-").slice(0, 19);
+  link.href = url;
+  link.download = `legacylens-session-${stamp}.json`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+
+  setStatus("Session exported");
+}
+
+async function loadRetrievalInfo() {
+  try {
+    const response = await fetch("/api/retrieval-info");
+    if (!response.ok) {
+      populateTopKSelect(currentTopKMax());
+      updateExplainerText();
+      return;
+    }
+    state.retrievalInfo = await response.json();
+    if (state.retrievalInfo.repo_url) {
+      state.repoUrl = String(state.retrievalInfo.repo_url);
+    }
+    if (state.retrievalInfo.query_top_k_max) {
+      topKRange.max = String(Math.max(1, Number(state.retrievalInfo.query_top_k_max)));
+    }
+    populateTopKSelect(currentTopKMax());
+    syncTopKInputs(state.topK);
+    updateExplainerText();
+  } catch (_err) {
+    populateTopKSelect(currentTopKMax());
+    updateExplainerText();
   }
 }
 
@@ -92,26 +936,33 @@ function initSpeech() {
     return;
   }
 
-  recognition = new SpeechRecognition();
-  recognition.continuous = false;
-  recognition.lang = "en-US";
+  state.recognition = new SpeechRecognition();
+  state.recognition.continuous = false;
+  state.recognition.lang = "en-US";
 
-  recognition.onresult = (event) => {
+  state.recognition.onresult = (event) => {
     const transcript = event.results[0][0].transcript;
     input.value = `${input.value} ${transcript}`.trim();
     autoResize();
   };
 
-  recognition.onend = () => {
-    listening = false;
+  state.recognition.onend = () => {
+    state.listening = false;
     micBtn.textContent = "🎙";
   };
 
-  recognition.onerror = () => {
-    listening = false;
+  state.recognition.onerror = () => {
+    state.listening = false;
     micBtn.textContent = "🎙";
+    setStatus("Microphone input failed", "warn");
   };
 }
+
+menuItems.forEach((item) => {
+  item.addEventListener("click", () => {
+    setMode(item.dataset.mode);
+  });
+});
 
 input.addEventListener("input", autoResize);
 input.addEventListener("keydown", (event) => {
@@ -121,20 +972,126 @@ input.addEventListener("keydown", (event) => {
   }
 });
 
-sendBtn.addEventListener("click", submitQuestion);
+sendBtn.addEventListener("click", () => submitQuestion());
+newChatBtn.addEventListener("click", resetSession);
+clearSessionBtn.addEventListener("click", () => {
+  resetSession();
+  closeSettings();
+});
 
-attachBtn.addEventListener("click", () => fileInput.click());
-fileInput.addEventListener("change", () => {
-  if (fileInput.files.length > 0) {
-    addMessage("assistant", `Attached file: ${fileInput.files[0].name} (upload handling not implemented yet).`);
+refreshBtn.addEventListener("click", refreshLastPrompt);
+debugToggleBtn.addEventListener("click", () => {
+  setDebugPanelState(!state.debugPanelOpen);
+  if (state.debugPanelOpen) {
+    renderDebugPayload(state.lastDebugPayload);
+  }
+});
+settingsBtn.addEventListener("click", openSettings);
+closeSettingsBtn.addEventListener("click", closeSettings);
+overlay.addEventListener("click", closeSettings);
+exportBtn.addEventListener("click", exportSession);
+clearPinsBtn.addEventListener("click", () => {
+  state.pinnedSources = [];
+  renderPinnedSources();
+  setStatus("Pinned sources cleared");
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    closeSettings();
+    sidebar.classList.remove("open");
   }
 });
 
-newChatBtn.addEventListener("click", () => {
-  chatThread.innerHTML = "";
-  hero.style.display = "block";
-  input.value = "";
-  autoResize();
+scoreInfoBtn.addEventListener("click", () => {
+  scoreExplainer.classList.toggle("hidden");
+});
+
+topKSelect.addEventListener("change", () => {
+  syncTopKInputs(topKSelect.value);
+  setStatus(`Top K set to ${state.topK}`);
+});
+
+topKRange.addEventListener("input", () => {
+  syncTopKInputs(topKRange.value);
+});
+
+topKRange.addEventListener("change", () => {
+  setStatus(`Top K set to ${state.topK}`);
+});
+
+showSnippetsToggle.addEventListener("change", () => {
+  state.showSnippets = showSnippetsToggle.checked;
+  applyDisplayPreferences();
+  setStatus(state.showSnippets ? "Snippets enabled" : "Snippets hidden");
+});
+
+compactCitationsToggle.addEventListener("change", () => {
+  state.compactCitations = compactCitationsToggle.checked;
+  applyDisplayPreferences();
+  setStatus(state.compactCitations ? "Compact citation view enabled" : "Detailed citation view enabled");
+});
+
+debugTraceToggle.addEventListener("change", () => {
+  state.debugTraceEnabled = debugTraceToggle.checked;
+  setStatus(state.debugTraceEnabled ? "Debug trace enabled" : "Debug trace disabled");
+  if (state.debugTraceEnabled) {
+    setDebugPanelState(true);
+  }
+});
+
+attachBtn.addEventListener("click", () => fileInput.click());
+fileInput.addEventListener("change", () => {
+  if (!fileInput.files || fileInput.files.length === 0) return;
+
+  const limits = uploadLimits();
+  let totalBytes = state.attachments.reduce((sum, item) => sum + (item.size || 0), 0);
+
+  for (const file of Array.from(fileInput.files)) {
+    if (state.attachments.length >= limits.maxFiles) {
+      setStatus(`Upload limit reached (${limits.maxFiles} files max)`, "warn");
+      break;
+    }
+    if (file.size > limits.maxFileBytes) {
+      setStatus(`"${file.name}" is too large (${Math.round(limits.maxFileBytes / 1024)} KB max)`, "warn");
+      continue;
+    }
+    if (totalBytes + file.size > limits.maxTotalBytes) {
+      setStatus(`Total upload size exceeds limit (${Math.round(limits.maxTotalBytes / 1024)} KB)`, "warn");
+      continue;
+    }
+
+    const signature = `${file.name}|${file.size}|${file.lastModified}`;
+    const exists = state.attachments.some((item) => item.signature === signature);
+    if (!exists) {
+      state.attachments.push({
+        signature,
+        name: file.name,
+        size: file.size,
+        file,
+      });
+      totalBytes += file.size;
+    }
+  }
+
+  fileInput.value = "";
+  renderAttachmentList();
+  setStatus(`${state.attachments.length} attachment(s) ready`);
+});
+
+attachmentList.addEventListener("click", (event) => {
+  const target = event.target;
+  if (!(target instanceof HTMLElement)) return;
+
+  const indexRaw = target.dataset.attachmentIndex;
+  if (typeof indexRaw === "undefined") return;
+
+  const index = Number(indexRaw);
+  if (!Number.isInteger(index) || index < 0 || index >= state.attachments.length) return;
+
+  state.attachments.splice(index, 1);
+  renderAttachmentList();
+  setStatus("Attachment removed");
 });
 
 toggleSidebar.addEventListener("click", () => {
@@ -142,18 +1099,30 @@ toggleSidebar.addEventListener("click", () => {
 });
 
 micBtn.addEventListener("click", () => {
-  if (!recognition) return;
+  if (!state.recognition) return;
 
-  if (!listening) {
-    listening = true;
+  if (!state.listening) {
+    state.listening = true;
     micBtn.textContent = "■";
-    recognition.start();
+    state.recognition.start();
+    setStatus("Listening...");
   } else {
-    listening = false;
+    state.listening = false;
     micBtn.textContent = "🎙";
-    recognition.stop();
+    state.recognition.stop();
+    setStatus("Voice input stopped");
   }
 });
 
+populateTopKSelect(currentTopKMax());
+syncTopKInputs(state.topK);
+state.debugTraceEnabled = debugTraceToggle.checked;
+setMode("chat");
 initSpeech();
 autoResize();
+updateEvidencePill(null);
+renderPinnedSources();
+setDebugPanelState(false);
+renderDebugPayload(null);
+loadRetrievalInfo();
+setStatus("Ready");

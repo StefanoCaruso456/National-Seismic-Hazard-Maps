@@ -12,6 +12,15 @@ class Settings(BaseSettings):
     pinecone_namespace: str = "nshmp-main"
     openai_embedding_model: str = "text-embedding-3-small"
     openai_chat_model: str = "gpt-4o-mini"
+    external_call_retries: int = 3
+    external_call_backoff_seconds: float = 0.5
+    embedding_cache_size: int = 512
+    retrieval_candidate_multiplier: int = 4
+    retrieval_max_candidates: int = 40
+    retrieval_lexical_weight: float = 0.25
+    retrieval_min_hybrid_score: float = 0.35
+    rag_max_context_chunks: int = 6
+    pinecone_fallback_namespace: str | None = None
 
     model_config = SettingsConfigDict(
         env_file=".env",

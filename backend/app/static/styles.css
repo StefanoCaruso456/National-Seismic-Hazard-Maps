@@ -26,9 +26,8 @@ body {
   font-family: "Manrope", sans-serif;
   color: var(--ink);
   background:
-    radial-gradient(circle at 10% 12%, #f9efe4 0%, transparent 36%),
-    radial-gradient(circle at 90% 20%, #f7ceb8 0%, transparent 42%),
-    linear-gradient(115deg, var(--bg-mist), var(--bg-rose) 46%, var(--bg-peach));
+    linear-gradient(120deg, rgba(199, 228, 222, 0.9) 0%, rgba(248, 219, 200, 0.92) 32%, rgba(244, 188, 159, 0.9) 100%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.2), rgba(255, 255, 255, 0));
 }
 
 .app-shell {
@@ -132,6 +131,16 @@ body {
   display: grid;
   grid-template-rows: auto auto 1fr auto;
   min-height: 100vh;
+  background:
+    linear-gradient(105deg, rgba(255, 247, 239, 0.45), rgba(255, 237, 223, 0.25) 38%, rgba(243, 204, 183, 0.34) 100%),
+    repeating-linear-gradient(
+      90deg,
+      rgba(255, 255, 255, 0.08) 0,
+      rgba(255, 255, 255, 0.08) 1px,
+      transparent 1px,
+      transparent 84px
+    );
+  border-left: 1px solid rgba(96, 104, 114, 0.14);
 }
 
 .content::before,
@@ -143,21 +152,19 @@ body {
 }
 
 .content::before {
-  width: 340px;
-  height: 340px;
-  top: 4%;
-  right: 4%;
-  background: radial-gradient(circle, rgba(255, 246, 238, 0.7), rgba(255, 255, 255, 0));
-  filter: blur(3px);
+  left: 0;
+  right: 0;
+  top: 0;
+  height: 220px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.33), rgba(255, 255, 255, 0));
 }
 
 .content::after {
-  width: 280px;
-  height: 280px;
-  left: 16%;
-  bottom: 10%;
-  border-radius: 40% 60% 35% 65%;
-  background: linear-gradient(120deg, rgba(95, 137, 149, 0.28), rgba(209, 115, 111, 0.18));
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 160px;
+  background: linear-gradient(0deg, rgba(224, 163, 140, 0.24), rgba(255, 255, 255, 0));
 }
 
 .topbar {

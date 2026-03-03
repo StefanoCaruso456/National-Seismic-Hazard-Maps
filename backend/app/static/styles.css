@@ -246,6 +246,20 @@ body {
   background: rgba(255, 255, 255, 0.6);
 }
 
+.citation-snippet {
+  width: 100%;
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.58);
+  color: var(--ink);
+  font-size: 12px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  overflow-x: auto;
+}
+
 .chat-input-wrap {
   position: sticky;
   bottom: 0;

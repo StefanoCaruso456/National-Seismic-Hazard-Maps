@@ -15,9 +15,21 @@ class QueryRequest(BaseModel):
     top_k: int = Field(default=5, ge=1, le=20)
 
 
+class Citation(BaseModel):
+    file_path: str
+    line_start: int
+    line_end: int
+    score: float
+    snippet: str | None = None
+
+
 class QueryResponse(BaseModel):
     answer: str
-    citations: list[dict] = Field(default_factory=list)
+    citations: list[Citation] = Field(default_factory=list)
+
+
+class SearchResponse(BaseModel):
+    matches: list[Citation] = Field(default_factory=list)
 
 
 openai_client: OpenAI | None = None
@@ -116,6 +128,7 @@ def extract_citation(metadata: dict, score: float) -> dict:
         "line_start": line_start,
         "line_end": line_end,
         "score": round(score, 4),
+        "snippet": metadata_chunk_text(metadata)[:550] or None,
     }
 
 
@@ -129,12 +142,12 @@ def metadata_chunk_text(metadata: dict) -> str:
     )
 
 
-def build_context(citations: list[dict], chunks: list[str]) -> str:
+def build_context(citations: list[Citation], chunks: list[str]) -> str:
     parts = []
     for idx, (citation, chunk) in enumerate(zip(citations, chunks), start=1):
         parts.append(
             (
-                f"[{idx}] {citation['file_path']}:{citation['line_start']}-{citation['line_end']}\n"
+                f"[{idx}] {citation.file_path}:{citation.line_start}-{citation.line_end}\n"
                 f"{chunk.strip()}"
             )
         )
@@ -168,6 +181,32 @@ def generate_answer(question: str, context: str) -> str:
     return content.strip() if content else "No answer generated."
 
 
+@app.post("/api/search", response_model=SearchResponse)
+def search(payload: QueryRequest) -> SearchResponse:
+    try:
+        question_vector = embed_question(payload.question)
+        index = get_pinecone_index()
+        results = index.query(
+            vector=question_vector,
+            top_k=payload.top_k,
+            include_metadata=True,
+            namespace=settings.pinecone_namespace,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Vector search failed: {exc}") from exc
+
+    matches = normalize_matches(results)
+    citations: list[Citation] = []
+    for match in matches:
+        metadata = normalize_metadata(match)
+        score = match_score(match)
+        citations.append(Citation(**extract_citation(metadata, score)))
+
+    return SearchResponse(matches=citations)
+
+
 @app.post("/api/query", response_model=QueryResponse)
 def query(payload: QueryRequest) -> QueryResponse:
     try:
@@ -194,12 +233,13 @@ def query(payload: QueryRequest) -> QueryResponse:
             citations=[],
         )
 
-    citations: list[dict] = []
+    citations: list[Citation] = []
     chunks: list[str] = []
     for match in matches:
         metadata = normalize_metadata(match)
         score = match_score(match)
-        citations.append(extract_citation(metadata, score))
+        citation = Citation(**extract_citation(metadata, score))
+        citations.append(citation)
         chunks.append(metadata_chunk_text(metadata))
 
     context = build_context(citations, chunks)

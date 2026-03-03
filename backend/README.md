@@ -1,6 +1,6 @@
 # LegacyLens Backend
 
-FastAPI backend scaffold for Railway deployment.
+FastAPI RAG backend for legacy Fortran code understanding.
 
 ## Local run
 
@@ -24,6 +24,26 @@ Landing page:
 open http://localhost:8000/
 ```
 
+## Ingest Fortran codebase into Pinecone
+
+From the `backend/` folder:
+
+```bash
+python -m app.ingest --repo-root .. --namespace nshmp-main
+```
+
+Dry run to validate syntax-aware chunking (200-500 tokens):
+
+```bash
+python -m app.ingest --repo-root .. --namespace nshmp-main --dry-run
+```
+
+## API endpoints
+
+- `POST /api/search` semantic vector search (returns snippets + file/line citations)
+- `POST /api/query` RAG answer generation using retrieved Pinecone context
+- `GET /health` deployment health
+
 ## Railway settings
 
 - Source repo: `StefanoCaruso456/National-Seismic-Hazard-Maps`
@@ -39,3 +59,15 @@ Required env vars:
 - `PINECONE_NAMESPACE` (default: `nshmp-main`)
 - `OPENAI_EMBEDDING_MODEL` (default: `text-embedding-3-small`)
 - `OPENAI_CHAT_MODEL` (default: `gpt-4o-mini`)
+
+## MVP hard-gate mapping
+
+- Ingest legacy Fortran: `python -m app.ingest`
+- Syntax-aware chunking: section-aware split by `program|subroutine|function|module|interface|block data`, then 200-500 token chunks
+- Embeddings: OpenAI `text-embedding-3-small`
+- Vector DB storage: Pinecone `upsert` with metadata
+- Semantic search: `POST /api/search`
+- Natural-language web query: landing page + `POST /api/query`
+- Relevant snippets + line refs: citation metadata (`file_path`, `line_start`, `line_end`, `snippet`)
+- Basic answer generation: OpenAI chat model with retrieved context
+- Deployed publicly: Railway custom domain

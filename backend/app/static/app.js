@@ -26,6 +26,19 @@ function citationText(c) {
   return `${file}:${start}-${end} (score ${score})`;
 }
 
+function renderCitation(citationsWrap, item) {
+  const badge = document.createElement("span");
+  badge.textContent = citationText(item);
+  citationsWrap.appendChild(badge);
+
+  if (!item.snippet) return;
+
+  const snippet = document.createElement("pre");
+  snippet.className = "citation-snippet";
+  snippet.textContent = item.snippet;
+  citationsWrap.appendChild(snippet);
+}
+
 function addMessage(role, text, citations = []) {
   const node = template.content.cloneNode(true);
   const article = node.querySelector(".message");
@@ -35,11 +48,7 @@ function addMessage(role, text, citations = []) {
   article.classList.add(role);
   bubble.textContent = text;
 
-  citations.forEach((item) => {
-    const badge = document.createElement("span");
-    badge.textContent = citationText(item);
-    citationsWrap.appendChild(badge);
-  });
+  citations.forEach((item) => renderCitation(citationsWrap, item));
 
   chatThread.appendChild(node);
   chatThread.scrollTop = chatThread.scrollHeight;

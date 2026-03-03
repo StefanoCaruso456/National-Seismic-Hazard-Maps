@@ -18,6 +18,12 @@ Health check:
 curl http://localhost:8000/health
 ```
 
+Landing page:
+
+```bash
+open http://localhost:8000/
+```
+
 ## Railway settings
 
 - Source repo: `StefanoCaruso456/National-Seismic-Hazard-Maps`

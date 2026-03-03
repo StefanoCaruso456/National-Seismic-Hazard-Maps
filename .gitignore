@@ -7,3 +7,8 @@ scripts/dir_hazrun_old/
 scripts/log_wus.tmp
 scripts/run_haz_interactive.sh
 tmp
+backend/.venv
+backend/.env
+
+__pycache__/
+*.pyc

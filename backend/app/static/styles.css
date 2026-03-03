@@ -132,39 +132,10 @@ body {
   grid-template-rows: auto auto 1fr auto;
   min-height: 100vh;
   background:
-    linear-gradient(105deg, rgba(255, 247, 239, 0.45), rgba(255, 237, 223, 0.25) 38%, rgba(243, 204, 183, 0.34) 100%),
-    repeating-linear-gradient(
-      90deg,
-      rgba(255, 255, 255, 0.08) 0,
-      rgba(255, 255, 255, 0.08) 1px,
-      transparent 1px,
-      transparent 84px
-    );
+    radial-gradient(110% 80% at 12% 8%, rgba(199, 228, 222, 0.34), transparent 56%),
+    radial-gradient(90% 72% at 88% 14%, rgba(244, 188, 159, 0.34), transparent 54%),
+    linear-gradient(120deg, rgba(255, 247, 239, 0.78), rgba(255, 236, 220, 0.66) 44%, rgba(242, 196, 171, 0.72) 100%);
   border-left: 1px solid rgba(96, 104, 114, 0.14);
-}
-
-.content::before,
-.content::after {
-  content: "";
-  position: absolute;
-  inset: auto;
-  pointer-events: none;
-}
-
-.content::before {
-  left: 0;
-  right: 0;
-  top: 0;
-  height: 220px;
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.33), rgba(255, 255, 255, 0));
-}
-
-.content::after {
-  left: 0;
-  right: 0;
-  bottom: 0;
-  height: 160px;
-  background: linear-gradient(0deg, rgba(224, 163, 140, 0.24), rgba(255, 255, 255, 0));
 }
 
 .topbar {

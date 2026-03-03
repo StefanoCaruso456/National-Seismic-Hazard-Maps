@@ -37,3 +37,5 @@ Required env vars:
 - `PINECONE_API_KEY`
 - `PINECONE_INDEX_NAME` (default: `legacylens-openai-index`)
 - `PINECONE_NAMESPACE` (default: `nshmp-main`)
+- `OPENAI_EMBEDDING_MODEL` (default: `text-embedding-3-small`)
+- `OPENAI_CHAT_MODEL` (default: `gpt-4o-mini`)

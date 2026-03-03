@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LegacyLens</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@500;600;700&family=Manrope:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" id="sidebar">
+        <div class="brand">
+          <div class="brand-mark">LL</div>
+          <div>
+            <h1>LegacyLens</h1>
+            <p>Seismic Code Intelligence</p>
+          </div>
+        </div>
+
+        <button class="action-btn" id="newChatBtn">+ New chat</button>
+
+        <nav class="menu">
+          <button class="menu-item active">Chat</button>
+          <button class="menu-item">Search</button>
+          <button class="menu-item">Code Patterns</button>
+          <button class="menu-item">Dependencies</button>
+        </nav>
+
+        <div class="sidebar-footer">
+          <span class="dot"></span>
+          <span>NSHMP workspace connected</span>
+        </div>
+      </aside>
+
+      <main class="content">
+        <header class="topbar">
+          <button class="icon-btn mobile-only" id="toggleSidebar" aria-label="Toggle sidebar">☰</button>
+          <h2>LegacyLens Assistant</h2>
+          <div class="topbar-actions">
+            <button class="icon-btn" title="Refresh">⟳</button>
+            <button class="icon-btn" title="Settings">⚙</button>
+          </div>
+        </header>
+
+        <section class="hero" id="hero">
+          <h3>What do you want to understand in this legacy codebase?</h3>
+          <p>
+            Ask about entry points, file I/O, data flow, business rules, and dependencies.
+            Responses include citations with file and line references.
+          </p>
+        </section>
+
+        <section class="chat-thread" id="chatThread" aria-live="polite"></section>
+
+        <footer class="chat-input-wrap">
+          <div class="chat-input" role="group" aria-label="Chat input">
+            <input id="fileInput" type="file" hidden />
+            <button class="icon-btn" id="attachBtn" title="Attach file">＋</button>
+            <textarea
+              id="questionInput"
+              rows="1"
+              placeholder="Ask anything about National-Seismic-Hazard-Maps..."
+            ></textarea>
+            <button class="icon-btn" id="micBtn" title="Voice input">🎙</button>
+            <button class="send-btn" id="sendBtn" title="Send">➤</button>
+          </div>
+        </footer>
+      </main>
+    </div>
+
+    <template id="messageTemplate">
+      <article class="message">
+        <div class="avatar"></div>
+        <div class="bubble-wrap">
+          <p class="bubble"></p>
+          <div class="citations"></div>
+        </div>
+      </article>
+    </template>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

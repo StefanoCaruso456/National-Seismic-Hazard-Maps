@@ -10,6 +10,8 @@ class Settings(BaseSettings):
     pinecone_api_key: str | None = None
     pinecone_index_name: str = "legacylens-openai-index"
     pinecone_namespace: str = "nshmp-main"
+    openai_embedding_model: str = "text-embedding-3-small"
+    openai_chat_model: str = "gpt-4o-mini"
 
     model_config = SettingsConfigDict(
         env_file=".env",

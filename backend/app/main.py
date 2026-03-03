@@ -1,3 +1,7 @@
+import logging
+import re
+import time
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +14,10 @@ from pydantic import BaseModel, Field, ValidationError
 
 from app.config import settings
 from app.ingest import FORTRAN_EXTENSIONS, chunk_fortran_file, discover_fortran_files, token_count
+
+logger = logging.getLogger("legacylens.api")
+IDENTIFIER_PATTERN = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]{2,}")
+WORD_PATTERN = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]*")
 
 
 class QueryRequest(BaseModel):
@@ -232,13 +240,48 @@ def debug_sample_chunks(file_path: str) -> dict:
     return {"chunk_count": len(chunks), "preview": preview}
 
 
-def embed_question(question: str) -> list[float]:
+def call_with_retries(action: str, fn):
+    attempts = max(settings.external_call_retries, 1)
+    base_backoff = max(settings.external_call_backoff_seconds, 0.0)
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except HTTPException:
+            raise
+        except Exception as exc:
+            if attempt >= attempts:
+                raise
+            sleep_for = base_backoff * (2 ** (attempt - 1))
+            logger.warning(
+                "%s failed (attempt %s/%s): %s; retrying in %.2fs",
+                action,
+                attempt,
+                attempts,
+                exc,
+                sleep_for,
+            )
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+
+
+@lru_cache(maxsize=max(settings.embedding_cache_size, 1))
+def _cached_question_embedding(question: str) -> tuple[float, ...]:
     client = get_openai_client()
-    response = client.embeddings.create(
-        model=settings.openai_embedding_model,
-        input=question,
+    response = call_with_retries(
+        "openai embeddings",
+        lambda: client.embeddings.create(
+            model=settings.openai_embedding_model,
+            input=question,
+        ),
     )
-    return response.data[0].embedding
+    return tuple(response.data[0].embedding)
+
+
+def embed_question(question: str) -> list[float]:
+    normalized = question.strip()
+    if not normalized:
+        return []
+    return list(_cached_question_embedding(normalized))
 
 
 def normalize_matches(query_response: object) -> list:
@@ -266,6 +309,73 @@ def match_score(match: object) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+def normalize_semantic_score(score: float) -> float:
+    # Cosine similarity can be in [-1, 1], map to [0, 1] for hybrid scoring.
+    return max(0.0, min(1.0, (score + 1.0) / 2.0))
+
+
+def tokenize_question(question: str) -> tuple[set[str], set[str]]:
+    words = {token.lower() for token in WORD_PATTERN.findall(question) if len(token) >= 2}
+    identifiers = {token.lower() for token in IDENTIFIER_PATTERN.findall(question)}
+    return words, identifiers
+
+
+def lexical_score(question_terms: set[str], identifiers: set[str], metadata: dict) -> float:
+    if not question_terms and not identifiers:
+        return 0.0
+    file_path = str(metadata.get("file_path", "")).lower()
+    section_name = str(metadata.get("section_name", "")).lower()
+    source = f"{file_path}\n{section_name}\n{metadata_chunk_text(metadata)[:2500]}".lower()
+    source_terms = {token for token in WORD_PATTERN.findall(source) if len(token) >= 2}
+
+    overlap = len(question_terms & source_terms)
+    term_coverage = (overlap / len(question_terms)) if question_terms else 0.0
+
+    id_bonus = 0.0
+    for ident in identifiers:
+        if ident in file_path:
+            id_bonus = max(id_bonus, 0.20)
+        elif ident in section_name:
+            id_bonus = max(id_bonus, 0.15)
+        elif ident in source:
+            id_bonus = max(id_bonus, 0.10)
+
+    return min(1.0, term_coverage + id_bonus)
+
+
+def rerank_matches(question: str, matches: list, top_k: int) -> list[tuple[dict, float]]:
+    question_terms, identifiers = tokenize_question(question)
+    lexical_weight = min(max(settings.retrieval_lexical_weight, 0.0), 1.0)
+
+    rescored: list[tuple[float, float, dict, object]] = []
+    for match in matches:
+        metadata = normalize_metadata(match)
+        semantic = normalize_semantic_score(match_score(match))
+        lexical = lexical_score(question_terms, identifiers, metadata)
+        hybrid = ((1.0 - lexical_weight) * semantic) + (lexical_weight * lexical)
+        rescored.append((hybrid, semantic, metadata, match))
+
+    rescored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+
+    deduped: list[tuple[dict, float]] = []
+    seen_ranges: set[tuple[str, int, int]] = set()
+    for hybrid, _, metadata, _ in rescored:
+        file_path = str(metadata.get("file_path", "unknown"))
+        line_start = safe_int(metadata.get("line_start")) or 1
+        line_end = safe_int(metadata.get("line_end")) or line_start
+        key = (file_path, line_start, line_end)
+        if key in seen_ranges:
+            continue
+        seen_ranges.add(key)
+        deduped.append((metadata, hybrid))
+        if len(deduped) >= top_k:
+            break
+
+    min_score = min(max(settings.retrieval_min_hybrid_score, 0.0), 1.0)
+    strong = [item for item in deduped if item[1] >= min_score]
+    return strong or deduped
 
 
 def extract_citation(metadata: dict, score: float) -> dict:
@@ -299,7 +409,8 @@ def metadata_chunk_text(metadata: dict) -> str:
 
 def build_context(citations: list[Citation], chunks: list[str]) -> str:
     parts = []
-    for idx, (citation, chunk) in enumerate(zip(citations, chunks), start=1):
+    max_context = max(settings.rag_max_context_chunks, 1)
+    for idx, (citation, chunk) in enumerate(zip(citations[:max_context], chunks[:max_context]), start=1):
         parts.append(
             (
                 f"[{idx}] {citation.file_path}:{citation.line_start}-{citation.line_end}\n"
@@ -309,28 +420,74 @@ def build_context(citations: list[Citation], chunks: list[str]) -> str:
     return "\n\n".join(parts)
 
 
+def query_namespaces() -> list[str]:
+    namespaces = [settings.pinecone_namespace]
+    fallback = (settings.pinecone_fallback_namespace or "").strip()
+    if fallback and fallback not in namespaces:
+        namespaces.append(fallback)
+    return namespaces
+
+
+def retrieve_citations_and_chunks(question: str, top_k: int) -> tuple[list[Citation], list[str]]:
+    question_vector = embed_question(question)
+    if not question_vector:
+        return [], []
+
+    candidate_top_k = min(
+        max(top_k * max(settings.retrieval_candidate_multiplier, 1), top_k),
+        max(settings.retrieval_max_candidates, top_k),
+    )
+    index = get_pinecone_index()
+
+    matches: list = []
+    for namespace in query_namespaces():
+        results = call_with_retries(
+            "pinecone query",
+            lambda: index.query(
+                vector=question_vector,
+                top_k=candidate_top_k,
+                include_metadata=True,
+                namespace=namespace,
+            ),
+        )
+        matches = normalize_matches(results)
+        if matches:
+            break
+
+    if not matches:
+        return [], []
+
+    reranked = rerank_matches(question=question, matches=matches, top_k=top_k)
+    citations = [Citation(**extract_citation(metadata, score)) for metadata, score in reranked]
+    chunks = [metadata_chunk_text(metadata) for metadata, _ in reranked]
+    return citations, chunks
+
+
 def generate_answer(question: str, context: str) -> str:
     client = get_openai_client()
-    completion = client.chat.completions.create(
-        model=settings.openai_chat_model,
-        temperature=0.2,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are a legacy code assistant. Use only retrieved context. "
-                    "If context is insufficient, say so clearly and suggest next queries."
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"Question:\n{question}\n\n"
-                    f"Retrieved context:\n{context}\n\n"
-                    "Answer with concise technical detail and reference citation numbers like [1], [2]."
-                ),
-            },
-        ],
+    completion = call_with_retries(
+        "openai chat completion",
+        lambda: client.chat.completions.create(
+            model=settings.openai_chat_model,
+            temperature=0.2,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a legacy code assistant. Use only retrieved context. "
+                        "If context is insufficient, say so clearly and suggest next queries."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Question:\n{question}\n\n"
+                        f"Retrieved context:\n{context}\n\n"
+                        "Answer with concise technical detail and reference citation numbers like [1], [2]."
+                    ),
+                },
+            ],
+        ),
     )
     content = completion.choices[0].message.content
     return content.strip() if content else "No answer generated."
@@ -339,25 +496,11 @@ def generate_answer(question: str, context: str) -> str:
 @app.post("/api/search", response_model=SearchResponse)
 def search(payload: QueryRequest) -> SearchResponse:
     try:
-        question_vector = embed_question(payload.question)
-        index = get_pinecone_index()
-        results = index.query(
-            vector=question_vector,
-            top_k=payload.top_k,
-            include_metadata=True,
-            namespace=settings.pinecone_namespace,
-        )
+        citations, _ = retrieve_citations_and_chunks(payload.question, payload.top_k)
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Vector search failed: {exc}") from exc
-
-    matches = normalize_matches(results)
-    citations: list[Citation] = []
-    for match in matches:
-        metadata = normalize_metadata(match)
-        score = match_score(match)
-        citations.append(Citation(**extract_citation(metadata, score)))
 
     return SearchResponse(matches=citations)
 
@@ -365,21 +508,13 @@ def search(payload: QueryRequest) -> SearchResponse:
 @app.post("/api/query", response_model=QueryResponse)
 def query(payload: QueryRequest) -> QueryResponse:
     try:
-        question_vector = embed_question(payload.question)
-        index = get_pinecone_index()
-        results = index.query(
-            vector=question_vector,
-            top_k=payload.top_k,
-            include_metadata=True,
-            namespace=settings.pinecone_namespace,
-        )
+        citations, chunks = retrieve_citations_and_chunks(payload.question, payload.top_k)
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Vector retrieval failed: {exc}") from exc
 
-    matches = normalize_matches(results)
-    if not matches:
+    if not citations:
         return QueryResponse(
             answer=(
                 "I could not find relevant indexed code for that question. "
@@ -388,15 +523,6 @@ def query(payload: QueryRequest) -> QueryResponse:
             ),
             citations=[],
         )
-
-    citations: list[Citation] = []
-    chunks: list[str] = []
-    for match in matches:
-        metadata = normalize_metadata(match)
-        score = match_score(match)
-        citation = Citation(**extract_citation(metadata, score))
-        citations.append(citation)
-        chunks.append(metadata_chunk_text(metadata))
 
     context = build_context(citations, chunks)
 

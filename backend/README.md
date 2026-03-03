@@ -32,6 +32,12 @@ From the `backend/` folder:
 python -m app.ingest --repo-root .. --namespace nshmp-main
 ```
 
+If chunking logic or metadata schema changes, reindex cleanly:
+
+```bash
+python -m app.ingest --repo-root .. --namespace nshmp-main --delete-existing
+```
+
 Dry run to validate syntax-aware chunking (200-500 tokens):
 
 ```bash
@@ -64,6 +70,17 @@ Runtime debug endpoints are disabled by default. To enable them, set `APP_DEBUG=
 - `POST /api/query` RAG answer generation using retrieved Pinecone context
 - `GET /health` deployment health
 
+## Retrieval quality and reliability defaults
+
+The backend uses:
+
+- Retry with exponential backoff for OpenAI + Pinecone calls
+- In-memory query embedding cache (LRU)
+- Candidate expansion (`top_k * multiplier`) then hybrid rerank (semantic + lexical identifier overlap)
+- Dedup by `file_path + line range`
+- Minimum hybrid score filter (fallback to best available results if no match passes threshold)
+- Optional namespace fallback (`PINECONE_FALLBACK_NAMESPACE`)
+
 ## Railway settings
 
 - Source repo: `StefanoCaruso456/National-Seismic-Hazard-Maps`
@@ -79,6 +96,15 @@ Required env vars:
 - `PINECONE_NAMESPACE` (default: `nshmp-main`)
 - `OPENAI_EMBEDDING_MODEL` (default: `text-embedding-3-small`)
 - `OPENAI_CHAT_MODEL` (default: `gpt-4o-mini`)
+- `EXTERNAL_CALL_RETRIES` (default: `3`)
+- `EXTERNAL_CALL_BACKOFF_SECONDS` (default: `0.5`)
+- `EMBEDDING_CACHE_SIZE` (default: `512`)
+- `RETRIEVAL_CANDIDATE_MULTIPLIER` (default: `4`)
+- `RETRIEVAL_MAX_CANDIDATES` (default: `40`)
+- `RETRIEVAL_LEXICAL_WEIGHT` (default: `0.25`)
+- `RETRIEVAL_MIN_HYBRID_SCORE` (default: `0.35`)
+- `RAG_MAX_CONTEXT_CHUNKS` (default: `6`)
+- `PINECONE_FALLBACK_NAMESPACE` (optional; empty by default)
 
 ## MVP hard-gate mapping
 

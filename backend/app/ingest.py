@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable
@@ -63,6 +64,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-max-tokens", type=int, default=500)
     parser.add_argument("--embed-batch-size", type=int, default=64)
     parser.add_argument("--upsert-batch-size", type=int, default=100)
+    parser.add_argument(
+        "--delete-existing",
+        action="store_true",
+        help="Delete all vectors in the target namespace before upserting",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Build chunks without embedding/upsert")
     return parser.parse_args()
 
@@ -158,7 +164,48 @@ def split_large_text(
     if current:
         flush(start_line + len(lines) - 1)
 
-    return chunks
+    if len(chunks) <= 1:
+        return chunks
+
+    # Merge very small chunks into neighboring chunks when it keeps chunk size bounded.
+    merged: list[FileChunk] = []
+    i = 0
+    while i < len(chunks):
+        chunk = chunks[i]
+        chunk_tokens = token_count(chunk.chunk_text)
+        if chunk_tokens < min_tokens:
+            if merged:
+                prev = merged[-1]
+                combined_prev = f"{prev.chunk_text}\n{chunk.chunk_text}".strip()
+                if token_count(combined_prev) <= max_tokens:
+                    merged[-1] = FileChunk(
+                        file_path=prev.file_path,
+                        line_start=prev.line_start,
+                        line_end=chunk.line_end,
+                        section_name=prev.section_name,
+                        chunk_text=combined_prev,
+                    )
+                    i += 1
+                    continue
+            if i + 1 < len(chunks):
+                nxt = chunks[i + 1]
+                combined_next = f"{chunk.chunk_text}\n{nxt.chunk_text}".strip()
+                if token_count(combined_next) <= max_tokens:
+                    merged.append(
+                        FileChunk(
+                            file_path=nxt.file_path,
+                            line_start=chunk.line_start,
+                            line_end=nxt.line_end,
+                            section_name=chunk.section_name,
+                            chunk_text=combined_next,
+                        )
+                    )
+                    i += 2
+                    continue
+        merged.append(chunk)
+        i += 1
+
+    return merged
 
 
 def chunk_fortran_file(path: Path, repo_root: Path, min_tokens: int, max_tokens: int) -> list[FileChunk]:
@@ -190,6 +237,24 @@ def chunk_id(namespace: str, chunk: FileChunk) -> str:
 def batched(items: list, size: int) -> Iterable[list]:
     for i in range(0, len(items), size):
         yield items[i : i + size]
+
+
+def call_with_retries(action: str, fn):
+    attempts = max(settings.external_call_retries, 1)
+    base_backoff = max(settings.external_call_backoff_seconds, 0.0)
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except Exception as exc:
+            if attempt >= attempts:
+                raise
+            sleep_for = base_backoff * (2 ** (attempt - 1))
+            print(
+                f"[retry {attempt}/{attempts}] {action} failed: {exc}. "
+                f"retrying in {sleep_for:.2f}s"
+            )
+            if sleep_for > 0:
+                time.sleep(sleep_for)
 
 
 def ensure_clients() -> tuple[Any, Any]:
@@ -232,15 +297,24 @@ def ingest(args: argparse.Namespace) -> None:
 
     openai_client, pinecone_client = ensure_clients()
     index = pinecone_client.Index(settings.pinecone_index_name)
+    if args.delete_existing:
+        call_with_retries(
+            "pinecone namespace delete_all",
+            lambda: index.delete(delete_all=True, namespace=args.namespace),
+        )
+        print(f"Deleted existing vectors in namespace: {args.namespace}")
 
-    vectors_payload: list[tuple[str, list[float], dict]] = []
-
+    pending_vectors: list[tuple[str, list[float], dict]] = []
+    total_upserted = 0
     for chunk_batch in batched(chunks, args.embed_batch_size):
         texts = [chunk.chunk_text for chunk in chunk_batch]
-        embeddings = openai_client.embeddings.create(
-            model=settings.openai_embedding_model,
-            input=texts,
-        ).data
+        embeddings = call_with_retries(
+            "openai embeddings",
+            lambda: openai_client.embeddings.create(
+                model=settings.openai_embedding_model,
+                input=texts,
+            ).data,
+        )
 
         for chunk, embedded in zip(chunk_batch, embeddings, strict=True):
             metadata = {
@@ -251,12 +325,23 @@ def ingest(args: argparse.Namespace) -> None:
                 "language": "fortran",
                 "chunk_text": chunk.chunk_text,
             }
-            vectors_payload.append((chunk_id(args.namespace, chunk), embedded.embedding, metadata))
+            pending_vectors.append((chunk_id(args.namespace, chunk), embedded.embedding, metadata))
 
-    total_upserted = 0
-    for vector_batch in batched(vectors_payload, args.upsert_batch_size):
-        index.upsert(vectors=vector_batch, namespace=args.namespace)
-        total_upserted += len(vector_batch)
+            if len(pending_vectors) >= args.upsert_batch_size:
+                vector_batch = pending_vectors[: args.upsert_batch_size]
+                pending_vectors = pending_vectors[args.upsert_batch_size:]
+                call_with_retries(
+                    "pinecone upsert",
+                    lambda: index.upsert(vectors=vector_batch, namespace=args.namespace),
+                )
+                total_upserted += len(vector_batch)
+
+    if pending_vectors:
+        call_with_retries(
+            "pinecone upsert",
+            lambda: index.upsert(vectors=pending_vectors, namespace=args.namespace),
+        )
+        total_upserted += len(pending_vectors)
 
     print(f"Upserted vectors: {total_upserted}")
     print(f"Namespace: {args.namespace}")

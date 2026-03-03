@@ -9,3 +9,6 @@ scripts/run_haz_interactive.sh
 tmp
 backend/.venv
 backend/.env
+
+__pycache__/
+*.pyc

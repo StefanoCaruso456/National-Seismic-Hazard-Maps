@@ -9,7 +9,7 @@ class Settings(BaseSettings):
     openai_api_key: str | None = None
     pinecone_api_key: str | None = None
     pinecone_index_name: str = "legacylens-openai-index"
-    pinecone_namespace: str = "nshmp-main"
+    pinecone_namespace: str = "nshmp-main:v1"
     openai_embedding_model: str = "text-embedding-3-small"
     openai_chat_model: str = "gpt-4o-mini"
     external_call_retries: int = 3

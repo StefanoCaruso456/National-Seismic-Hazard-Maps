@@ -486,6 +486,10 @@ body {
   gap: 8px;
 }
 
+.message.user .bubble-wrap {
+  margin-left: 14px;
+}
+
 .message-meta {
   display: flex;
   flex-wrap: wrap;
@@ -1042,6 +1046,10 @@ textarea {
 
   .message-meta {
     flex-wrap: wrap;
+  }
+
+  .message.user .bubble-wrap {
+    margin-left: 8px;
   }
 
   .prompt-modal-head h3 {

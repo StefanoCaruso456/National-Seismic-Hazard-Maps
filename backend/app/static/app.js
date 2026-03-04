@@ -1184,6 +1184,12 @@ function renderCitation(citationsWrap, item, index) {
   citationsWrap.appendChild(card);
 }
 
+function stripMarkdownBold(text) {
+  return String(text || "")
+    .replace(/\*\*([^*]+?)\*\*/g, "$1")
+    .replace(/\*\*/g, "");
+}
+
 function addMessage(role, text, citations = [], meta = {}) {
   const node = template.content.cloneNode(true);
   const article = node.querySelector(".message");
@@ -1191,9 +1197,10 @@ function addMessage(role, text, citations = [], meta = {}) {
   const bubbleWrap = node.querySelector(".bubble-wrap");
   const citationsWrap = node.querySelector(".citations");
   const metaRow = node.querySelector(".message-meta");
+  const renderedText = role === "assistant" ? stripMarkdownBold(text) : text;
 
   article.classList.add(role);
-  bubble.textContent = text;
+  bubble.textContent = renderedText;
   metaRow.textContent = buildMetaText(role, meta);
 
   if (role === "assistant") {
@@ -1209,7 +1216,7 @@ function addMessage(role, text, citations = [], meta = {}) {
     copyAnswerBtn.className = "tiny-btn";
     copyAnswerBtn.textContent = "Copy answer";
     copyAnswerBtn.addEventListener("click", () => {
-      copyText(text, "Answer copied");
+      copyText(renderedText, "Answer copied");
     });
     metaRow.appendChild(copyAnswerBtn);
 
@@ -1268,7 +1275,7 @@ function addMessage(role, text, citations = [], meta = {}) {
 
   state.history.push({
     role,
-    text,
+    text: renderedText,
     citations,
     meta,
     timestamp: new Date().toISOString(),

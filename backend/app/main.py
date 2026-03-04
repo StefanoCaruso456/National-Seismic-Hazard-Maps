@@ -1713,12 +1713,10 @@ def pin_upload(file_sha: str, payload: UploadPinRequest) -> UploadFileRecord:
 def delete_upload(file_sha: str, project_id: str | None = None) -> UploadDeleteResponse:
     project = normalize_project_id(project_id)
     record = get_upload_record(project, file_sha)
-    if not record:
-        raise HTTPException(status_code=404, detail="Upload not found")
-
-    chunk_count = safe_int(record.get("chunk_count")) or 0
+    chunk_count = safe_int((record or {}).get("chunk_count")) or 0
     delete_attachment_vectors(project_id=project, file_sha=file_sha, chunk_count=chunk_count)
-    remove_upload_record(project, file_sha)
+    if record:
+        remove_upload_record(project, file_sha)
 
     return UploadDeleteResponse(
         project_id=project,

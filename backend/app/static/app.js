@@ -497,11 +497,35 @@ function roleLabel(role) {
 function buildMetaText(role, meta) {
   const parts = [roleLabel(role)];
   if (meta.modeLabel) parts.push(meta.modeLabel);
+  if (meta.resultType) parts.push(meta.resultType);
   if (typeof meta.resultCount === "number") parts.push(`${meta.resultCount} sources`);
   if (meta.evidenceLabel) parts.push(`evidence ${meta.evidenceLabel}`);
   if (typeof meta.elapsedMs === "number") parts.push(formatDuration(meta.elapsedMs));
   parts.push(new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }));
   return parts.join(" • ");
+}
+
+function defaultResultTypeForMode(mode) {
+  if (mode === "dependencies") return "Dependency Graph";
+  if (mode === "patterns") return "Pattern Examples";
+  if (mode === "search") return "Ranked Chunks";
+  return "Answer";
+}
+
+function normalizeFollowUps(items) {
+  if (!Array.isArray(items)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const raw of items) {
+    const next = String(raw || "").trim();
+    if (!next) continue;
+    const key = next.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(next);
+    if (out.length >= 6) break;
+  }
+  return out;
 }
 
 function citationRange(item) {
@@ -643,6 +667,7 @@ function addMessage(role, text, citations = [], meta = {}) {
   const node = template.content.cloneNode(true);
   const article = node.querySelector(".message");
   const bubble = node.querySelector(".bubble");
+  const bubbleWrap = node.querySelector(".bubble-wrap");
   const citationsWrap = node.querySelector(".citations");
   const metaRow = node.querySelector(".message-meta");
 
@@ -651,6 +676,13 @@ function addMessage(role, text, citations = [], meta = {}) {
   metaRow.textContent = buildMetaText(role, meta);
 
   if (role === "assistant") {
+    if (meta.resultType) {
+      const resultType = document.createElement("div");
+      resultType.className = "result-type-head";
+      resultType.textContent = meta.resultType;
+      bubbleWrap.insertBefore(resultType, bubble);
+    }
+
     const copyAnswerBtn = document.createElement("button");
     copyAnswerBtn.type = "button";
     copyAnswerBtn.className = "tiny-btn";
@@ -659,12 +691,51 @@ function addMessage(role, text, citations = [], meta = {}) {
       copyText(text, "Answer copied");
     });
     metaRow.appendChild(copyAnswerBtn);
+
+    if (meta.debugPayload) {
+      const debugBtn = document.createElement("button");
+      debugBtn.type = "button";
+      debugBtn.className = "tiny-btn";
+      debugBtn.textContent = "Show retrieval debug";
+      debugBtn.addEventListener("click", () => {
+        setDebugPanelState(true);
+        renderDebugPayload(meta.debugPayload);
+        setStatus("Debug trace opened");
+      });
+      metaRow.appendChild(debugBtn);
+    }
   }
 
   if (citations.length) {
     citations.forEach((item, index) => renderCitation(citationsWrap, item, index + 1));
   } else {
     citationsWrap.remove();
+  }
+
+  if (role === "assistant" && Array.isArray(meta.followUps) && meta.followUps.length) {
+    const followRow = document.createElement("div");
+    followRow.className = "followup-row";
+
+    const label = document.createElement("span");
+    label.className = "followup-label";
+    label.textContent = "Next:";
+    followRow.appendChild(label);
+
+    meta.followUps.forEach((suggestion) => {
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "followup-chip";
+      chip.textContent = suggestion;
+      chip.addEventListener("click", () => {
+        submitQuestion({
+          modeOverride: meta.modeValue || state.mode,
+          questionOverride: suggestion,
+        });
+      });
+      followRow.appendChild(chip);
+    });
+
+    bubbleWrap.appendChild(followRow);
   }
 
   chatThread.appendChild(node);
@@ -784,6 +855,7 @@ async function postMultipart(url, payload) {
   formData.append("question", payload.question);
   formData.append("top_k", String(payload.topK));
   formData.append("debug", payload.debug ? "true" : "false");
+  formData.append("mode", payload.mode || state.mode);
   formData.append("scope", payload.scope || state.scope);
   formData.append("project_id", payload.projectId || state.projectId);
   formData.append("persist_uploads", payload.persistUploads ? "true" : "false");
@@ -818,6 +890,7 @@ async function runModeQuery(mode, question, files = []) {
   const scope = state.scope;
   const projectId = state.projectId;
   const persistUploads = state.persistUploads;
+  const normalizedMode = mode || state.mode;
   const searchRequest = async (topK) => {
     if (hasUploads) {
       return postMultipart("/api/search/upload", {
@@ -825,6 +898,7 @@ async function runModeQuery(mode, question, files = []) {
         topK,
         files,
         debug,
+        mode: normalizedMode,
         scope,
         projectId,
         persistUploads,
@@ -835,18 +909,20 @@ async function runModeQuery(mode, question, files = []) {
       question,
       top_k: topK,
       debug,
+      mode: normalizedMode,
       scope,
       project_id: projectId,
     });
   };
 
-  if (mode === "chat") {
+  if (normalizedMode === "chat") {
     const data = hasUploads
       ? await postMultipart("/api/query/upload", {
           question,
           topK: state.topK,
           files,
           debug,
+          mode: normalizedMode,
           scope,
           projectId,
           persistUploads,
@@ -855,6 +931,7 @@ async function runModeQuery(mode, question, files = []) {
           question,
           top_k: state.topK,
           debug,
+          mode: normalizedMode,
           scope,
           project_id: projectId,
         });
@@ -864,29 +941,37 @@ async function runModeQuery(mode, question, files = []) {
       citations: data.citations || [],
       evidence: data.evidence_strength || {},
       debug: data.debug || null,
+      resultType: defaultResultTypeForMode(normalizedMode),
+      followUps: [],
     };
   }
 
-  if (mode === "search") {
-    const data = await searchRequest(state.topK);
+  if (normalizedMode === "search") {
+    const topK = state.topK;
+    const data = await searchRequest(topK);
     const matches = data.matches || [];
+    const summary = data.summary || buildSearchSummary(question, matches);
     return {
-      text: buildSearchSummary(question, matches),
+      text: summary,
       citations: matches,
       evidence: data.evidence_strength || {},
       debug: data.debug || null,
+      resultType: data.result_type || defaultResultTypeForMode(normalizedMode),
+      followUps: normalizeFollowUps(data.follow_ups || []),
     };
   }
 
-  if (mode === "patterns") {
+  if (normalizedMode === "patterns") {
     const expandedTopK = Math.min(20, Math.max(state.topK, 6));
     const data = await searchRequest(expandedTopK);
     const matches = data.matches || [];
     return {
-      text: generatePatternInsights(question, matches),
+      text: data.summary || generatePatternInsights(question, matches),
       citations: matches,
       evidence: data.evidence_strength || {},
       debug: data.debug || null,
+      resultType: data.result_type || defaultResultTypeForMode(normalizedMode),
+      followUps: normalizeFollowUps(data.follow_ups || []),
     };
   }
 
@@ -894,10 +979,12 @@ async function runModeQuery(mode, question, files = []) {
   const data = await searchRequest(expandedTopK);
   const matches = data.matches || [];
   return {
-    text: generateDependencyInsights(question, matches),
+    text: data.summary || generateDependencyInsights(question, matches),
     citations: matches,
     evidence: data.evidence_strength || {},
     debug: data.debug || null,
+    resultType: data.result_type || defaultResultTypeForMode(normalizedMode),
+    followUps: normalizeFollowUps(data.follow_ups || []),
   };
 }
 
@@ -949,6 +1036,10 @@ async function submitQuestion(options = {}) {
 
     addMessage("assistant", result.text, result.citations, {
       modeLabel: MODE_CONFIG[state.mode].label,
+      modeValue: state.mode,
+      resultType: result.resultType || defaultResultTypeForMode(state.mode),
+      followUps: normalizeFollowUps(result.followUps || []),
+      debugPayload: result.debug || null,
       elapsedMs,
       resultCount: result.citations.length,
       evidenceLabel: normalizedEvidenceLabel(result.evidence?.label),

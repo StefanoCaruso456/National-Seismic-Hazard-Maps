@@ -465,11 +465,25 @@ body {
 
 .message-meta {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-start;
   color: var(--ink-faint);
   font-size: 12px;
+}
+
+.result-type-head {
+  display: inline-flex;
+  width: fit-content;
+  border-radius: 999px;
+  border: 1px solid rgba(95, 137, 149, 0.35);
+  background: rgba(95, 137, 149, 0.14);
+  color: #365966;
+  padding: 3px 9px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
 }
 
 .bubble {
@@ -490,6 +504,29 @@ body {
 .citations {
   display: grid;
   gap: 8px;
+}
+
+.followup-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.followup-label {
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+
+.followup-chip {
+  border: 1px solid rgba(95, 137, 149, 0.3);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.72);
+  color: var(--ink);
+  padding: 5px 10px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
 }
 
 .citation-card {
@@ -742,7 +779,8 @@ textarea {
 .send-btn:hover,
 .topk-select:hover,
 .tiny-btn:hover,
-.citation-chip:hover {
+.citation-chip:hover,
+.followup-chip:hover {
   filter: brightness(0.98);
 }
 

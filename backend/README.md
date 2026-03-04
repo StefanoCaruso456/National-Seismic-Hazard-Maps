@@ -29,19 +29,19 @@ open http://localhost:8000/
 From the `backend/` folder:
 
 ```bash
-python -m app.ingest --repo-root .. --namespace nshmp-main
+python -m app.ingest --repo-root .. --namespace nshmp-main:v1
 ```
 
 If chunking logic or metadata schema changes, reindex cleanly:
 
 ```bash
-python -m app.ingest --repo-root .. --namespace nshmp-main --delete-existing
+python -m app.ingest --repo-root .. --namespace nshmp-main:v1 --delete-existing
 ```
 
 Dry run to validate syntax-aware chunking (200-500 tokens):
 
 ```bash
-python -m app.ingest --repo-root .. --namespace nshmp-main --dry-run
+python -m app.ingest --repo-root .. --namespace nshmp-main:v1 --dry-run
 ```
 
 ## Audit / Debug
@@ -49,13 +49,13 @@ python -m app.ingest --repo-root .. --namespace nshmp-main --dry-run
 Local audit (validates file discovery + chunk sizing; optionally checks Pinecone vector counts if `PINECONE_API_KEY` is configured):
 
 ```bash
-python -m app.audit --repo-root .. --namespace nshmp-main
+python -m app.audit --repo-root .. --namespace nshmp-main:v1
 ```
 
 End-to-end retrieval smoke test (adds semantic query probe + PASS/FAIL gate summary):
 
 ```bash
-python -m app.audit --repo-root .. --namespace nshmp-main --smoke-query "Where is subroutine hazallXL defined?" --top-k 5
+python -m app.audit --repo-root .. --namespace nshmp-main:v1 --smoke-query "Where is subroutine hazallXL defined?" --top-k 5
 ```
 
 Retrieval eval harness (Recall@5/10 + nDCG@10):
@@ -72,7 +72,7 @@ Runtime debug endpoints are disabled by default. To enable them, set `APP_DEBUG=
 
 ## API endpoints
 
-- `POST /api/search` semantic vector search (returns snippets + file/line citations)
+- `POST /api/search` mode-aware retrieval (`search|patterns|dependencies`) with snippets + file/line citations
 - `POST /api/query` RAG answer generation using retrieved Pinecone context
 - `POST /api/search/upload` multipart search with temporary retrieval scope from attached files
 - `POST /api/query/upload` multipart RAG answer with attached-file chunking + retrieval
@@ -85,6 +85,7 @@ Runtime debug endpoints are disabled by default. To enable them, set `APP_DEBUG=
 
 `/api/search` and `/api/query` accept `debug=true` in JSON to return retrieval traces.
 `/api/search/upload` and `/api/query/upload` accept multipart field `debug=true` for the same trace payload.
+`mode` can be `chat|search|patterns|dependencies` (mode-aware evidence + response formatting).
 `scope` can be `repo|uploads|both`; `project_id` selects attachment namespace scope.
 Upload persistence is opt-in via multipart field `persist_uploads=true` (default: not persisted).
 
@@ -101,7 +102,10 @@ The backend uses:
 - Attachment-aware retrieval across repo namespace + persistent upload namespace
 - Upload ingestion pipeline with SHA-256 dedupe and PDF/text extraction
 - Query rewrite/decomposition for implementation/workflow/config style questions
-- Evidence strength scoring (`High|Medium|Low`) and insufficient-evidence refusal policy
+- Intent router for config-style queries (prioritizes `conf/`, `etc/`, `scripts/`, run scripts, Makefile)
+- Dependency graph extraction (CALL/USE/INCLUDE/COMMON) with definition resolution
+- Pattern extraction for Fortran loop/IO blocks with concrete code snippets
+- Evidence strength scoring (`High|Medium|Low`) with mode-aware gates
 
 ## Railway settings
 
@@ -115,7 +119,7 @@ Required env vars:
 - `OPENAI_API_KEY`
 - `PINECONE_API_KEY`
 - `PINECONE_INDEX_NAME` (default: `legacylens-openai-index`)
-- `PINECONE_NAMESPACE` (default: `nshmp-main`)
+- `PINECONE_NAMESPACE` (default: `nshmp-main:v1`)
 - `OPENAI_EMBEDDING_MODEL` (default: `text-embedding-3-small`)
 - `OPENAI_CHAT_MODEL` (default: `gpt-4o-mini`)
 - `EXTERNAL_CALL_RETRIES` (default: `3`)

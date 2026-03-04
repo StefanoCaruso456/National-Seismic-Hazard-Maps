@@ -154,21 +154,23 @@ const DIAGRAM_WORKFLOWS = {
     ],
     prompt: `You are a senior software architect analyzing a code repository.
 
-Task: generate a HIGH-LEVEL SYSTEM ARCHITECTURE DIAGRAM.
+Your task is to generate a HIGH-LEVEL SYSTEM ARCHITECTURE DIAGRAM for this repository.
 
-Process requirements:
-1) Scan the repository structure first.
-2) Build an internal repo map before reasoning.
-3) Identify major components: entry scripts, core compute modules, config/data inputs, build tools, outputs, external deps.
-4) Group components into logical subsystems.
-5) Identify directional relationships between subsystems.
+Follow these steps carefully:
+1) Scan the entire repository structure.
+2) Identify major system components including entry scripts, core computational modules, data/config folders, build tools, external dependencies, and output artifacts.
+3) Group related components into logical subsystems such as orchestration scripts, compute engine, model logic, configuration, data sources, outputs, and build system.
+4) Identify directional relationships between components.
+5) Produce a clean architecture diagram.
 
-Output requirements:
-- Return ONLY Mermaid.
+OUTPUT FORMAT:
+- Return ONLY a Mermaid diagram.
 - Use flowchart TD.
-- Keep it high-level with 8-12 nodes.
-- Prefer subsystem names, not individual files.
-- No prose outside the Mermaid block.`,
+- Keep the diagram high level.
+- Use logical system components instead of individual files.
+- Limit the diagram to 8-12 nodes.
+- Prefer clarity over completeness.
+- No explanatory prose outside Mermaid.`,
   },
   executionPipeline: {
     title: "Execution Pipeline Diagram",
@@ -178,22 +180,25 @@ Output requirements:
       "Add optional and error branches in the pipeline",
       "Generate pipeline focused only on output generation stages",
     ],
-    prompt: `You are a software engineer investigating repository execution.
+    prompt: `You are a software engineer investigating how a repository executes.
 
-Task: produce an EXECUTION PIPELINE DIAGRAM.
+Your task is to produce an EXECUTION PIPELINE DIAGRAM.
 
-Process requirements:
-1) Find entry points (shell scripts, mains, run scripts, Make targets).
+Follow these steps:
+1) Identify all entry points such as shell scripts, main programs, run scripts, and Makefile targets.
 2) Determine execution order.
-3) Identify key runtime stages (preprocess, init, compute, aggregate, export).
-4) Trace runtime sequence end-to-end.
+3) Identify intermediate steps such as preprocessing, model initialization, simulation, aggregation, and output generation.
+4) Trace the runtime sequence.
+5) Generate a pipeline diagram.
 
-Output requirements:
-- Return ONLY Mermaid.
+OUTPUT FORMAT:
+- Return ONLY a Mermaid diagram.
 - Use flowchart LR.
-- Show strict execution order.
+- Must represent execution order.
+- Use left-to-right flow.
 - Max 10 nodes.
-- Avoid low-level function names.`,
+- Avoid low-level function names.
+- No explanatory prose outside Mermaid.`,
   },
   dataFlow: {
     title: "Data Flow Diagram",
@@ -205,19 +210,22 @@ Output requirements:
     ],
     prompt: `You are a data systems architect.
 
-Task: produce a DATA FLOW DIAGRAM for this repository.
+Your goal is to produce a DATA FLOW DIAGRAM for the repository.
 
-Process requirements:
-1) Identify major data inputs (configs, datasets, model parameters, lookup tables).
-2) Identify transformations.
-3) Identify outputs (maps, simulation outputs, processed datasets).
-4) Trace lineage from input to output.
+Steps:
+1) Identify major data inputs including configuration files, scientific datasets, model parameters, and lookup tables.
+2) Identify transformations that process the data.
+3) Identify outputs including generated maps, simulation results, and processed datasets.
+4) Trace how data moves through the system.
+5) Create a clean data lineage diagram.
 
-Output requirements:
-- Return ONLY Mermaid.
+OUTPUT FORMAT:
+- Return ONLY a Mermaid diagram.
 - Use flowchart TD.
-- Show transformations clearly with descriptive node names.
-- Max 12 nodes.`,
+- Show transformations clearly.
+- Use descriptive node names.
+- Max 12 nodes.
+- No explanatory prose outside Mermaid.`,
   },
   dependencyGraph: {
     title: "Code Dependency Graph",
@@ -227,21 +235,24 @@ Output requirements:
       "Map dependency chains starting from run scripts",
       "Highlight possible circular dependencies and shared utility overload",
     ],
-    prompt: `You are analyzing internal code dependencies of a repository.
+    prompt: `You are analyzing the internal code dependencies of a repository.
 
-Task: create a MODULE DEPENDENCY GRAPH.
+Your task is to create a MODULE DEPENDENCY GRAPH.
 
-Process requirements:
-1) Scan source code first.
-2) Identify major modules/packages/files.
-3) Detect directional dependencies from imports, usage, and call relationships.
-4) Focus on central modules only.
+Steps:
+1) Scan the source code.
+2) Identify modules, packages, or major files.
+3) Detect dependency relationships including imports, module usage, and function calls.
+4) Identify the most central modules.
+5) Focus only on the most important modules.
 
-Output requirements:
-- Return ONLY Mermaid.
+OUTPUT FORMAT:
+- Return ONLY a Mermaid graph.
 - Use graph TD.
-- Include top 10 most important modules only.
-- Do not include every file.`,
+- Show directional dependencies.
+- Focus on the top 10 most important modules.
+- Do not include every file.
+- No explanatory prose outside Mermaid.`,
   },
   buildRuntime: {
     title: "Build & Runtime Environment Diagram",
@@ -253,19 +264,21 @@ Output requirements:
     ],
     prompt: `You are a build systems engineer.
 
-Task: create a BUILD AND RUNTIME ENVIRONMENT DIAGRAM.
+Your task is to create a BUILD AND RUNTIME ENVIRONMENT DIAGRAM.
 
-Process requirements:
-1) Identify build system and toolchain (Make, scripts, compiler commands).
-2) Identify compiler/runtime artifacts.
-3) Identify runtime dependencies (data, config, env vars).
-4) Identify final executable/services and outputs.
+Steps:
+1) Identify build system details such as Makefile, shell scripts, and compiler commands.
+2) Identify compiler and toolchain.
+3) Identify runtime dependencies such as datasets, environment variables, and config files.
+4) Identify the final executable/runtime target and outputs.
 
-Output requirements:
-- Return ONLY Mermaid.
+OUTPUT FORMAT:
+- Return ONLY a Mermaid diagram.
 - Use flowchart TD.
 - Focus on build and runtime environment.
-- Keep it readable; avoid low-level file detail.`,
+- Avoid low-level file detail.
+- Keep the diagram readable.
+- No explanatory prose outside Mermaid.`,
   },
 };
 
@@ -1135,9 +1148,12 @@ function buildMetaText(role, meta) {
   return parts.join(" • ");
 }
 
-function defaultResultTypeForMode(mode) {
+function defaultResultTypeForMode(mode, detail = null) {
   if (mode === "audit") return AUDIT_WORKFLOW.reportType;
-  if (mode === "diagrams") return "Mermaid Diagram";
+  if (mode === "diagrams") {
+    const diagramType = detail || state.activeDiagramType;
+    return DIAGRAM_WORKFLOWS[diagramType]?.reportType || "Mermaid Diagram";
+  }
   if (mode === "dependencies") return "Dependency Graph";
   if (mode === "patterns") return "Pattern Examples";
   if (mode === "search") return "Ranked Chunks";
@@ -1592,7 +1608,10 @@ async function runModeQuery(mode, question, files = []) {
       citations: data.citations || [],
       evidence: data.evidence_strength || {},
       debug: data.debug || null,
-      resultType: defaultResultTypeForMode(uiMode),
+      resultType: defaultResultTypeForMode(
+        uiMode,
+        uiMode === "diagrams" ? state.activeDiagramType : null,
+      ),
       followUps:
         uiMode === "audit"
           ? auditFollowUps()

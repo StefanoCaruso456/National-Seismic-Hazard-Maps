@@ -145,7 +145,7 @@ ${AUDIT_REPORT_CONTRACT}`,
 
 const DIAGRAM_WORKFLOWS = {
   systemArchitecture: {
-    title: "System Architecture Diagram",
+    title: "System Architecture: National Hazard Run",
     reportType: "System Architecture Diagram",
     followUps: [
       "Refine architecture diagram around ingestion and compute boundaries",
@@ -163,6 +163,9 @@ Follow these steps carefully:
 4) Identify directional relationships between components.
 5) Produce a clean architecture diagram.
 
+Primary scope for this repository:
+- System boundaries centered on run orchestration, regional hazard scripts, core hazard binaries, config/data inputs, and outputs.
+
 OUTPUT FORMAT:
 - Return ONLY a Mermaid diagram.
 - Use flowchart TD.
@@ -170,10 +173,11 @@ OUTPUT FORMAT:
 - Use logical system components instead of individual files.
 - Limit the diagram to 8-12 nodes.
 - Prefer clarity over completeness.
+- At least 6 nodes must be traceable to real repository components/scripts/binaries.
 - No explanatory prose outside Mermaid.`,
   },
   executionPipeline: {
-    title: "Execution Pipeline Diagram",
+    title: "Execution Pipeline: run_all_hazard.sh",
     reportType: "Execution Pipeline Diagram",
     followUps: [
       "Trace startup path from the primary run script in more detail",
@@ -191,6 +195,9 @@ Follow these steps:
 4) Trace the runtime sequence.
 5) Generate a pipeline diagram.
 
+Primary scope for this repository:
+- run_all_hazard.sh sequence: environment checks -> make -> getmeanrjf.v2 preprocessing -> hazrun_casc_2014.sh / hazrun_ceus_2014.sh / hazrun_wus_2014.sh -> logs/out outputs.
+
 OUTPUT FORMAT:
 - Return ONLY a Mermaid diagram.
 - Use flowchart LR.
@@ -198,10 +205,11 @@ OUTPUT FORMAT:
 - Use left-to-right flow.
 - Max 10 nodes.
 - Avoid low-level function names.
+- Include the orchestration and regional execution stages when evidence exists.
 - No explanatory prose outside Mermaid.`,
   },
   dataFlow: {
-    title: "Data Flow Diagram",
+    title: "Data Flow: conf/* to out/*",
     reportType: "Data Flow Diagram",
     followUps: [
       "Add more detail for configuration and lookup-table lineage",
@@ -219,16 +227,20 @@ Steps:
 4) Trace how data moves through the system.
 5) Create a clean data lineage diagram.
 
+Primary scope for this repository:
+- conf/WUS, conf/CEUS, conf/CASC input files and scripts/GR tables flowing into hazard executables and then to logs/out artifacts.
+
 OUTPUT FORMAT:
 - Return ONLY a Mermaid diagram.
 - Use flowchart TD.
 - Show transformations clearly.
 - Use descriptive node names.
 - Max 12 nodes.
+- Include input -> transform -> output lineage with concrete repository anchors.
 - No explanatory prose outside Mermaid.`,
   },
   dependencyGraph: {
-    title: "Code Dependency Graph",
+    title: "Dependency Graph: Core Hazard Engines",
     reportType: "Module Dependency Graph",
     followUps: [
       "Expand dependency graph around the most central module",
@@ -246,16 +258,20 @@ Steps:
 4) Identify the most central modules.
 5) Focus only on the most important modules.
 
+Primary scope for this repository:
+- Core engine set: hazgridXnga13l, hazFXnga13l, hazSUBX, hazpoint, hazinterpnga and utility/build dependencies tied to Makefile and scripts.
+
 OUTPUT FORMAT:
 - Return ONLY a Mermaid graph.
 - Use graph TD.
 - Show directional dependencies.
 - Focus on the top 10 most important modules.
 - Do not include every file.
+- Prefer modules that are demonstrably central in entry scripts or build targets.
 - No explanatory prose outside Mermaid.`,
   },
   buildRuntime: {
-    title: "Build & Runtime Environment Diagram",
+    title: "Build & Runtime: Makefile + gfortran",
     reportType: "Build and Runtime Environment Diagram",
     followUps: [
       "Add CI/CD and deployment stages to the environment diagram",
@@ -272,12 +288,16 @@ Steps:
 3) Identify runtime dependencies such as datasets, environment variables, and config files.
 4) Identify the final executable/runtime target and outputs.
 
+Primary scope for this repository:
+- Makefile/gfortran build chain producing bin/* executables, then runtime scripts consuming conf/* and producing out/logs.
+
 OUTPUT FORMAT:
 - Return ONLY a Mermaid diagram.
 - Use flowchart TD.
 - Focus on build and runtime environment.
 - Avoid low-level file detail.
 - Keep the diagram readable.
+- Include both compile-time and run-time stages.
 - No explanatory prose outside Mermaid.`,
   },
 };
@@ -285,6 +305,28 @@ OUTPUT FORMAT:
 const DIAGRAM_PROMPT_TO_TYPE = Object.fromEntries(
   Object.entries(DIAGRAM_WORKFLOWS).map(([type, workflow]) => [workflow.title, type]),
 );
+
+const NSHMP_DIAGRAM_REPO_FACTS = [
+  "Entry orchestrator: run_all_hazard.sh",
+  "Regional runners: scripts/hazrun_casc_2014.sh, scripts/hazrun_ceus_2014.sh, scripts/hazrun_wus_2014.sh",
+  "Build file: Makefile (gfortran targets to bin/*)",
+  "Core executables: bin/hazgridXnga13l, bin/hazFXnga13l, bin/hazSUBX, bin/hazpoint, bin/hazinterpnga",
+  "Input/config roots: conf/CASC, conf/CEUS, conf/WUS, scripts/GR",
+  "Outputs/logs: out/, out/combine/, logs/",
+];
+
+const NSHMP_DIAGRAM_SCOPE_HINTS = {
+  systemArchitecture:
+    "Map orchestration and subsystem boundaries around run_all_hazard.sh, regional scripts, core binaries, and output directories.",
+  executionPipeline:
+    "Trace the concrete runtime sequence from run_all_hazard.sh through make/getmeanrjf.v2, then regional scripts, then outputs.",
+  dataFlow:
+    "Trace data lineage from conf/* and scripts/GR inputs into hazard binaries and then logs/out artifacts.",
+  dependencyGraph:
+    "Center dependency graph on hazgridXnga13l, hazFXnga13l, hazSUBX, hazpoint, hazinterpnga and their build/run relationships.",
+  buildRuntime:
+    "Model Makefile + gfortran compile chain and runtime dependence on conf/*, scripts/*, and generated outputs.",
+};
 
 const PROMPT_MODE_CATEGORIES = [
   {
@@ -858,6 +900,8 @@ function buildDiagramWorkflowPrompt(diagramType, userIntent = "") {
   const focusLine = intent
     ? `Focus request from user: ${intent}\nConstrain node labels and scope around this focus where possible.`
     : "Focus request from user: full repository baseline.";
+  const scopeHint = NSHMP_DIAGRAM_SCOPE_HINTS[resolvedType] || NSHMP_DIAGRAM_SCOPE_HINTS.systemArchitecture;
+  const repoFacts = NSHMP_DIAGRAM_REPO_FACTS.map((fact) => `- ${fact}`).join("\n");
 
   return `${workflow.prompt}
 
@@ -865,6 +909,16 @@ Global guardrails:
 - First scan repo, then reason, then draw.
 - Use evidence from discovered files/modules; avoid invented components.
 - Keep node labels concise and engineering-relevant.
+- Include concrete repository anchors whenever evidence exists.
+- Do not emit generic placeholder nodes like "Component A/B" or "Module X".
+- If evidence is insufficient for a node, annotate the label with "(hypothesis)".
+- Keep deterministic structure: stable top-to-bottom or left-to-right flow with no disconnected nodes.
+
+Verified repository anchors to prioritize:
+${repoFacts}
+
+Scope directive:
+${scopeHint}
 
 ${focusLine}`;
 }
@@ -1320,6 +1374,25 @@ function stripMarkdownBold(text) {
     .replace(/\*\*/g, "");
 }
 
+function normalizeDiagramText(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return "";
+  const fencedMatch = raw.match(/```(?:mermaid)?\s*([\s\S]*?)```/i);
+  let next = fencedMatch ? fencedMatch[1].trim() : raw;
+  next = next
+    .replace(/^`{3,}\s*/gm, "")
+    .replace(/`{3,}$/gm, "")
+    .replace(/^["']{1,3}\s*/, "")
+    .replace(/\s*["']{1,3}$/, "")
+    .trim();
+  return next || raw;
+}
+
+function isLikelyMermaidDiagram(text) {
+  const normalized = normalizeDiagramText(text).trim().toLowerCase();
+  return normalized.startsWith("flowchart ") || normalized.startsWith("graph ");
+}
+
 function addMessage(role, text, citations = [], meta = {}) {
   const node = template.content.cloneNode(true);
   const article = node.querySelector(".message");
@@ -1327,7 +1400,10 @@ function addMessage(role, text, citations = [], meta = {}) {
   const bubbleWrap = node.querySelector(".bubble-wrap");
   const citationsWrap = node.querySelector(".citations");
   const metaRow = node.querySelector(".message-meta");
-  const renderedText = role === "assistant" ? stripMarkdownBold(text) : text;
+  let renderedText = role === "assistant" ? stripMarkdownBold(text) : text;
+  if (role === "assistant" && meta.modeValue === "diagrams") {
+    renderedText = normalizeDiagramText(renderedText);
+  }
 
   article.classList.add(role);
   bubble.textContent = renderedText;
@@ -1490,12 +1566,43 @@ function generateDependencyInsights(question, matches) {
   return lines.join("\n");
 }
 
+function isTransientHttpStatus(status) {
+  return status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
+}
+
+async function fetchWithRetry(url, options, retries = 1) {
+  let lastError = null;
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      const response = await fetch(url, options);
+      if (attempt < retries && isTransientHttpStatus(response.status)) {
+        await sleep(300 * (attempt + 1));
+        continue;
+      }
+      return response;
+    } catch (err) {
+      lastError = err;
+      if (attempt >= retries) {
+        throw err;
+      }
+      await sleep(300 * (attempt + 1));
+    }
+  }
+  throw lastError || new Error("Request failed");
+}
+
 async function postJson(url, payload) {
-  const response = await fetch(url, {
+  const response = await fetchWithRetry(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
-  });
+  }, 2);
 
   let data = null;
   try {
@@ -1527,10 +1634,10 @@ async function postMultipart(url, payload) {
     formData.append("files", file, file.name);
   }
 
-  const response = await fetch(url, {
+  const response = await fetchWithRetry(url, {
     method: "POST",
     body: formData,
-  });
+  }, 2);
 
   let data = null;
   try {
@@ -1580,9 +1687,8 @@ async function runModeQuery(mode, question, files = []) {
     });
   };
 
-  if (uiMode === "chat" || uiMode === "audit" || uiMode === "diagrams") {
-    const requestTopK =
-      uiMode === "audit" || uiMode === "diagrams" ? Math.min(20, Math.max(state.topK, 8)) : state.topK;
+  if (uiMode === "chat" || uiMode === "audit") {
+    const requestTopK = uiMode === "audit" ? Math.min(20, Math.max(state.topK, 8)) : state.topK;
     const data = hasUploads
       ? await postMultipart("/api/query/upload", {
           question,
@@ -1615,9 +1721,70 @@ async function runModeQuery(mode, question, files = []) {
       followUps:
         uiMode === "audit"
           ? auditFollowUps()
-          : uiMode === "diagrams"
-            ? diagramFollowUpsForType(state.activeDiagramType)
-            : [],
+          : [],
+    };
+  }
+
+  if (uiMode === "diagrams") {
+    const requestTopK = Math.min(20, Math.max(state.topK, 8));
+    let data = hasUploads
+      ? await postMultipart("/api/query/upload", {
+          question,
+          topK: requestTopK,
+          files,
+          debug,
+          mode: apiMode,
+          scope,
+          projectId,
+          persistUploads,
+        })
+      : await postJson("/api/query", {
+          question,
+          top_k: requestTopK,
+          debug,
+          mode: apiMode,
+          scope,
+          project_id: projectId,
+        });
+
+    if (!isLikelyMermaidDiagram(data.answer || "")) {
+      const strictQuestion = `${question}
+
+Validation retry:
+- Return ONLY raw Mermaid syntax (no markdown fences, no prose).
+- Start with "flowchart" or "graph".
+- Use concrete repository anchors and deterministic edges.`;
+      data = hasUploads
+        ? await postMultipart("/api/query/upload", {
+            question: strictQuestion,
+            topK: requestTopK,
+            files,
+            debug,
+            mode: apiMode,
+            scope,
+            projectId,
+            persistUploads,
+          })
+        : await postJson("/api/query", {
+            question: strictQuestion,
+            top_k: requestTopK,
+            debug,
+            mode: apiMode,
+            scope,
+            project_id: projectId,
+          });
+    }
+
+    return {
+      text: data.answer || "No answer returned.",
+      citations: data.citations || [],
+      evidence: data.evidence_strength || {},
+      debug: data.debug || null,
+      resultType: defaultResultTypeForMode(
+        uiMode,
+        uiMode === "diagrams" ? state.activeDiagramType : null,
+      ),
+      followUps: diagramFollowUpsForType(state.activeDiagramType),
     };
   }
 
@@ -1766,7 +1933,11 @@ async function submitQuestion(options = {}) {
       renderAttachmentList();
     }
   } catch (err) {
-    addMessage("assistant", `Error: ${err.message}`);
+    const rawMessage = String(err?.message || "Request failed");
+    const friendlyMessage = /failed to fetch|networkerror|load failed/i.test(rawMessage)
+      ? "Network error: unable to reach the backend service. Please retry in a few seconds."
+      : rawMessage;
+    addMessage("assistant", `Error: ${friendlyMessage}`);
     setStatus("Request failed", "warn");
   } finally {
     setBusy(false);

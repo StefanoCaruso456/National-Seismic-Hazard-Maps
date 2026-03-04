@@ -8,10 +8,11 @@ const micBtn = document.getElementById("micBtn");
 const attachBtn = document.getElementById("attachBtn");
 const fileInput = document.getElementById("fileInput");
 const newChatBtn = document.getElementById("newChatBtn");
+const recentChatsList = document.getElementById("recentChatsList");
 const sidebar = document.getElementById("sidebar");
 const toggleSidebar = document.getElementById("toggleSidebar");
 const template = document.getElementById("messageTemplate");
-const menuItems = Array.from(document.querySelectorAll(".menu-item"));
+const modeButtons = Array.from(document.querySelectorAll(".mode-btn"));
 const refreshBtn = document.getElementById("refreshBtn");
 const debugToggleBtn = document.getElementById("debugToggleBtn");
 const settingsBtn = document.getElementById("settingsBtn");
@@ -38,6 +39,12 @@ const debugPanel = document.getElementById("debugPanel");
 const debugContent = document.getElementById("debugContent");
 const debugStateLabel = document.getElementById("debugStateLabel");
 const overlay = document.getElementById("overlay");
+const suggestionOverlay = document.getElementById("suggestionOverlay");
+const suggestionBtn = document.getElementById("suggestionBtn");
+const promptSuggestionModal = document.getElementById("promptSuggestionModal");
+const closeSuggestionModalBtn = document.getElementById("closeSuggestionModalBtn");
+const promptModalBody = document.getElementById("promptModalBody");
+const exploreCapabilitiesLink = document.getElementById("exploreCapabilitiesLink");
 const settingsDrawer = document.getElementById("settingsDrawer");
 const closeSettingsBtn = document.getElementById("closeSettingsBtn");
 const showSnippetsToggle = document.getElementById("showSnippetsToggle");
@@ -77,6 +84,49 @@ const MODE_CONFIG = {
   },
 };
 
+const PROMPT_MODE_CATEGORIES = [
+  {
+    key: "system-overview",
+    title: "SYSTEM OVERVIEW",
+    mode: "chat",
+    prompts: [
+      "Explain the hazard curve workflow",
+      "What is the main entry point for this codebase?",
+      "Describe the data flow from inputs to outputs",
+    ],
+  },
+  {
+    key: "find-code",
+    title: "FIND CODE",
+    mode: "search",
+    prompts: [
+      "Where is hazard curve calculation implemented?",
+      "Find files referencing ground motion models",
+      "Show code that reads configuration files",
+    ],
+  },
+  {
+    key: "code-analysis",
+    title: "CODE ANALYSIS",
+    mode: "patterns",
+    prompts: [
+      "Show loops iterating over seismic sources",
+      "Identify patterns used for reading input tables",
+      "Find functions similar to hazgridX",
+    ],
+  },
+  {
+    key: "dependency-graph",
+    title: "DEPENDENCY GRAPH",
+    mode: "dependencies",
+    prompts: [
+      "Trace dependencies from run_all_hazard.sh",
+      "Which modules depend on hazard curve routines?",
+      "Show the call chain for hazgridX",
+    ],
+  },
+];
+
 const DEFAULT_UPLOAD_LIMITS = {
   maxFiles: 8,
   maxFileBytes: 1_500_000,
@@ -104,6 +154,10 @@ const state = {
   debugPanelOpen: false,
   debugTraceEnabled: false,
   lastDebugPayload: null,
+  recentChats: [],
+  currentSessionTitle: null,
+  contextFile: "",
+  suggestionModalOpen: false,
 };
 
 function autoResize() {
@@ -220,6 +274,9 @@ function pinSource(item) {
     return;
   }
   state.pinnedSources.push(item);
+  if (item?.file_path && !String(item.file_path).startsWith("uploaded/")) {
+    state.contextFile = String(item.file_path);
+  }
   renderPinnedSources();
   setStatus("Source pinned");
 }
@@ -365,11 +422,184 @@ function setBusy(isBusy) {
   state.loading = Boolean(isBusy);
   sendBtn.disabled = state.loading;
   refreshBtn.disabled = state.loading;
+  suggestionBtn.disabled = state.loading;
 }
 
 function setStatus(text, tone = "") {
   statusLine.textContent = text;
   statusLine.dataset.tone = tone;
+}
+
+function summarizePrompt(text, limit = 68) {
+  const firstLine = String(text || "")
+    .split("\n")[0]
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!firstLine) return "";
+  if (firstLine.length <= limit) return firstLine;
+  return `${firstLine.slice(0, Math.max(0, limit - 1)).trim()}...`;
+}
+
+function renderRecentChats() {
+  recentChatsList.innerHTML = "";
+  if (!state.recentChats.length) {
+    const empty = document.createElement("span");
+    empty.className = "recent-chat-empty";
+    empty.textContent = "No recent chats yet.";
+    recentChatsList.appendChild(empty);
+    return;
+  }
+
+  for (const item of state.recentChats) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "recent-chat-item";
+    button.textContent = item.title;
+    button.dataset.mode = item.mode;
+    button.dataset.prompt = item.title;
+    button.addEventListener("click", () => {
+      setMode(item.mode);
+      input.value = item.title;
+      autoResize();
+      setStatus("Prompt loaded from recent chat");
+    });
+    recentChatsList.appendChild(button);
+  }
+}
+
+function archiveCurrentSession() {
+  if (!state.history.length) return;
+  const firstUser = state.history.find((entry) => entry.role === "user");
+  const sourceTitle = state.currentSessionTitle || firstUser?.text || "";
+  const title = summarizePrompt(sourceTitle);
+  if (!title) return;
+
+  const next = {
+    title,
+    mode: state.mode,
+    at: new Date().toISOString(),
+  };
+  state.recentChats = [next, ...state.recentChats.filter((entry) => entry.title !== title)].slice(0, 8);
+  renderRecentChats();
+}
+
+function deriveContextFile() {
+  const explicit = String(state.contextFile || "").trim();
+  if (explicit) return explicit;
+
+  const fromPinned = state.pinnedSources.find((item) => item?.file_path && !String(item.file_path).startsWith("uploaded/"));
+  if (fromPinned?.file_path) {
+    return String(fromPinned.file_path);
+  }
+
+  const fromAttachment = state.attachments[0]?.name;
+  if (fromAttachment) {
+    return String(fromAttachment);
+  }
+
+  return "";
+}
+
+function contextSuggestions(contextFile) {
+  if (!contextFile) return [];
+  const base = contextFile.split("/").pop() || contextFile;
+  const stem = base.replace(/\.[^.]+$/, "") || base;
+  return [
+    { text: `Explain what ${base} does`, mode: "chat" },
+    { text: `Show functions called by ${stem}`, mode: "dependencies" },
+    { text: "Find similar hazard curve implementations", mode: "patterns" },
+  ];
+}
+
+function PromptChip(promptText, mode, onSelect) {
+  const chip = document.createElement("button");
+  chip.type = "button";
+  chip.className = "prompt-chip";
+  chip.textContent = promptText;
+  chip.addEventListener("click", () => {
+    onSelect(promptText, mode);
+  });
+  return chip;
+}
+
+function PromptCategory(category, onSelect) {
+  const section = document.createElement("section");
+  section.className = "prompt-category";
+
+  const title = document.createElement("h4");
+  const uniqueModes = [...new Set(category.prompts.map((item) => item.mode))];
+  if (uniqueModes.length === 1 && MODE_CONFIG[uniqueModes[0]]) {
+    title.textContent = `${category.title} (${MODE_CONFIG[uniqueModes[0]].label})`;
+  } else {
+    title.textContent = category.title;
+  }
+  section.appendChild(title);
+
+  const list = document.createElement("div");
+  list.className = "prompt-chip-list";
+  category.prompts.slice(0, 3).forEach((item) => {
+    list.appendChild(PromptChip(item.text, item.mode, onSelect));
+  });
+  section.appendChild(list);
+  return section;
+}
+
+function PromptSuggestionModal(modeCategories, onSelect, contextFile) {
+  promptModalBody.innerHTML = "";
+
+  const normalizedCategories = modeCategories.map((category) => ({
+    title: category.title,
+    prompts: category.prompts.slice(0, 3).map((text) => ({
+      text,
+      mode: category.mode,
+    })),
+  }));
+
+  normalizedCategories.forEach((category) => {
+    promptModalBody.appendChild(PromptCategory(category, onSelect));
+  });
+
+  const contextPromptItems = contextSuggestions(contextFile);
+  if (contextPromptItems.length) {
+    promptModalBody.appendChild(
+      PromptCategory({
+        title: "CONTEXT SUGGESTIONS",
+        prompts: contextPromptItems,
+      }, onSelect),
+    );
+  }
+}
+
+function openSuggestionModal() {
+  if (state.loading) {
+    setStatus("Wait for the current request to finish", "warn");
+    return;
+  }
+  closeSettings();
+  const contextFile = deriveContextFile();
+  PromptSuggestionModal(PROMPT_MODE_CATEGORIES, onPromptSelected, contextFile);
+  state.suggestionModalOpen = true;
+  suggestionOverlay.classList.remove("hidden");
+  promptSuggestionModal.classList.remove("hidden");
+}
+
+function closeSuggestionModal() {
+  state.suggestionModalOpen = false;
+  suggestionOverlay.classList.add("hidden");
+  promptSuggestionModal.classList.add("hidden");
+}
+
+async function onPromptSelected(promptText, mode) {
+  closeSuggestionModal();
+  setMode(mode);
+  input.value = promptText;
+  autoResize();
+  updateEvidencePill(null);
+  setStatus(`Mode: ${MODE_CONFIG[mode].label} • Evidence: n/a • TopK: ${state.topK}`);
+  await submitQuestion({
+    modeOverride: mode,
+    questionOverride: promptText,
+  });
 }
 
 function bumpCounter(counter, key) {
@@ -456,7 +686,7 @@ function setMode(mode) {
   if (!MODE_CONFIG[mode]) return;
   state.mode = mode;
 
-  for (const item of menuItems) {
+  for (const item of modeButtons) {
     item.classList.toggle("active", item.dataset.mode === mode);
   }
 
@@ -474,6 +704,7 @@ function setMode(mode) {
 }
 
 function resetSession() {
+  archiveCurrentSession();
   chatThread.innerHTML = "";
   hero.style.display = "block";
   input.value = "";
@@ -483,6 +714,9 @@ function resetSession() {
   state.history = [];
   state.lastRequest = null;
   state.lastDebugPayload = null;
+  state.currentSessionTitle = null;
+  state.contextFile = "";
+  closeSuggestionModal();
   renderAttachmentList();
   renderPinnedSources();
   renderDebugPayload(null);
@@ -614,6 +848,9 @@ function renderCitation(citationsWrap, item, index) {
   openBtn.textContent = "Open file";
   if (openUrl) {
     openBtn.addEventListener("click", () => {
+      if (item?.file_path && !String(item.file_path).startsWith("uploaded/")) {
+        state.contextFile = String(item.file_path);
+      }
       window.open(openUrl, "_blank", "noopener,noreferrer");
     });
   } else {
@@ -740,6 +977,10 @@ function addMessage(role, text, citations = [], meta = {}) {
 
   chatThread.appendChild(node);
   chatThread.scrollTop = chatThread.scrollHeight;
+
+  if (role === "user" && !state.currentSessionTitle) {
+    state.currentSessionTitle = summarizePrompt(text);
+  }
 
   state.history.push({
     role,
@@ -1053,6 +1294,13 @@ async function submitQuestion(options = {}) {
       }
     }
 
+    const contextHit = result.citations.find(
+      (item) => item?.file_path && !String(item.file_path).startsWith("uploaded/"),
+    );
+    if (contextHit?.file_path) {
+      state.contextFile = String(contextHit.file_path);
+    }
+
     const count = result.citations.length;
     setStatus(
       `${MODE_CONFIG[state.mode].label}: ${count} source${count === 1 ? "" : "s"} in ${formatDuration(
@@ -1096,6 +1344,7 @@ function renderAttachmentList() {
 }
 
 function openSettings() {
+  closeSuggestionModal();
   settingsDrawer.classList.remove("hidden");
   overlay.classList.remove("hidden");
 }
@@ -1205,7 +1454,7 @@ function initSpeech() {
   };
 }
 
-menuItems.forEach((item) => {
+modeButtons.forEach((item) => {
   item.addEventListener("click", () => {
     setMode(item.dataset.mode);
   });
@@ -1239,6 +1488,17 @@ debugToggleBtn.addEventListener("click", () => {
 settingsBtn.addEventListener("click", openSettings);
 closeSettingsBtn.addEventListener("click", closeSettings);
 overlay.addEventListener("click", closeSettings);
+suggestionBtn.addEventListener("click", openSuggestionModal);
+closeSuggestionModalBtn.addEventListener("click", closeSuggestionModal);
+suggestionOverlay.addEventListener("click", closeSuggestionModal);
+exploreCapabilitiesLink.addEventListener("click", (event) => {
+  event.preventDefault();
+  closeSuggestionModal();
+  setMode("chat");
+  input.value = "Show example questions I can ask in Chat, Search, Code Patterns, and Dependencies modes.";
+  autoResize();
+  setStatus("Capabilities example inserted");
+});
 exportBtn.addEventListener("click", exportSession);
 refreshUploadsBtn.addEventListener("click", refreshUploadLibrary);
 clearPinsBtn.addEventListener("click", () => {
@@ -1250,6 +1510,7 @@ clearPinsBtn.addEventListener("click", () => {
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {
     closeSettings();
+    closeSuggestionModal();
     sidebar.classList.remove("open");
   }
 });
@@ -1429,7 +1690,9 @@ autoResize();
 updateEvidencePill(null);
 renderPinnedSources();
 renderUploadLibrary();
+renderRecentChats();
 setDebugPanelState(false);
 renderDebugPayload(null);
+closeSuggestionModal();
 loadRetrievalInfo();
 setStatus("Ready");

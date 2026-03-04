@@ -58,8 +58,7 @@ const MODE_CONFIG = {
     label: "Chat",
     placeholder: "Ask anything about National-Seismic-Hazard-Maps...",
     heroTitle: "What do you want to understand in this legacy codebase?",
-    heroCopy:
-      "Ask about entry points, file I/O, data flow, business rules, and dependencies. Responses include citations with file and line references.",
+    heroCopy: "Ask about entry points, file I/O, data flow, business rules, and dependencies.",
   },
   search: {
     label: "Search",

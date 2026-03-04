@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     pinecone_namespace: str = "nshmp-main:v1"
     openai_embedding_model: str = "text-embedding-3-small"
     openai_chat_model: str = "gpt-4o-mini"
+    enforce_embedding_dimension: bool = True
     external_call_retries: int = 3
     external_call_backoff_seconds: float = 0.5
     embedding_cache_size: int = 512
@@ -21,6 +22,9 @@ class Settings(BaseSettings):
     retrieval_min_hybrid_score: float = 0.35
     rag_max_context_chunks: int = 6
     pinecone_fallback_namespace: str | None = None
+    startup_smoke_mode: str = "off"
+    startup_smoke_query: str = "startup health probe"
+    startup_smoke_top_k: int = 1
 
     model_config = SettingsConfigDict(
         env_file=".env",

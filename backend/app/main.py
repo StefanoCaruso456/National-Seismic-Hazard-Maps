@@ -50,6 +50,9 @@ FORTRAN_LOOP_END_PATTERN = re.compile(r"^\s*(?:end\s*do|enddo|\d+\s+continue)\b"
 FORTRAN_IO_PATTERN = re.compile(r"\b(open|read|write|inquire|rewind|backspace|close)\b", re.IGNORECASE)
 CONFIG_DIR_HINTS = ("conf/", "etc/", "scripts/", "makefile", "readme", "run_", "run.")
 MODE_VALUES = {"chat", "search", "patterns", "dependencies"}
+FILTERABLE_LANGUAGES = {"fortran", "text", "pdf"}
+FILTERABLE_SOURCE_TYPES = {"repo", "upload", "temp-upload"}
+STARTUP_SMOKE_MODES = {"off", "warn", "strict"}
 QUERY_MAX_CHARS = 8000
 
 UPLOAD_MAX_FILES = 8
@@ -67,6 +70,7 @@ ATTACHMENT_NAMESPACE_VERSION = "v1"
 ATTACHMENT_VECTOR_PREFIX = "attchunk"
 ATTACHMENT_MARKER_PREFIX = "attfile"
 UPLOAD_MANIFEST_PATH = Path(__file__).resolve().parent / "data" / "attachments_manifest.json"
+EMBEDDING_METADATA_SCHEMA_VERSION = "v1"
 
 
 class QueryRequest(BaseModel):
@@ -75,6 +79,9 @@ class QueryRequest(BaseModel):
     mode: str = Field(default="chat")
     scope: str = Field(default="both")
     project_id: str = Field(default="nshmp-main", min_length=1, max_length=80)
+    path_prefix: str | None = Field(default=None, max_length=260)
+    language: str | None = Field(default=None, max_length=40)
+    source_type: str | None = Field(default=None, max_length=40)
     debug: bool = False
 
 
@@ -220,6 +227,13 @@ class UploadPinRequest(BaseModel):
 
 openai_client: OpenAI | None = None
 pinecone_client: Pinecone | None = None
+startup_smoke_state: dict[str, Any] = {
+    "mode": "off",
+    "checked_at": None,
+    "ok": None,
+    "errors": [],
+    "checks": {},
+}
 
 
 app = FastAPI(
@@ -230,13 +244,158 @@ static_dir = Path(__file__).resolve().parent / "static"
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 
+def normalize_startup_smoke_mode() -> str:
+    mode = (settings.startup_smoke_mode or "off").strip().lower()
+    if mode in STARTUP_SMOKE_MODES:
+        return mode
+    logger.warning("Invalid STARTUP_SMOKE_MODE=%r. Falling back to 'off'.", settings.startup_smoke_mode)
+    return "off"
+
+
+def startup_smoke_error(exc: Exception) -> str:
+    text = " ".join(str(exc).split())
+    return text[:280] if len(text) > 280 else text
+
+
+def run_startup_smoke_probe() -> dict[str, Any]:
+    mode = normalize_startup_smoke_mode()
+    checked_at = datetime.now(timezone.utc).isoformat()
+    result: dict[str, Any] = {
+        "mode": mode,
+        "checked_at": checked_at,
+        "ok": None,
+        "errors": [],
+        "checks": {},
+    }
+    if mode == "off":
+        result["ok"] = True
+        result["checks"] = {"startup_gate": {"ok": True, "skipped": True}}
+        return result
+
+    errors: list[str] = []
+    checks: dict[str, Any] = {}
+    probe_vector: list[float] | None = None
+
+    if not settings.openai_api_key:
+        errors.append("OPENAI_API_KEY is not configured")
+        checks["openai_embeddings"] = {"ok": False, "error": "missing_api_key"}
+    else:
+        try:
+            openai_probe = OpenAI(api_key=settings.openai_api_key)
+            embedding_response = call_with_retries(
+                "startup openai embeddings",
+                lambda: openai_probe.embeddings.create(
+                    model=settings.openai_embedding_model,
+                    input=settings.startup_smoke_query,
+                ),
+            )
+            probe_vector = list(embedding_response.data[0].embedding)
+            checks["openai_embeddings"] = {
+                "ok": True,
+                "model": settings.openai_embedding_model,
+                "dimension": len(probe_vector),
+            }
+        except Exception as exc:
+            message = startup_smoke_error(exc)
+            errors.append(f"OpenAI probe failed: {message}")
+            checks["openai_embeddings"] = {
+                "ok": False,
+                "error": message,
+                "model": settings.openai_embedding_model,
+            }
+
+    if not settings.pinecone_api_key:
+        errors.append("PINECONE_API_KEY is not configured")
+        checks["pinecone_index"] = {"ok": False, "error": "missing_api_key"}
+    else:
+        try:
+            pinecone_probe = Pinecone(api_key=settings.pinecone_api_key)
+            index = pinecone_probe.Index(settings.pinecone_index_name)
+            description_obj = call_with_retries(
+                "startup pinecone describe index",
+                lambda: pinecone_probe.describe_index(settings.pinecone_index_name),
+            )
+            index_dimension = index_dimension_from_description(description_obj)
+            stats_obj = call_with_retries("startup pinecone stats", lambda: index.describe_index_stats())
+            stats = stats_obj if isinstance(stats_obj, dict) else getattr(stats_obj, "to_dict", lambda: {})()
+            namespace_vector_count, _ = extract_vector_counts(stats, settings.pinecone_namespace)
+            checks["pinecone_index"] = {
+                "ok": True,
+                "index": settings.pinecone_index_name,
+                "namespace": settings.pinecone_namespace,
+                "namespace_vector_count": namespace_vector_count,
+                "dimension": index_dimension,
+            }
+            if probe_vector:
+                call_with_retries(
+                    "startup pinecone query",
+                    lambda: index.query(
+                        vector=probe_vector,
+                        top_k=max(settings.startup_smoke_top_k, 1),
+                        include_metadata=False,
+                        namespace=settings.pinecone_namespace,
+                    ),
+                )
+                checks["pinecone_query"] = {
+                    "ok": True,
+                    "top_k": max(settings.startup_smoke_top_k, 1),
+                    "namespace": settings.pinecone_namespace,
+                }
+        except Exception as exc:
+            message = startup_smoke_error(exc)
+            errors.append(f"Pinecone probe failed: {message}")
+            checks["pinecone_index"] = {
+                "ok": False,
+                "error": message,
+                "index": settings.pinecone_index_name,
+            }
+
+    result["checks"] = checks
+    result["errors"] = errors
+    result["ok"] = len(errors) == 0
+    return result
+
+
+def apply_startup_smoke_probe() -> None:
+    global startup_smoke_state
+    startup_smoke_state = run_startup_smoke_probe()
+    if startup_smoke_state.get("ok"):
+        logger.info("Startup smoke probe passed (mode=%s).", startup_smoke_state.get("mode"))
+        return
+
+    errors = startup_smoke_state.get("errors", [])
+    message = "; ".join(str(item) for item in errors if item) or "unknown error"
+    if startup_smoke_state.get("mode") == "strict":
+        raise RuntimeError(f"Startup smoke gate failed: {message}")
+    logger.warning("Startup smoke probe failed (mode=%s): %s", startup_smoke_state.get("mode"), message)
+
+
+def enforce_startup_smoke_gate() -> None:
+    if startup_smoke_state.get("mode") != "strict":
+        return
+    if startup_smoke_state.get("ok") is False:
+        message = "; ".join(str(item) for item in startup_smoke_state.get("errors", [])) or "startup smoke probe failed"
+        raise HTTPException(status_code=503, detail=f"Startup smoke gate failed: {message}")
+
+
+@app.on_event("startup")
+def startup_event() -> None:
+    apply_startup_smoke_probe()
+
+
 @app.get("/health")
 def health() -> dict:
+    mode = str(startup_smoke_state.get("mode", "off"))
+    smoke_ok = startup_smoke_state.get("ok")
+    health_status = "ok"
+    if mode != "off" and smoke_ok is False:
+        health_status = "degraded"
     return {
-        "status": "ok",
+        "status": health_status,
         "env": settings.app_env,
         "pinecone_index": settings.pinecone_index_name,
         "pinecone_namespace": settings.pinecone_namespace,
+        "startup_smoke": startup_smoke_state,
     }
 
 
@@ -267,6 +426,7 @@ def retrieval_info() -> RetrievalInfoResponse:
 
 def get_openai_client() -> OpenAI:
     global openai_client
+    enforce_startup_smoke_gate()
     if not settings.openai_api_key:
         raise HTTPException(status_code=503, detail="OPENAI_API_KEY is not configured")
     if openai_client is None:
@@ -276,6 +436,7 @@ def get_openai_client() -> OpenAI:
 
 def get_pinecone_index():
     global pinecone_client
+    enforce_startup_smoke_gate()
     if not settings.pinecone_api_key:
         raise HTTPException(status_code=503, detail="PINECONE_API_KEY is not configured")
     if pinecone_client is None:
@@ -318,6 +479,67 @@ def safe_int(value: Any) -> int | None:
         return None
 
 
+def normalize_index_description_payload(description: object) -> dict[str, Any]:
+    if isinstance(description, dict):
+        return description
+    if hasattr(description, "to_dict"):
+        try:
+            payload = description.to_dict()
+            if isinstance(payload, dict):
+                return payload
+        except Exception:
+            return {}
+    return {}
+
+
+def index_dimension_from_description(description: object) -> int | None:
+    attr_dimension = safe_int(getattr(description, "dimension", None))
+    if attr_dimension and attr_dimension > 0:
+        return attr_dimension
+    payload = normalize_index_description_payload(description)
+    for key in ("dimension", "vector_dimension"):
+        value = safe_int(payload.get(key))
+        if value and value > 0:
+            return value
+    return None
+
+
+@lru_cache(maxsize=4)
+def cached_index_dimension(index_name: str) -> int | None:
+    if not settings.pinecone_api_key:
+        return None
+    pinecone_probe = Pinecone(api_key=settings.pinecone_api_key)
+    if not hasattr(pinecone_probe, "describe_index"):
+        return None
+    description = call_with_retries(
+        "pinecone describe index",
+        lambda: pinecone_probe.describe_index(index_name),
+    )
+    return index_dimension_from_description(description)
+
+
+def ensure_embedding_dimension_matches_index(embedding_dim: int, index_dim: int | None = None) -> None:
+    if not settings.enforce_embedding_dimension:
+        return
+    expected = index_dim if index_dim is not None else cached_index_dimension(settings.pinecone_index_name)
+    if expected is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Unable to determine Pinecone index dimension for compatibility check. "
+                "Set ENFORCE_EMBEDDING_DIMENSION=false to bypass."
+            ),
+        )
+    if embedding_dim != expected:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Embedding dimension mismatch: embedding={embedding_dim}, index={expected}. "
+                "Update embedding model or recreate the Pinecone index."
+            ),
+        )
+
+
 def default_project_id() -> str:
     raw = (settings.pinecone_namespace or "nshmp-main").split(":")[0]
     cleaned = SAFE_PROJECT_ID_PATTERN.sub("-", raw).strip("._-")
@@ -344,6 +566,43 @@ def normalize_mode(value: str | None) -> str:
     if mode in MODE_VALUES:
         return mode
     raise HTTPException(status_code=422, detail="mode must be one of: chat, search, patterns, dependencies")
+
+
+def normalize_path_prefix(value: str | None) -> str | None:
+    if value is None:
+        return None
+    cleaned = str(value).strip().replace("\\", "/")
+    cleaned = cleaned.lstrip("/")
+    cleaned = re.sub(r"/{2,}", "/", cleaned)
+    if not cleaned:
+        return None
+    if ".." in cleaned.split("/"):
+        raise HTTPException(status_code=422, detail="path_prefix cannot contain parent traversal segments")
+    return cleaned[:260]
+
+
+def normalize_language(value: str | None) -> str | None:
+    if value is None:
+        return None
+    language = str(value).strip().lower()
+    if not language:
+        return None
+    if language not in FILTERABLE_LANGUAGES:
+        supported = ", ".join(sorted(FILTERABLE_LANGUAGES))
+        raise HTTPException(status_code=422, detail=f"language must be one of: {supported}")
+    return language
+
+
+def normalize_source_type(value: str | None) -> str | None:
+    if value is None:
+        return None
+    source_type = str(value).strip().lower()
+    if not source_type:
+        return None
+    if source_type not in FILTERABLE_SOURCE_TYPES:
+        supported = ", ".join(sorted(FILTERABLE_SOURCE_TYPES))
+        raise HTTPException(status_code=422, detail=f"source_type must be one of: {supported}")
+    return source_type
 
 
 def attachments_namespace(project_id: str) -> str:
@@ -581,6 +840,9 @@ def validate_query_request(
     mode: str = "chat",
     scope: str = "both",
     project_id: str | None = None,
+    path_prefix: str | None = None,
+    language: str | None = None,
+    source_type: str | None = None,
 ) -> QueryRequest:
     try:
         return QueryRequest(
@@ -590,6 +852,9 @@ def validate_query_request(
             mode=normalize_mode(mode),
             scope=normalize_scope(scope),
             project_id=normalize_project_id(project_id),
+            path_prefix=normalize_path_prefix(path_prefix),
+            language=normalize_language(language),
+            source_type=normalize_source_type(source_type),
         )
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=exc.errors()) from exc
@@ -602,7 +867,11 @@ def batched(items: list[Any], size: int):
         yield items[i : i + size]
 
 
-def embed_texts(texts: list[str]) -> list[list[float]]:
+def embed_texts(
+    texts: list[str],
+    check_index_dimension: bool = False,
+    index_dim: int | None = None,
+) -> list[list[float]]:
     if not texts:
         return []
     client = get_openai_client()
@@ -613,7 +882,10 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
             input=texts,
         ),
     )
-    return [list(item.embedding) for item in response.data]
+    embeddings = [list(item.embedding) for item in response.data]
+    if check_index_dimension and embeddings:
+        ensure_embedding_dimension_matches_index(len(embeddings[0]), index_dim=index_dim)
+    return embeddings
 
 
 def safe_upload_name(filename: str, index: int) -> str:
@@ -849,6 +1121,15 @@ def upsert_attachment_chunks(
     project = normalize_project_id(project_id)
     namespace = attachments_namespace(project)
     index = get_pinecone_index()
+    index_dim: int | None = None
+    if settings.enforce_embedding_dimension:
+        try:
+            index_dim = cached_index_dimension(settings.pinecone_index_name)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Failed to resolve Pinecone index dimension: {startup_smoke_error(exc)}",
+            ) from exc
 
     statuses: list[UploadIngestStatus] = []
     for upload in uploaded_files:
@@ -893,13 +1174,21 @@ def upsert_attachment_chunks(
         pending_vectors: list[tuple[str, list[float], dict[str, Any]]] = []
         next_chunk_index = 0
         for metadata_batch in batched(chunks, UPLOAD_EMBED_BATCH_SIZE):
-            embeddings = embed_texts([metadata_chunk_text(metadata) for metadata in metadata_batch])
+            embeddings = embed_texts(
+                [metadata_chunk_text(metadata) for metadata in metadata_batch],
+                check_index_dimension=True,
+                index_dim=index_dim,
+            )
             for metadata, embedding in zip(metadata_batch, embeddings, strict=True):
                 vector_id = attachment_chunk_id(file_sha, next_chunk_index)
                 next_chunk_index += 1
                 enriched = metadata.copy()
                 enriched["_record_type"] = "attachment_chunk"
                 enriched["project_id"] = project
+                enriched["embedding_model"] = settings.openai_embedding_model
+                enriched["embedding_provider"] = "openai"
+                enriched["embedding_dimension"] = len(embedding)
+                enriched["embedding_schema_version"] = EMBEDDING_METADATA_SCHEMA_VERSION
                 pending_vectors.append((vector_id, embedding, enriched))
 
             if len(pending_vectors) >= 100:
@@ -916,7 +1205,11 @@ def upsert_attachment_chunks(
                 lambda: index.upsert(vectors=pending_vectors, namespace=namespace),
             )
 
-        marker_embedding = embed_texts([f"attachment marker {file_sha} {file_name}"])[0]
+        marker_embedding = embed_texts(
+            [f"attachment marker {file_sha} {file_name}"],
+            check_index_dimension=True,
+            index_dim=index_dim,
+        )[0]
         marker_metadata = {
             "_record_type": "attachment_file",
             "source_type": "upload",
@@ -927,6 +1220,10 @@ def upsert_attachment_chunks(
             "project_id": project,
             "uploaded_at": datetime.now(timezone.utc).isoformat(),
             "chunk_text": f"attachment file marker {file_name}",
+            "embedding_model": settings.openai_embedding_model,
+            "embedding_provider": "openai",
+            "embedding_dimension": len(marker_embedding),
+            "embedding_schema_version": EMBEDDING_METADATA_SCHEMA_VERSION,
         }
         call_with_retries(
             "pinecone marker upsert",
@@ -1174,6 +1471,18 @@ def parse_form_bool(value: str | None) -> bool:
     if value is None:
         return False
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def normalized_request_filters(
+    path_prefix: str | None,
+    language: str | None,
+    source_type: str | None,
+) -> tuple[str | None, str | None, str | None]:
+    return (
+        normalize_path_prefix(path_prefix),
+        normalize_language(language),
+        normalize_source_type(source_type),
+    )
 
 
 def lexical_score(question_terms: set[str], identifiers: set[str], metadata: dict) -> float:
@@ -1943,12 +2252,52 @@ def query_namespaces() -> list[str]:
     return namespaces
 
 
+def build_pinecone_filter(
+    language: str | None = None,
+    source_type: str | None = None,
+) -> dict[str, Any] | None:
+    clauses: list[dict[str, Any]] = []
+    if language:
+        clauses.append({"language": {"$eq": language}})
+    if source_type:
+        clauses.append({"source_type": {"$eq": source_type}})
+    if not clauses:
+        return None
+    if len(clauses) == 1:
+        return clauses[0]
+    return {"$and": clauses}
+
+
+def metadata_matches_filters(
+    metadata: dict[str, Any],
+    path_prefix: str | None = None,
+    language: str | None = None,
+    source_type: str | None = None,
+) -> bool:
+    file_path = str(metadata.get("file_path", "")).replace("\\", "/").lstrip("/")
+    meta_language = str(metadata.get("language", "")).strip().lower()
+    meta_source_type = str(metadata.get("source_type", "")).strip().lower()
+
+    if path_prefix:
+        normalized_prefix = path_prefix.replace("\\", "/").lstrip("/").lower()
+        if not file_path.lower().startswith(normalized_prefix):
+            return False
+    if language and meta_language != language:
+        return False
+    if source_type and meta_source_type != source_type:
+        return False
+    return True
+
+
 def retrieve_citations_and_chunks(
     question: str,
     top_k: int,
     retrieval_queries: list[str] | None = None,
     namespaces: list[str] | None = None,
-    source_type: str = "repo",
+    default_source_type: str = "repo",
+    path_prefix: str | None = None,
+    language: str | None = None,
+    source_type_filter: str | None = None,
 ) -> tuple[list[Citation], list[str], dict[str, Any]]:
     queries = retrieval_queries or [question]
     target_namespaces = namespaces or query_namespaces()
@@ -1957,6 +2306,16 @@ def retrieve_citations_and_chunks(
         max(settings.retrieval_max_candidates, top_k),
     )
     index = get_pinecone_index()
+    index_dim: int | None = None
+    if settings.enforce_embedding_dimension:
+        try:
+            index_dim = cached_index_dimension(settings.pinecone_index_name)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Failed to resolve Pinecone index dimension: {startup_smoke_error(exc)}",
+            ) from exc
+    pinecone_filter = build_pinecone_filter(language=language, source_type=source_type_filter)
 
     matches: list = []
     subquery_counts: list[dict[str, Any]] = []
@@ -1965,22 +2324,24 @@ def retrieve_citations_and_chunks(
         if not question_vector:
             subquery_counts.append({"query": query_text, "matches": 0})
             continue
+        ensure_embedding_dimension_matches_index(len(question_vector), index_dim=index_dim)
 
         query_matches: list = []
         for namespace in target_namespaces:
-            results = call_with_retries(
-                "pinecone query",
-                lambda: index.query(
-                    vector=question_vector,
-                    top_k=candidate_top_k,
-                    include_metadata=True,
-                    namespace=namespace,
-                ),
-            )
+            query_kwargs: dict[str, Any] = {
+                "vector": question_vector,
+                "top_k": candidate_top_k,
+                "include_metadata": True,
+                "namespace": namespace,
+            }
+            if pinecone_filter:
+                query_kwargs["filter"] = pinecone_filter
+            results = call_with_retries("pinecone query", lambda: index.query(**query_kwargs))
             query_matches = normalize_matches(results)
             if query_matches:
                 break
 
+        accepted_count = 0
         for match in query_matches:
             metadata = normalize_metadata(match).copy()
             if str(metadata.get("_record_type", "")) == "attachment_file":
@@ -1988,9 +2349,17 @@ def retrieve_citations_and_chunks(
             if not metadata_chunk_text(metadata).strip():
                 continue
             metadata["query_used"] = query_text
-            metadata.setdefault("source_type", source_type)
+            metadata.setdefault("source_type", default_source_type)
+            if not metadata_matches_filters(
+                metadata,
+                path_prefix=path_prefix,
+                language=language,
+                source_type=source_type_filter,
+            ):
+                continue
             matches.append({"score": match_score(match), "metadata": metadata})
-        subquery_counts.append({"query": query_text, "matches": len(query_matches)})
+            accepted_count += 1
+        subquery_counts.append({"query": query_text, "matches": accepted_count})
 
     if not matches:
         return [], [], {"candidates": [], "subqueries": subquery_counts}
@@ -2007,6 +2376,9 @@ def retrieve_uploaded_citations_and_chunks(
     top_k: int,
     uploaded_files: list[dict[str, Any]],
     retrieval_queries: list[str] | None = None,
+    path_prefix: str | None = None,
+    language: str | None = None,
+    source_type_filter: str | None = None,
 ) -> tuple[list[Citation], list[str], dict[str, Any]]:
     if not uploaded_files:
         return [], [], {"candidates": [], "subqueries": []}
@@ -2030,6 +2402,13 @@ def retrieve_uploaded_citations_and_chunks(
             for metadata, embedding in zip(metadata_batch, embeddings, strict=True):
                 scoped = metadata.copy()
                 scoped["query_used"] = query_text
+                if not metadata_matches_filters(
+                    scoped,
+                    path_prefix=path_prefix,
+                    language=language,
+                    source_type=source_type_filter,
+                ):
+                    continue
                 matches.append(
                     {
                         "score": cosine_similarity(question_vector, embedding),
@@ -2084,6 +2463,9 @@ def retrieve_with_optional_uploads(
     scope: str,
     project_id: str,
     mode: str = "chat",
+    path_prefix: str | None = None,
+    language: str | None = None,
+    source_type_filter: str | None = None,
 ) -> tuple[list[Citation], list[str], dict[str, Any]]:
     normalized_mode = normalize_mode(mode)
     effective_top_k = max(top_k, 1)
@@ -2111,7 +2493,10 @@ def retrieve_with_optional_uploads(
                 top_k=effective_top_k,
                 retrieval_queries=retrieval_queries,
                 namespaces=query_namespaces(),
-                source_type="repo",
+                default_source_type="repo",
+                path_prefix=path_prefix,
+                language=language,
+                source_type_filter=source_type_filter,
             )
         except HTTPException as exc:
             logger.warning("Indexed retrieval unavailable: %s", exc.detail)
@@ -2126,7 +2511,10 @@ def retrieve_with_optional_uploads(
                 top_k=effective_top_k,
                 retrieval_queries=retrieval_queries,
                 namespaces=[attachment_ns],
-                source_type="upload",
+                default_source_type="upload",
+                path_prefix=path_prefix,
+                language=language,
+                source_type_filter=source_type_filter,
             )
         except HTTPException as exc:
             logger.warning("Attachment retrieval unavailable: %s", exc.detail)
@@ -2139,6 +2527,9 @@ def retrieve_with_optional_uploads(
                 top_k=effective_top_k,
                 uploaded_files=uploaded_files,
                 retrieval_queries=retrieval_queries,
+                path_prefix=path_prefix,
+                language=language,
+                source_type_filter=source_type_filter,
             )
 
     sets_to_merge: list[tuple[list[Citation], list[str], float]] = []
@@ -2170,6 +2561,11 @@ def retrieve_with_optional_uploads(
         "uploads": upload_debug,
         "intent_router": intent_debug,
         "retrieval_top_k": effective_top_k,
+        "filters": {
+            "path_prefix": path_prefix,
+            "language": language,
+            "source_type": source_type_filter,
+        },
     }
     return citations, chunks, debug
 
@@ -2399,6 +2795,11 @@ def generate_answer(question: str, context: str) -> str:
 @app.post("/api/search", response_model=SearchResponse)
 def search(payload: QueryRequest) -> SearchResponse:
     started = time.perf_counter()
+    path_prefix, language, source_type_filter = normalized_request_filters(
+        payload.path_prefix,
+        payload.language,
+        payload.source_type,
+    )
     try:
         citations, chunks, retrieval_debug = retrieve_with_optional_uploads(
             question=payload.question,
@@ -2407,6 +2808,9 @@ def search(payload: QueryRequest) -> SearchResponse:
             mode=normalize_mode(payload.mode),
             scope=normalize_scope(payload.scope),
             project_id=normalize_project_id(payload.project_id),
+            path_prefix=path_prefix,
+            language=language,
+            source_type_filter=source_type_filter,
         )
     except HTTPException:
         raise
@@ -2453,6 +2857,11 @@ def search(payload: QueryRequest) -> SearchResponse:
 @app.post("/api/query", response_model=QueryResponse)
 def query(payload: QueryRequest) -> QueryResponse:
     started = time.perf_counter()
+    path_prefix, language, source_type_filter = normalized_request_filters(
+        payload.path_prefix,
+        payload.language,
+        payload.source_type,
+    )
     try:
         citations, chunks, retrieval_debug = retrieve_with_optional_uploads(
             question=payload.question,
@@ -2461,6 +2870,9 @@ def query(payload: QueryRequest) -> QueryResponse:
             mode=normalize_mode(payload.mode),
             scope=normalize_scope(payload.scope),
             project_id=normalize_project_id(payload.project_id),
+            path_prefix=path_prefix,
+            language=language,
+            source_type_filter=source_type_filter,
         )
     except HTTPException:
         raise
@@ -2611,6 +3023,9 @@ async def search_with_uploads(
     mode: str = Form("chat"),
     scope: str = Form("both"),
     project_id: str | None = Form(default=None),
+    path_prefix: str | None = Form(default=None),
+    language: str | None = Form(default=None),
+    source_type: str | None = Form(default=None),
     persist_uploads: str | None = Form(default=None),
 ) -> SearchResponse:
     payload = validate_query_request(
@@ -2620,6 +3035,9 @@ async def search_with_uploads(
         mode=mode,
         scope=scope,
         project_id=project_id,
+        path_prefix=path_prefix,
+        language=language,
+        source_type=source_type,
     )
     uploaded_files = await extract_uploaded_files(files or [])
     persist = parse_form_bool(persist_uploads)
@@ -2635,6 +3053,9 @@ async def search_with_uploads(
             mode=payload.mode,
             scope=payload.scope,
             project_id=payload.project_id,
+            path_prefix=payload.path_prefix,
+            language=payload.language,
+            source_type_filter=payload.source_type,
         )
     except HTTPException:
         raise
@@ -2686,6 +3107,9 @@ async def query_with_uploads(
     mode: str = Form("chat"),
     scope: str = Form("both"),
     project_id: str | None = Form(default=None),
+    path_prefix: str | None = Form(default=None),
+    language: str | None = Form(default=None),
+    source_type: str | None = Form(default=None),
     persist_uploads: str | None = Form(default=None),
 ) -> QueryResponse:
     payload = validate_query_request(
@@ -2695,6 +3119,9 @@ async def query_with_uploads(
         mode=mode,
         scope=scope,
         project_id=project_id,
+        path_prefix=path_prefix,
+        language=language,
+        source_type=source_type,
     )
     uploaded_files = await extract_uploaded_files(files or [])
     persist = parse_form_bool(persist_uploads)
@@ -2710,6 +3137,9 @@ async def query_with_uploads(
             mode=payload.mode,
             scope=payload.scope,
             project_id=payload.project_id,
+            path_prefix=payload.path_prefix,
+            language=payload.language,
+            source_type_filter=payload.source_type,
         )
     except HTTPException:
         raise

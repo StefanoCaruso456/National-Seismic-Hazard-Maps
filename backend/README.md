@@ -81,12 +81,13 @@ Runtime debug endpoints are disabled by default. To enable them, set `APP_DEBUG=
 - `POST /api/uploads/{file_sha}/pin` pin/unpin upload metadata entry
 - `DELETE /api/uploads/{file_sha}` delete attachment vectors by `file_sha`
 - `GET /api/retrieval-info` retrieval scoring/limits metadata for the UI (`repo_url`, upload limits, score weights)
-- `GET /health` deployment health
+- `GET /health` deployment health + startup smoke gate status (`ok`/`degraded`)
 
 `/api/search` and `/api/query` accept `debug=true` in JSON to return retrieval traces.
 `/api/search/upload` and `/api/query/upload` accept multipart field `debug=true` for the same trace payload.
 `mode` can be `chat|search|patterns|dependencies` (mode-aware evidence + response formatting).
 `scope` can be `repo|uploads|both`; `project_id` selects attachment namespace scope.
+Optional retrieval filters: `path_prefix`, `language` (`fortran|text|pdf`), `source_type` (`repo|upload|temp-upload`).
 Upload persistence is opt-in via multipart field `persist_uploads=true` (default: not persisted).
 
 ## Retrieval quality and reliability defaults
@@ -122,6 +123,7 @@ Required env vars:
 - `PINECONE_NAMESPACE` (default: `nshmp-main:v1`)
 - `OPENAI_EMBEDDING_MODEL` (default: `text-embedding-3-small`)
 - `OPENAI_CHAT_MODEL` (default: `gpt-4o-mini`)
+- `ENFORCE_EMBEDDING_DIMENSION` (default: `true`)
 - `EXTERNAL_CALL_RETRIES` (default: `3`)
 - `EXTERNAL_CALL_BACKOFF_SECONDS` (default: `0.5`)
 - `EMBEDDING_CACHE_SIZE` (default: `512`)
@@ -131,6 +133,9 @@ Required env vars:
 - `RETRIEVAL_MIN_HYBRID_SCORE` (default: `0.35`)
 - `RAG_MAX_CONTEXT_CHUNKS` (default: `6`)
 - `PINECONE_FALLBACK_NAMESPACE` (optional; empty by default)
+- `STARTUP_SMOKE_MODE` (`off|warn|strict`, default: `off`)
+- `STARTUP_SMOKE_QUERY` (default: `startup health probe`)
+- `STARTUP_SMOKE_TOP_K` (default: `1`)
 
 ## MVP hard-gate mapping
 

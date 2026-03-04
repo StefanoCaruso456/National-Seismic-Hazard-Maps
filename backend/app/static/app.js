@@ -272,6 +272,8 @@ const DEFAULT_UPLOAD_LIMITS = {
   maxTotalBytes: 6_000_000,
 };
 
+const BACKEND_QUERY_SOFT_MAX = 1900;
+
 const state = {
   mode: "chat",
   scope: "both",
@@ -696,6 +698,54 @@ Report format contract:
 Overview -> Key Findings -> Evidence (files/lines) -> Recommendations -> Next Actions
 
 ${contextLine}`;
+}
+
+function formatApiErrorDetail(detail, fallback) {
+  if (!detail) return fallback;
+  if (typeof detail === "string") return detail;
+
+  if (Array.isArray(detail)) {
+    const parts = detail
+      .map((item) => {
+        if (!item) return "";
+        if (typeof item === "string") return item;
+        if (typeof item === "object") {
+          const loc = Array.isArray(item.loc) ? item.loc.join(".") : "";
+          const msg = typeof item.msg === "string" ? item.msg : JSON.stringify(item);
+          return loc ? `${loc}: ${msg}` : msg;
+        }
+        return String(item);
+      })
+      .filter(Boolean);
+    return parts.length ? parts.join(" | ") : fallback;
+  }
+
+  if (typeof detail === "object") {
+    if (typeof detail.message === "string") return detail.message;
+    return JSON.stringify(detail);
+  }
+
+  return String(detail);
+}
+
+function compactPromptWhitespace(text) {
+  return String(text || "")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .replace(/[ \t]{2,}/g, " ")
+    .trim();
+}
+
+function trimQuestionForBackend(question) {
+  const normalized = compactPromptWhitespace(question);
+  if (normalized.length <= BACKEND_QUERY_SOFT_MAX) {
+    return { value: normalized, trimmed: false };
+  }
+
+  const suffix = "\n\n[Prompt trimmed to fit backend request limits.]";
+  const maxBodyLength = Math.max(32, BACKEND_QUERY_SOFT_MAX - suffix.length);
+  const body = normalized.slice(0, maxBodyLength).trimEnd();
+  return { value: `${body}${suffix}`, trimmed: true };
 }
 
 function buildAuditDispatch(promptText) {
@@ -1318,8 +1368,9 @@ async function postJson(url, payload) {
   }
 
   if (!response.ok) {
-    const detail = data && data.detail ? data.detail : `Request failed with status ${response.status}`;
-    throw new Error(detail);
+    const fallback = `Request failed with status ${response.status}`;
+    const detail = data && "detail" in data ? data.detail : null;
+    throw new Error(formatApiErrorDetail(detail, fallback));
   }
 
   return data || {};
@@ -1352,8 +1403,9 @@ async function postMultipart(url, payload) {
   }
 
   if (!response.ok) {
-    const detail = data && data.detail ? data.detail : `Request failed with status ${response.status}`;
-    throw new Error(detail);
+    const fallback = `Request failed with status ${response.status}`;
+    const detail = data && "detail" in data ? data.detail : null;
+    throw new Error(formatApiErrorDetail(detail, fallback));
   }
 
   return data || {};
@@ -1483,6 +1535,8 @@ async function submitQuestion(options = {}) {
     state.activeAuditType = auditType;
     question = buildAuditWorkflowPrompt(auditType, rawQuestion);
   }
+  const preparedQuestion = trimQuestionForBackend(question);
+  question = preparedQuestion.value;
 
   const displaySeed = String(options.displayOverride || rawQuestion).trim() || rawQuestion;
   const displayQuestion =
@@ -1508,7 +1562,7 @@ async function submitQuestion(options = {}) {
   setStatus(
     `Running ${MODE_CONFIG[state.mode].label.toLowerCase()} request${
       state.attachments.length ? ` with ${state.attachments.length} upload(s)` : ""
-    }...`,
+    }${preparedQuestion.trimmed ? " (trimmed for backend limit)" : ""}...`,
   );
 
   const started = performance.now();

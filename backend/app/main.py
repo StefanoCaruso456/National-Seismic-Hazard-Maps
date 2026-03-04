@@ -50,6 +50,7 @@ FORTRAN_LOOP_END_PATTERN = re.compile(r"^\s*(?:end\s*do|enddo|\d+\s+continue)\b"
 FORTRAN_IO_PATTERN = re.compile(r"\b(open|read|write|inquire|rewind|backspace|close)\b", re.IGNORECASE)
 CONFIG_DIR_HINTS = ("conf/", "etc/", "scripts/", "makefile", "readme", "run_", "run.")
 MODE_VALUES = {"chat", "search", "patterns", "dependencies"}
+QUERY_MAX_CHARS = 8000
 
 UPLOAD_MAX_FILES = 8
 UPLOAD_MAX_FILE_BYTES = 1_500_000
@@ -69,7 +70,7 @@ UPLOAD_MANIFEST_PATH = Path(__file__).resolve().parent / "data" / "attachments_m
 
 
 class QueryRequest(BaseModel):
-    question: str = Field(min_length=3, max_length=2000)
+    question: str = Field(min_length=3, max_length=QUERY_MAX_CHARS)
     top_k: int = Field(default=5, ge=1, le=20)
     mode: str = Field(default="chat")
     scope: str = Field(default="both")

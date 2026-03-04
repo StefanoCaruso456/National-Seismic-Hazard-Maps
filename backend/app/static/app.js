@@ -18,6 +18,9 @@ const settingsBtn = document.getElementById("settingsBtn");
 const exportBtn = document.getElementById("exportBtn");
 const modePill = document.getElementById("modePill");
 const evidencePill = document.getElementById("evidencePill");
+const scopeBothBtn = document.getElementById("scopeBothBtn");
+const scopeRepoBtn = document.getElementById("scopeRepoBtn");
+const scopeUploadsBtn = document.getElementById("scopeUploadsBtn");
 const topKSelect = document.getElementById("topKSelect");
 const topKRange = document.getElementById("topKRange");
 const topKValue = document.getElementById("topKValue");
@@ -25,6 +28,9 @@ const scoreInfoBtn = document.getElementById("scoreInfoBtn");
 const scoreExplainer = document.getElementById("scoreExplainer");
 const statusLine = document.getElementById("statusLine");
 const attachmentList = document.getElementById("attachmentList");
+const uploadLibrarySection = document.getElementById("uploadLibrarySection");
+const uploadLibraryList = document.getElementById("uploadLibraryList");
+const refreshUploadsBtn = document.getElementById("refreshUploadsBtn");
 const pinnedSourcesSection = document.getElementById("pinnedSourcesSection");
 const pinnedSources = document.getElementById("pinnedSources");
 const clearPinsBtn = document.getElementById("clearPinsBtn");
@@ -37,6 +43,7 @@ const closeSettingsBtn = document.getElementById("closeSettingsBtn");
 const showSnippetsToggle = document.getElementById("showSnippetsToggle");
 const compactCitationsToggle = document.getElementById("compactCitationsToggle");
 const debugTraceToggle = document.getElementById("debugTraceToggle");
+const persistUploadsToggle = document.getElementById("persistUploadsToggle");
 const clearSessionBtn = document.getElementById("clearSessionBtn");
 
 const MODE_CONFIG = {
@@ -78,6 +85,7 @@ const DEFAULT_UPLOAD_LIMITS = {
 
 const state = {
   mode: "chat",
+  scope: "both",
   topK: 5,
   showSnippets: true,
   compactCitations: false,
@@ -89,6 +97,9 @@ const state = {
   loading: false,
   retrievalInfo: null,
   repoUrl: "https://github.com/StefanoCaruso456/National-Seismic-Hazard-Maps",
+  projectId: "nshmp-main",
+  persistUploads: false,
+  uploadLibrary: [],
   pinnedSources: [],
   debugPanelOpen: false,
   debugTraceEnabled: false,
@@ -136,6 +147,23 @@ function updateEvidencePill(evidence = null) {
   evidencePill.title = title;
   evidencePill.textContent =
     label === "unknown" ? "Evidence: n/a" : `Evidence: ${label[0].toUpperCase()}${label.slice(1)}${score}`;
+}
+
+function formatBytes(bytes) {
+  const value = Number(bytes);
+  if (!Number.isFinite(value) || value <= 0) return "0 B";
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+function setScope(scope) {
+  const normalized = ["repo", "uploads", "both"].includes(scope) ? scope : "both";
+  state.scope = normalized;
+  scopeBothBtn.classList.toggle("active", normalized === "both");
+  scopeRepoBtn.classList.toggle("active", normalized === "repo");
+  scopeUploadsBtn.classList.toggle("active", normalized === "uploads");
+  setStatus(`Scope: ${normalized}`);
 }
 
 function encodeRepoPath(path) {
@@ -194,6 +222,104 @@ function pinSource(item) {
   state.pinnedSources.push(item);
   renderPinnedSources();
   setStatus("Source pinned");
+}
+
+function renderUploadLibrary() {
+  uploadLibraryList.innerHTML = "";
+  if (!Array.isArray(state.uploadLibrary) || !state.uploadLibrary.length) {
+    const empty = document.createElement("div");
+    empty.className = "upload-meta";
+    empty.textContent = "No persisted uploads yet.";
+    uploadLibraryList.appendChild(empty);
+    return;
+  }
+
+  for (const entry of state.uploadLibrary) {
+    const row = document.createElement("article");
+    row.className = "upload-row";
+
+    const main = document.createElement("div");
+    main.className = "upload-main";
+
+    const name = document.createElement("span");
+    name.className = "upload-name";
+    name.textContent = entry.file_name || entry.file_sha;
+
+    const meta = document.createElement("span");
+    meta.className = "upload-meta";
+    meta.textContent = `${entry.file_sha} • ${formatBytes(entry.file_size)} • ${entry.chunk_count} chunks`;
+
+    main.append(name, meta);
+
+    const actions = document.createElement("div");
+    actions.className = "upload-actions";
+
+    const pinBtn = document.createElement("button");
+    pinBtn.type = "button";
+    pinBtn.className = "tiny-btn";
+    pinBtn.textContent = entry.pinned ? "Unpin" : "Pin";
+    pinBtn.dataset.uploadAction = "pin";
+    pinBtn.dataset.fileSha = entry.file_sha;
+    pinBtn.dataset.currentPinned = entry.pinned ? "1" : "0";
+
+    const deleteBtn = document.createElement("button");
+    deleteBtn.type = "button";
+    deleteBtn.className = "tiny-btn";
+    deleteBtn.textContent = "Delete";
+    deleteBtn.dataset.uploadAction = "delete";
+    deleteBtn.dataset.fileSha = entry.file_sha;
+
+    actions.append(pinBtn, deleteBtn);
+    row.append(main, actions);
+    uploadLibraryList.appendChild(row);
+  }
+}
+
+async function refreshUploadLibrary() {
+  try {
+    const response = await fetch(`/api/uploads?project_id=${encodeURIComponent(state.projectId)}`);
+    if (!response.ok) {
+      setStatus("Failed to refresh upload library", "warn");
+      return;
+    }
+    const data = await response.json();
+    state.uploadLibrary = Array.isArray(data.files) ? data.files : [];
+    renderUploadLibrary();
+  } catch (_err) {
+    setStatus("Failed to refresh upload library", "warn");
+  }
+}
+
+async function persistCurrentAttachments() {
+  if (!state.attachments.length || !state.persistUploads) return;
+
+  const formData = new FormData();
+  formData.append("project_id", state.projectId);
+  formData.append("persist_uploads", "true");
+  for (const attachment of state.attachments) {
+    formData.append("files", attachment.file, attachment.name);
+  }
+
+  const response = await fetch("/api/uploads/ingest", {
+    method: "POST",
+    body: formData,
+  });
+  let data = null;
+  try {
+    data = await response.json();
+  } catch (_err) {
+    data = null;
+  }
+  if (!response.ok) {
+    const detail = data && data.detail ? data.detail : `Upload ingestion failed (${response.status})`;
+    throw new Error(detail);
+  }
+
+  const statuses = Array.isArray(data.files) ? data.files : [];
+  const persisted = statuses.filter((row) => row.status === "persisted").length;
+  const skipped = statuses.filter((row) => row.status !== "persisted").length;
+  setStatus(`Uploads ingested: ${persisted} persisted, ${skipped} skipped`);
+  await refreshUploadLibrary();
 }
 
 function setDebugPanelState(open) {
@@ -401,12 +527,14 @@ async function copyText(text, successMessage = "Copied to clipboard") {
 function renderCitation(citationsWrap, item, index) {
   const score = normalizeScore(item.score);
   const rangeText = citationRange(item);
+  const sourceType = String(item.source_type || "repo");
+  const sourceLabel = sourceType === "repo" ? "Repo" : "Upload";
 
   if (state.compactCitations) {
     const chip = document.createElement("button");
     chip.type = "button";
     chip.className = "citation-chip";
-    chip.textContent = `#${index} ${rangeText} • ${scorePercent(score)}`;
+    chip.textContent = `[${sourceLabel}] #${index} ${rangeText} • ${scorePercent(score)}`;
     chip.title = "Copy citation";
     chip.addEventListener("click", () => {
       copyText(rangeText, "Citation copied");
@@ -436,7 +564,11 @@ function renderCitation(citationsWrap, item, index) {
   scorePill.className = "citation-score";
   scorePill.textContent = `${scorePercent(score)} ${confidenceLabel(score)}`;
 
-  lead.append(rank, path, scorePill);
+  const sourceBadge = document.createElement("span");
+  sourceBadge.className = `source-badge ${sourceType}`;
+  sourceBadge.textContent = sourceLabel;
+
+  lead.append(rank, sourceBadge, path, scorePill);
   header.appendChild(lead);
 
   const actions = document.createElement("div");
@@ -652,6 +784,9 @@ async function postMultipart(url, payload) {
   formData.append("question", payload.question);
   formData.append("top_k", String(payload.topK));
   formData.append("debug", payload.debug ? "true" : "false");
+  formData.append("scope", payload.scope || state.scope);
+  formData.append("project_id", payload.projectId || state.projectId);
+  formData.append("persist_uploads", payload.persistUploads ? "true" : "false");
 
   for (const file of payload.files || []) {
     formData.append("files", file, file.name);
@@ -680,6 +815,9 @@ async function postMultipart(url, payload) {
 async function runModeQuery(mode, question, files = []) {
   const hasUploads = Array.isArray(files) && files.length > 0;
   const debug = state.debugTraceEnabled;
+  const scope = state.scope;
+  const projectId = state.projectId;
+  const persistUploads = state.persistUploads;
   const searchRequest = async (topK) => {
     if (hasUploads) {
       return postMultipart("/api/search/upload", {
@@ -687,6 +825,9 @@ async function runModeQuery(mode, question, files = []) {
         topK,
         files,
         debug,
+        scope,
+        projectId,
+        persistUploads,
       });
     }
 
@@ -694,6 +835,8 @@ async function runModeQuery(mode, question, files = []) {
       question,
       top_k: topK,
       debug,
+      scope,
+      project_id: projectId,
     });
   };
 
@@ -704,11 +847,16 @@ async function runModeQuery(mode, question, files = []) {
           topK: state.topK,
           files,
           debug,
+          scope,
+          projectId,
+          persistUploads,
         })
       : await postJson("/api/query", {
           question,
           top_k: state.topK,
           debug,
+          scope,
+          project_id: projectId,
         });
 
     return {
@@ -788,10 +936,14 @@ async function submitQuestion(options = {}) {
   const started = performance.now();
 
   try {
+    if (state.persistUploads && state.attachments.length) {
+      await persistCurrentAttachments();
+    }
+    const filesToSend = state.persistUploads ? [] : state.attachments.map((item) => item.file);
     const result = await runModeQuery(
       state.mode,
       question,
-      state.attachments.map((item) => item.file),
+      filesToSend,
     );
     const elapsedMs = performance.now() - started;
 
@@ -916,12 +1068,16 @@ async function loadRetrievalInfo() {
     if (state.retrievalInfo.repo_url) {
       state.repoUrl = String(state.retrievalInfo.repo_url);
     }
+    if (state.retrievalInfo.default_project_id) {
+      state.projectId = String(state.retrievalInfo.default_project_id);
+    }
     if (state.retrievalInfo.query_top_k_max) {
       topKRange.max = String(Math.max(1, Number(state.retrievalInfo.query_top_k_max)));
     }
     populateTopKSelect(currentTopKMax());
     syncTopKInputs(state.topK);
     updateExplainerText();
+    await refreshUploadLibrary();
   } catch (_err) {
     populateTopKSelect(currentTopKMax());
     updateExplainerText();
@@ -980,6 +1136,9 @@ clearSessionBtn.addEventListener("click", () => {
 });
 
 refreshBtn.addEventListener("click", refreshLastPrompt);
+scopeBothBtn.addEventListener("click", () => setScope("both"));
+scopeRepoBtn.addEventListener("click", () => setScope("repo"));
+scopeUploadsBtn.addEventListener("click", () => setScope("uploads"));
 debugToggleBtn.addEventListener("click", () => {
   setDebugPanelState(!state.debugPanelOpen);
   if (state.debugPanelOpen) {
@@ -990,6 +1149,7 @@ settingsBtn.addEventListener("click", openSettings);
 closeSettingsBtn.addEventListener("click", closeSettings);
 overlay.addEventListener("click", closeSettings);
 exportBtn.addEventListener("click", exportSession);
+refreshUploadsBtn.addEventListener("click", refreshUploadLibrary);
 clearPinsBtn.addEventListener("click", () => {
   state.pinnedSources = [];
   renderPinnedSources();
@@ -1038,6 +1198,11 @@ debugTraceToggle.addEventListener("change", () => {
   if (state.debugTraceEnabled) {
     setDebugPanelState(true);
   }
+});
+
+persistUploadsToggle.addEventListener("change", () => {
+  state.persistUploads = persistUploadsToggle.checked;
+  setStatus(state.persistUploads ? "Upload persistence enabled" : "Upload persistence disabled");
 });
 
 attachBtn.addEventListener("click", () => fileInput.click());
@@ -1094,6 +1259,54 @@ attachmentList.addEventListener("click", (event) => {
   setStatus("Attachment removed");
 });
 
+uploadLibraryList.addEventListener("click", async (event) => {
+  const target = event.target;
+  if (!(target instanceof HTMLElement)) return;
+  const action = target.dataset.uploadAction;
+  const fileSha = target.dataset.fileSha;
+  if (!action || !fileSha) return;
+
+  if (action === "delete") {
+    try {
+      const response = await fetch(
+        `/api/uploads/${encodeURIComponent(fileSha)}?project_id=${encodeURIComponent(state.projectId)}`,
+        {
+          method: "DELETE",
+        },
+      );
+      if (!response.ok) {
+        throw new Error(`Delete failed (${response.status})`);
+      }
+      setStatus("Upload deleted");
+      await refreshUploadLibrary();
+    } catch (_err) {
+      setStatus("Failed to delete upload", "warn");
+    }
+    return;
+  }
+
+  if (action === "pin") {
+    const currentPinned = target.dataset.currentPinned === "1";
+    try {
+      const response = await fetch(`/api/uploads/${encodeURIComponent(fileSha)}/pin`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          project_id: state.projectId,
+          pinned: !currentPinned,
+        }),
+      });
+      if (!response.ok) {
+        throw new Error(`Pin failed (${response.status})`);
+      }
+      setStatus(currentPinned ? "Upload unpinned" : "Upload pinned");
+      await refreshUploadLibrary();
+    } catch (_err) {
+      setStatus("Failed to pin upload", "warn");
+    }
+  }
+});
+
 toggleSidebar.addEventListener("click", () => {
   sidebar.classList.toggle("open");
 });
@@ -1117,11 +1330,14 @@ micBtn.addEventListener("click", () => {
 populateTopKSelect(currentTopKMax());
 syncTopKInputs(state.topK);
 state.debugTraceEnabled = debugTraceToggle.checked;
+state.persistUploads = persistUploadsToggle.checked;
+setScope("both");
 setMode("chat");
 initSpeech();
 autoResize();
 updateEvidencePill(null);
 renderPinnedSources();
+renderUploadLibrary();
 setDebugPanelState(false);
 renderDebugPayload(null);
 loadRetrievalInfo();

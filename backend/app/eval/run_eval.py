@@ -86,6 +86,8 @@ def evaluate(items: list[EvalItem], top_k: int) -> dict:
             question=item.question,
             top_k=max(top_k, 10),
             uploaded_files=[],
+            scope="repo",
+            project_id="nshmp-main",
         )
         paths = [citation.file_path for citation in citations]
         r5 = recall_at_k(paths, item.expected_paths, 5)

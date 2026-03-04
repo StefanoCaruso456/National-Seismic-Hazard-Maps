@@ -62,6 +62,11 @@
           <div class="insight-left">
             <span class="mode-pill" id="modePill">Mode: Chat</span>
             <span class="evidence-pill unknown" id="evidencePill">Evidence: n/a</span>
+            <div class="scope-toggle" role="group" aria-label="Search scope">
+              <button class="tiny-btn scope-btn active" id="scopeBothBtn" type="button">Both</button>
+              <button class="tiny-btn scope-btn" id="scopeRepoBtn" type="button">Repo</button>
+              <button class="tiny-btn scope-btn" id="scopeUploadsBtn" type="button">Uploads</button>
+            </div>
             <label for="topKSelect" class="topk-label">Top K</label>
             <select id="topKSelect" class="topk-select" aria-label="Retrieved chunks">
               <option value="3">3</option>
@@ -80,6 +85,14 @@
             Relevance is a hybrid score from semantic similarity + lexical overlap, normalized to 0-100.
             Top K controls how many chunks are retrieved per request.
           </p>
+        </section>
+
+        <section class="upload-library" id="uploadLibrarySection">
+          <div class="pinned-head">
+            <strong>Stored Uploads</strong>
+            <button class="tiny-btn" type="button" id="refreshUploadsBtn">Refresh</button>
+          </div>
+          <div class="upload-library-list" id="uploadLibraryList"></div>
         </section>
 
         <section class="pinned-sources hidden" id="pinnedSourcesSection">
@@ -140,6 +153,13 @@
         <span>Enable debug trace in requests</span>
         <input id="debugTraceToggle" type="checkbox" />
       </label>
+      <label class="settings-row toggle-row">
+        <span>Persist uploads in Pinecone</span>
+        <input id="persistUploadsToggle" type="checkbox" />
+      </label>
+      <p class="settings-note">
+        Uploads are not stored unless this is enabled. Stored uploads can be deleted anytime from the upload list.
+      </p>
       <button class="action-btn" id="clearSessionBtn" type="button">Clear session</button>
     </aside>
 

@@ -217,6 +217,25 @@ body {
   flex-wrap: wrap;
 }
 
+.scope-toggle {
+  display: inline-flex;
+  gap: 4px;
+  padding: 2px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.4);
+}
+
+.scope-btn {
+  border-radius: 999px;
+  padding: 5px 10px;
+}
+
+.scope-btn.active {
+  background: rgba(95, 137, 149, 0.18);
+  border-color: rgba(95, 137, 149, 0.4);
+}
+
 .mode-pill {
   border-radius: 999px;
   border: 1px solid rgba(95, 137, 149, 0.35);
@@ -303,6 +322,52 @@ body {
   border-radius: 12px;
   background: rgba(255, 255, 255, 0.52);
   padding: 10px 12px;
+}
+
+.upload-library {
+  width: min(960px, calc(100% - 32px));
+  margin: 0 auto 8px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.52);
+  padding: 10px 12px;
+}
+
+.upload-library-list {
+  display: grid;
+  gap: 6px;
+}
+
+.upload-row {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.62);
+  padding: 8px 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.upload-main {
+  display: grid;
+  gap: 2px;
+}
+
+.upload-name {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.upload-meta {
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+
+.upload-actions {
+  display: inline-flex;
+  gap: 6px;
 }
 
 .pinned-head,
@@ -473,6 +538,26 @@ body {
   padding: 2px 8px;
 }
 
+.source-badge {
+  font-size: 11px;
+  font-weight: 600;
+  border-radius: 999px;
+  padding: 2px 8px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.68);
+}
+
+.source-badge.repo {
+  border-color: rgba(95, 137, 149, 0.42);
+  background: rgba(95, 137, 149, 0.15);
+}
+
+.source-badge.upload,
+.source-badge.temp-upload {
+  border-color: rgba(209, 115, 111, 0.38);
+  background: rgba(209, 115, 111, 0.14);
+}
+
 .citation-actions {
   display: flex;
   gap: 6px;
@@ -634,6 +719,12 @@ textarea {
   font-size: 14px;
 }
 
+.settings-note {
+  margin: -4px 0 0;
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+
 .settings-row output {
   font-size: 13px;
   color: var(--ink-soft);
@@ -704,6 +795,7 @@ textarea {
   .attachment-list,
   .insight-strip,
   .score-explainer,
+  .upload-library,
   .pinned-sources,
   .debug-panel {
     width: calc(100% - 8px);

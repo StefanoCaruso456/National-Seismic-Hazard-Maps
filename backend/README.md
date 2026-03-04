@@ -76,11 +76,17 @@ Runtime debug endpoints are disabled by default. To enable them, set `APP_DEBUG=
 - `POST /api/query` RAG answer generation using retrieved Pinecone context
 - `POST /api/search/upload` multipart search with temporary retrieval scope from attached files
 - `POST /api/query/upload` multipart RAG answer with attached-file chunking + retrieval
+- `POST /api/uploads/ingest` persist uploads into Pinecone attachment namespace (`attachments:<project_id>:v1`) with SHA-256 dedupe
+- `GET /api/uploads` list persisted uploads for project
+- `POST /api/uploads/{file_sha}/pin` pin/unpin upload metadata entry
+- `DELETE /api/uploads/{file_sha}` delete attachment vectors by `file_sha`
 - `GET /api/retrieval-info` retrieval scoring/limits metadata for the UI (`repo_url`, upload limits, score weights)
 - `GET /health` deployment health
 
 `/api/search` and `/api/query` accept `debug=true` in JSON to return retrieval traces.
 `/api/search/upload` and `/api/query/upload` accept multipart field `debug=true` for the same trace payload.
+`scope` can be `repo|uploads|both`; `project_id` selects attachment namespace scope.
+Upload persistence is opt-in via multipart field `persist_uploads=true` (default: not persisted).
 
 ## Retrieval quality and reliability defaults
 
@@ -92,7 +98,8 @@ The backend uses:
 - Dedup by `file_path + line range`
 - Minimum hybrid score filter (fallback to best available results if no match passes threshold)
 - Optional namespace fallback (`PINECONE_FALLBACK_NAMESPACE`)
-- Attachment-aware temporary retrieval scope (uploads are chunked/embedded per request and merged into ranking)
+- Attachment-aware retrieval across repo namespace + persistent upload namespace
+- Upload ingestion pipeline with SHA-256 dedupe and PDF/text extraction
 - Query rewrite/decomposition for implementation/workflow/config style questions
 - Evidence strength scoring (`High|Medium|Low`) and insufficient-evidence refusal policy
 

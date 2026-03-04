@@ -15,11 +15,23 @@ if TYPE_CHECKING:
     from pinecone import Pinecone
 
 FORTRAN_EXTENSIONS = {".f", ".for", ".f90", ".f95", ".f03", ".f08", ".inc"}
+EXCLUDED_DISCOVERY_DIRS = {
+    ".git",
+    ".hg",
+    ".svn",
+    ".venv",
+    "__pycache__",
+    "build",
+    "dist",
+    "vendor",
+    "node_modules",
+}
 START_PATTERN = re.compile(
     r"^\s*(program|subroutine|function|module(?!\s+procedure)|block\s+data|interface)\b",
     re.IGNORECASE,
 )
 TOKEN_PATTERN = re.compile(r"\w+|[^\w\s]", re.UNICODE)
+EMBEDDING_METADATA_SCHEMA_VERSION = "v1"
 
 
 @dataclass
@@ -74,11 +86,16 @@ def parse_args() -> argparse.Namespace:
 
 
 def discover_fortran_files(repo_root: Path, extensions: set[str]) -> list[Path]:
+    root = repo_root.resolve()
     files: list[Path] = []
-    for path in repo_root.rglob("*"):
+    for path in root.rglob("*"):
         if not path.is_file():
             continue
-        if "/.git/" in str(path).replace("\\", "/"):
+        try:
+            rel_parts = [part.lower() for part in path.relative_to(root).parts[:-1]]
+        except ValueError:
+            continue
+        if any(part in EXCLUDED_DISCOVERY_DIRS for part in rel_parts):
             continue
         if path.suffix.lower() in extensions:
             files.append(path)
@@ -239,6 +256,63 @@ def batched(items: list, size: int) -> Iterable[list]:
         yield items[i : i + size]
 
 
+def normalize_index_description(description: object) -> dict[str, Any]:
+    if isinstance(description, dict):
+        return description
+    if hasattr(description, "to_dict"):
+        try:
+            payload = description.to_dict()
+            if isinstance(payload, dict):
+                return payload
+        except Exception:
+            return {}
+    return {}
+
+
+def pinecone_index_dimension(pinecone_client: Any) -> int | None:
+    try:
+        if not hasattr(pinecone_client, "describe_index"):
+            return None
+        description = call_with_retries(
+            "pinecone describe index",
+            lambda: pinecone_client.describe_index(settings.pinecone_index_name),
+        )
+    except Exception:
+        return None
+
+    if hasattr(description, "dimension"):
+        try:
+            value = int(getattr(description, "dimension"))
+            if value > 0:
+                return value
+        except (TypeError, ValueError):
+            pass
+
+    payload = normalize_index_description(description)
+    for key in ("dimension", "vector_dimension"):
+        try:
+            value = int(payload.get(key)) if payload.get(key) is not None else None
+        except (TypeError, ValueError):
+            value = None
+        if value and value > 0:
+            return value
+    return None
+
+
+def ensure_index_dimension_match(index_dim: int | None, embedding_dim: int) -> None:
+    if not settings.enforce_embedding_dimension:
+        return
+    if index_dim is None:
+        raise RuntimeError(
+            "Could not determine Pinecone index dimension; set ENFORCE_EMBEDDING_DIMENSION=false to bypass."
+        )
+    if embedding_dim != index_dim:
+        raise RuntimeError(
+            f"Embedding dimension mismatch: embedding={embedding_dim}, index={index_dim}. "
+            "Recreate index or change embedding model."
+        )
+
+
 def call_with_retries(action: str, fn):
     attempts = max(settings.external_call_retries, 1)
     base_backoff = max(settings.external_call_backoff_seconds, 0.0)
@@ -297,6 +371,7 @@ def ingest(args: argparse.Namespace) -> None:
 
     openai_client, pinecone_client = ensure_clients()
     index = pinecone_client.Index(settings.pinecone_index_name)
+    index_dim = pinecone_index_dimension(pinecone_client)
     if args.delete_existing:
         call_with_retries(
             "pinecone namespace delete_all",
@@ -306,6 +381,7 @@ def ingest(args: argparse.Namespace) -> None:
 
     pending_vectors: list[tuple[str, list[float], dict]] = []
     total_upserted = 0
+    checked_index_dimension = False
     for chunk_batch in batched(chunks, args.embed_batch_size):
         texts = [chunk.chunk_text for chunk in chunk_batch]
         embeddings = call_with_retries(
@@ -317,13 +393,22 @@ def ingest(args: argparse.Namespace) -> None:
         )
 
         for chunk, embedded in zip(chunk_batch, embeddings, strict=True):
+            embedding_dim = len(embedded.embedding)
+            if not checked_index_dimension:
+                ensure_index_dimension_match(index_dim=index_dim, embedding_dim=embedding_dim)
+                checked_index_dimension = True
             metadata = {
                 "file_path": chunk.file_path,
                 "line_start": chunk.line_start,
                 "line_end": chunk.line_end,
                 "section_name": chunk.section_name,
                 "language": "fortran",
+                "source_type": "repo",
                 "chunk_text": chunk.chunk_text,
+                "embedding_model": settings.openai_embedding_model,
+                "embedding_provider": "openai",
+                "embedding_dimension": embedding_dim,
+                "embedding_schema_version": EMBEDDING_METADATA_SCHEMA_VERSION,
             }
             pending_vectors.append((chunk_id(args.namespace, chunk), embedded.embedding, metadata))
 

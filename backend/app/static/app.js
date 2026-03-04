@@ -12,7 +12,8 @@ const recentChatsList = document.getElementById("recentChatsList");
 const sidebar = document.getElementById("sidebar");
 const toggleSidebar = document.getElementById("toggleSidebar");
 const template = document.getElementById("messageTemplate");
-const modeButtons = Array.from(document.querySelectorAll(".mode-btn"));
+const modeButtons = Array.from(document.querySelectorAll(".mode-btn[data-mode]"));
+const auditLaunchBtn = document.getElementById("auditLaunchBtn");
 const refreshBtn = document.getElementById("refreshBtn");
 const debugToggleBtn = document.getElementById("debugToggleBtn");
 const settingsBtn = document.getElementById("settingsBtn");
@@ -81,7 +82,136 @@ const MODE_CONFIG = {
     heroCopy:
       "Dependency mode surfaces call sites, module usage, and shared common blocks from the top retrieved chunks.",
   },
+  audit: {
+    label: "Audit",
+    placeholder: "Select an audit type or describe the area you want audited...",
+    heroTitle: "Run Structured Engineering Audits",
+    heroCopy:
+      "Audit mode generates scannable reports with findings, evidence, recommended fixes, and prioritized next actions.",
+  },
 };
+
+const AUDIT_REPORT_CONTRACT = `Return the report in this exact section order:
+Overview
+Key Findings
+Evidence (files/lines)
+Recommendations
+Next Actions
+
+For every finding include:
+- Priority: High | Medium | Low
+- Why it matters
+- File/function evidence with file paths and line ranges when available
+- Recommended fix (incremental, no rewrites)
+
+If the repository is large, start with a fast scan and add a "Deeper Pass Targets" subsection in Next Actions.`;
+
+const AUDIT_WORKFLOWS = {
+  architecture: {
+    title: "Architecture Audit (System Map + Critical Paths)",
+    reportType: "Architecture Audit",
+    followUps: [
+      "Deeper pass: trace dependency chains from run_all_hazard.sh",
+      "Deeper pass: analyze top 3 high-risk coupling areas",
+      "Deeper pass: map runtime flow for the ingestion pipeline",
+    ],
+    prompt: `You are a senior staff engineer performing an Architecture Audit on this codebase.
+
+Objectives:
+- Identify true entry points (CLI, scripts, services, jobs, UI bootstraps, schedulers).
+- Build a component map of major domains/modules and responsibilities.
+- Trace critical execution paths for top 3-5 core flows.
+- Surface hidden coupling, circular dependencies, tight integrations, and high-risk areas.
+- Highlight global state, side effects, concurrency hazards, IO-heavy sections, and brittle integrations.
+
+Method:
+- Start with a repository scan, then trace from entry points inward.
+- Use evidence-based reporting with concrete files/functions.
+- Prefer concrete call chains over vague descriptions.
+- No rewrites; prioritize incremental, safe refactors.
+
+Required sections:
+- Executive Summary (10 lines max)
+- System Map (component purpose, inputs/outputs, key files)
+- Entry Points (how invoked, what triggered, key call chain)
+- Critical Paths (top 3-5, step-by-step with file/function refs)
+- Dependency and Coupling Risks
+- Architecture Recommendations (5-10 actions by ROI)
+- Immediate Next Steps ("If I had 2 days, I'd do X")
+
+${AUDIT_REPORT_CONTRACT}`,
+  },
+  stack: {
+    title: "Stack & Dependency Audit (Tech + Runtime + Build)",
+    reportType: "Stack & Dependency Audit",
+    followUps: [
+      "Deeper pass: dependency risk register with patch plan",
+      "Deeper pass: build and environment reproducibility audit",
+      "Deeper pass: runtime topology with external integration risks",
+    ],
+    prompt: `You are a senior platform engineer performing a Stack and Dependency Audit.
+
+Objectives:
+- Identify full stack: languages, frameworks, libraries, and major subsystems.
+- Document build/run pipeline with install, config, test, build, and start steps.
+- Map runtime architecture: services, workers, scripts, jobs, databases, caches, external APIs.
+- Audit dependency risks (outdated versions, vulnerable/unmaintained libs, overlap).
+- Identify config and environment risks: secrets, env var sprawl, non-reproducible builds.
+
+Method:
+- Enumerate manifests, lockfiles, build scripts, CI/CD descriptors, and runtime configs.
+- Distinguish verified facts vs inferred assumptions.
+- Prefer minimal-change recommendations that reduce risk quickly.
+
+Required sections:
+- Stack Snapshot (table: category, technology, where found)
+- Build and Run Golden Path (commands, env vars, common failures/fixes)
+- Runtime Topology (components and communication map)
+- Dependency Risk Register (top 10 risks with impact and effort)
+- Security and Secrets Review
+- Recommended Standardization (5-10 improvements)
+- Next Actions (prioritized checklist)
+
+${AUDIT_REPORT_CONTRACT}`,
+  },
+  maintainability: {
+    title: "Maintainability & Risk Audit (Hotspots + Debt + Test Health)",
+    reportType: "Maintainability & Risk Audit",
+    followUps: [
+      "Deeper pass: top 10 hotspot modules with refactor sequence",
+      "Deeper pass: critical-path test gap analysis",
+      "Deeper pass: reliability and observability risk drill-down",
+    ],
+    prompt: `You are a senior engineering lead running a Maintainability and Risk Audit.
+
+Objectives:
+- Identify change-risk hotspots: complexity, coupling, high-churn zones, TODO/FIXME heavy areas.
+- Find maintainability smells: duplication, god modules, unclear boundaries, hidden side effects.
+- Assess test health: missing tests on critical paths, flaky patterns, integration gaps.
+- Assess operational risk: error handling gaps, weak observability, retry/idempotency issues.
+- Deliver a phased refactor and test plan with quick wins and medium-term actions.
+
+Method:
+- Start with directory-level triage, then deep-dive top 10 central modules.
+- Use objective signals (size, complexity approximation, fan-in/fan-out, dependency depth).
+- Avoid rewrites; optimize for safe incremental progress.
+
+Required sections:
+- Executive Summary (10 lines max)
+- Hotspot Leaderboard (ranked with risk reason and ROI)
+- Technical Debt Themes (3-7 recurring issues with examples)
+- Test and Quality Assessment
+- Reliability and Observability Gaps
+- Refactor Plan (Phase 0-3)
+- Definition of Done with measurable outcomes
+
+${AUDIT_REPORT_CONTRACT}`,
+  },
+};
+
+const AUDIT_PROMPT_TO_TYPE = Object.fromEntries(
+  Object.entries(AUDIT_WORKFLOWS).map(([type, workflow]) => [workflow.title, type]),
+);
 
 const PROMPT_MODE_CATEGORIES = [
   {
@@ -124,6 +254,16 @@ const PROMPT_MODE_CATEGORIES = [
       "Show the call chain for hazgridX",
     ],
   },
+  {
+    key: "audit-workflows",
+    title: "AUDIT",
+    mode: "audit",
+    prompts: [
+      AUDIT_WORKFLOWS.architecture.title,
+      AUDIT_WORKFLOWS.stack.title,
+      AUDIT_WORKFLOWS.maintainability.title,
+    ],
+  },
 ];
 
 const DEFAULT_UPLOAD_LIMITS = {
@@ -157,6 +297,7 @@ const state = {
   currentSessionTitle: null,
   contextFile: "",
   suggestionModalOpen: false,
+  activeAuditType: "architecture",
 };
 
 function autoResize() {
@@ -422,6 +563,9 @@ function setBusy(isBusy) {
   sendBtn.disabled = state.loading;
   refreshBtn.disabled = state.loading;
   suggestionBtn.disabled = state.loading;
+  if (auditLaunchBtn) {
+    auditLaunchBtn.disabled = state.loading;
+  }
 }
 
 function setStatus(text, tone = "") {
@@ -510,6 +654,64 @@ function contextSuggestions(contextFile) {
   ];
 }
 
+function inferAuditType(text) {
+  const normalized = String(text || "").trim().toLowerCase();
+  if (!normalized) return state.activeAuditType || "architecture";
+  if (normalized.includes("stack") || normalized.includes("dependency")) return "stack";
+  if (
+    normalized.includes("maintainability")
+    || normalized.includes("risk")
+    || normalized.includes("hotspot")
+    || normalized.includes("debt")
+    || normalized.includes("test")
+  ) {
+    return "maintainability";
+  }
+  return "architecture";
+}
+
+function auditFollowUpsForType(auditType) {
+  const workflow = AUDIT_WORKFLOWS[auditType];
+  if (!workflow) return [];
+  return workflow.followUps.slice(0, 3);
+}
+
+function buildAuditWorkflowPrompt(auditType, userIntent = "") {
+  const resolvedType = AUDIT_WORKFLOWS[auditType] ? auditType : inferAuditType(userIntent);
+  const workflow = AUDIT_WORKFLOWS[resolvedType];
+  const intent = String(userIntent || "").trim();
+  const contextLine = intent
+    ? `Audit focus request from user: ${intent}\nConstrain recommendations to this focus where possible.`
+    : "Audit focus request from user: full repository baseline scan.";
+
+  return `${workflow.prompt}
+
+Execution requirements:
+- Start with a fast scan baseline.
+- If repository size/complexity is high, identify specific deeper-pass targets.
+- Mark uncertainty explicitly as Hypothesis + verification steps.
+- Keep recommendations incremental and safe.
+
+Report format contract:
+Overview -> Key Findings -> Evidence (files/lines) -> Recommendations -> Next Actions
+
+${contextLine}`;
+}
+
+function buildAuditDispatch(promptText) {
+  const mappedType = AUDIT_PROMPT_TO_TYPE[promptText];
+  const auditType = mappedType || inferAuditType(promptText);
+  return {
+    auditType,
+    displayText: AUDIT_WORKFLOWS[auditType].title,
+    workflowPrompt: buildAuditWorkflowPrompt(auditType, promptText),
+  };
+}
+
+function apiModeForMode(mode) {
+  return mode === "audit" ? "chat" : mode;
+}
+
 function PromptChip(promptText, mode, onSelect) {
   const chip = document.createElement("button");
   chip.type = "button";
@@ -524,6 +726,9 @@ function PromptChip(promptText, mode, onSelect) {
 function PromptCategory(category, onSelect) {
   const section = document.createElement("section");
   section.className = "prompt-category";
+  if (category.key) {
+    section.dataset.categoryKey = category.key;
+  }
 
   const title = document.createElement("h4");
   const uniqueModes = [...new Set(category.prompts.map((item) => item.mode))];
@@ -543,25 +748,30 @@ function PromptCategory(category, onSelect) {
   return section;
 }
 
-function PromptSuggestionModal(modeCategories, onSelect, contextFile) {
+function PromptSuggestionModal(modeCategories, onSelect, contextFile, options = {}) {
   promptModalBody.innerHTML = "";
+  const filterKeys = Array.isArray(options.filterKeys) ? new Set(options.filterKeys) : null;
 
-  const normalizedCategories = modeCategories.map((category) => ({
-    title: category.title,
-    prompts: category.prompts.slice(0, 3).map((text) => ({
-      text,
-      mode: category.mode,
-    })),
-  }));
+  const normalizedCategories = modeCategories
+    .filter((category) => !filterKeys || filterKeys.has(category.key))
+    .map((category) => ({
+      key: category.key,
+      title: category.title,
+      prompts: category.prompts.slice(0, 3).map((text) => ({
+        text,
+        mode: category.mode,
+      })),
+    }));
 
   normalizedCategories.forEach((category) => {
     promptModalBody.appendChild(PromptCategory(category, onSelect));
   });
 
   const contextPromptItems = contextSuggestions(contextFile);
-  if (contextPromptItems.length) {
+  if (contextPromptItems.length && !filterKeys) {
     promptModalBody.appendChild(
       PromptCategory({
+        key: "context-suggestions",
         title: "CONTEXT SUGGESTIONS",
         prompts: contextPromptItems,
       }, onSelect),
@@ -569,17 +779,25 @@ function PromptSuggestionModal(modeCategories, onSelect, contextFile) {
   }
 }
 
-function openSuggestionModal() {
+function openSuggestionModal(options = {}) {
   if (state.loading) {
     setStatus("Wait for the current request to finish", "warn");
     return;
   }
   closeSettings();
   const contextFile = deriveContextFile();
-  PromptSuggestionModal(PROMPT_MODE_CATEGORIES, onPromptSelected, contextFile);
+  PromptSuggestionModal(PROMPT_MODE_CATEGORIES, onPromptSelected, contextFile, options);
   state.suggestionModalOpen = true;
   suggestionOverlay.classList.remove("hidden");
   promptSuggestionModal.classList.remove("hidden");
+
+  const focusKey = String(options.focusKey || "").trim();
+  if (focusKey) {
+    requestAnimationFrame(() => {
+      const target = promptModalBody.querySelector(`[data-category-key="${focusKey}"]`);
+      if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  }
 }
 
 function closeSuggestionModal() {
@@ -591,13 +809,28 @@ function closeSuggestionModal() {
 async function onPromptSelected(promptText, mode) {
   closeSuggestionModal();
   setMode(mode);
-  input.value = promptText;
+  let dispatchPrompt = promptText;
+  let displayPrompt = promptText;
+  let auditType = null;
+
+  if (mode === "audit") {
+    const dispatch = buildAuditDispatch(promptText);
+    auditType = dispatch.auditType;
+    state.activeAuditType = dispatch.auditType;
+    dispatchPrompt = dispatch.workflowPrompt;
+    displayPrompt = dispatch.displayText;
+  }
+
+  input.value = displayPrompt;
   autoResize();
   updateEvidencePill(null);
   setStatus(`Mode: ${MODE_CONFIG[mode].label} • Evidence: n/a • TopK: ${state.topK}`);
   await submitQuestion({
     modeOverride: mode,
-    questionOverride: promptText,
+    questionOverride: dispatchPrompt,
+    displayOverride: displayPrompt,
+    skipAuditWrap: mode === "audit",
+    auditType,
   });
 }
 
@@ -715,6 +948,7 @@ function resetSession() {
   state.lastDebugPayload = null;
   state.currentSessionTitle = null;
   state.contextFile = "";
+  state.activeAuditType = "architecture";
   closeSuggestionModal();
   renderAttachmentList();
   renderPinnedSources();
@@ -739,6 +973,7 @@ function buildMetaText(role, meta) {
 }
 
 function defaultResultTypeForMode(mode) {
+  if (mode === "audit") return "Audit Report";
   if (mode === "dependencies") return "Dependency Graph";
   if (mode === "patterns") return "Pattern Examples";
   if (mode === "search") return "Ranked Chunks";
@@ -1130,7 +1365,8 @@ async function runModeQuery(mode, question, files = []) {
   const scope = state.scope;
   const projectId = state.projectId;
   const persistUploads = state.persistUploads;
-  const normalizedMode = mode || state.mode;
+  const uiMode = mode || state.mode;
+  const apiMode = apiModeForMode(uiMode);
   const searchRequest = async (topK) => {
     if (hasUploads) {
       return postMultipart("/api/search/upload", {
@@ -1138,7 +1374,7 @@ async function runModeQuery(mode, question, files = []) {
         topK,
         files,
         debug,
-        mode: normalizedMode,
+        mode: apiMode,
         scope,
         projectId,
         persistUploads,
@@ -1149,29 +1385,30 @@ async function runModeQuery(mode, question, files = []) {
       question,
       top_k: topK,
       debug,
-      mode: normalizedMode,
+      mode: apiMode,
       scope,
       project_id: projectId,
     });
   };
 
-  if (normalizedMode === "chat") {
+  if (uiMode === "chat" || uiMode === "audit") {
+    const requestTopK = uiMode === "audit" ? Math.min(20, Math.max(state.topK, 8)) : state.topK;
     const data = hasUploads
       ? await postMultipart("/api/query/upload", {
           question,
-          topK: state.topK,
+          topK: requestTopK,
           files,
           debug,
-          mode: normalizedMode,
+          mode: apiMode,
           scope,
           projectId,
           persistUploads,
         })
       : await postJson("/api/query", {
           question,
-          top_k: state.topK,
+          top_k: requestTopK,
           debug,
-          mode: normalizedMode,
+          mode: apiMode,
           scope,
           project_id: projectId,
         });
@@ -1181,12 +1418,12 @@ async function runModeQuery(mode, question, files = []) {
       citations: data.citations || [],
       evidence: data.evidence_strength || {},
       debug: data.debug || null,
-      resultType: defaultResultTypeForMode(normalizedMode),
-      followUps: [],
+      resultType: defaultResultTypeForMode(uiMode),
+      followUps: uiMode === "audit" ? auditFollowUpsForType(state.activeAuditType) : [],
     };
   }
 
-  if (normalizedMode === "search") {
+  if (uiMode === "search") {
     const topK = state.topK;
     const data = await searchRequest(topK);
     const matches = data.matches || [];
@@ -1196,12 +1433,12 @@ async function runModeQuery(mode, question, files = []) {
       citations: matches,
       evidence: data.evidence_strength || {},
       debug: data.debug || null,
-      resultType: data.result_type || defaultResultTypeForMode(normalizedMode),
+      resultType: data.result_type || defaultResultTypeForMode(uiMode),
       followUps: normalizeFollowUps(data.follow_ups || []),
     };
   }
 
-  if (normalizedMode === "patterns") {
+  if (uiMode === "patterns") {
     const expandedTopK = Math.min(20, Math.max(state.topK, 6));
     const data = await searchRequest(expandedTopK);
     const matches = data.matches || [];
@@ -1210,7 +1447,7 @@ async function runModeQuery(mode, question, files = []) {
       citations: matches,
       evidence: data.evidence_strength || {},
       debug: data.debug || null,
-      resultType: data.result_type || defaultResultTypeForMode(normalizedMode),
+      resultType: data.result_type || defaultResultTypeForMode(uiMode),
       followUps: normalizeFollowUps(data.follow_ups || []),
     };
   }
@@ -1223,7 +1460,7 @@ async function runModeQuery(mode, question, files = []) {
     citations: matches,
     evidence: data.evidence_strength || {},
     debug: data.debug || null,
-    resultType: data.result_type || defaultResultTypeForMode(normalizedMode),
+    resultType: data.result_type || defaultResultTypeForMode(uiMode),
     followUps: normalizeFollowUps(data.follow_ups || []),
   };
 }
@@ -1234,16 +1471,24 @@ async function submitQuestion(options = {}) {
     setMode(currentMode);
   }
 
-  const question = (options.questionOverride || input.value).trim();
-  if (!question) {
+  const rawQuestion = (options.questionOverride || input.value).trim();
+  if (!rawQuestion) {
     setStatus("Type a question first", "warn");
     return;
   }
 
+  let question = rawQuestion;
+  if (currentMode === "audit" && !options.skipAuditWrap) {
+    const auditType = options.auditType || state.activeAuditType || inferAuditType(rawQuestion);
+    state.activeAuditType = auditType;
+    question = buildAuditWorkflowPrompt(auditType, rawQuestion);
+  }
+
+  const displaySeed = String(options.displayOverride || rawQuestion).trim() || rawQuestion;
   const displayQuestion =
     state.attachments.length && !options.questionOverride
-      ? `${question}\n[Attached: ${state.attachments.map((item) => item.name).join(", ")}]`
-      : question;
+      ? `${displaySeed}\n[Attached: ${state.attachments.map((item) => item.name).join(", ")}]`
+      : displaySeed;
 
   hero.style.display = "none";
   addMessage("user", displayQuestion, [], { modeLabel: MODE_CONFIG[state.mode].label });
@@ -1253,7 +1498,13 @@ async function submitQuestion(options = {}) {
   }
 
   setBusy(true);
-  state.lastRequest = { mode: state.mode, question };
+  state.lastRequest = {
+    mode: state.mode,
+    question,
+    display: displaySeed,
+    skipAuditWrap: currentMode === "audit",
+    auditType: state.activeAuditType || null,
+  };
   setStatus(
     `Running ${MODE_CONFIG[state.mode].label.toLowerCase()} request${
       state.attachments.length ? ` with ${state.attachments.length} upload(s)` : ""
@@ -1362,6 +1613,9 @@ async function refreshLastPrompt() {
   await submitQuestion({
     modeOverride: state.lastRequest.mode,
     questionOverride: state.lastRequest.question,
+    displayOverride: state.lastRequest.display,
+    skipAuditWrap: Boolean(state.lastRequest.skipAuditWrap),
+    auditType: state.lastRequest.auditType || null,
   });
 }
 
@@ -1455,7 +1709,14 @@ function initSpeech() {
 
 modeButtons.forEach((item) => {
   item.addEventListener("click", () => {
-    setMode(item.dataset.mode);
+    const mode = item.dataset.mode;
+    setMode(mode);
+    if (mode === "audit") {
+      openSuggestionModal({
+        filterKeys: ["audit-workflows"],
+        focusKey: "audit-workflows",
+      });
+    }
   });
 });
 
@@ -1494,7 +1755,7 @@ exploreCapabilitiesLink.addEventListener("click", (event) => {
   event.preventDefault();
   closeSuggestionModal();
   setMode("chat");
-  input.value = "Show example questions I can ask in Chat, Search, Code Patterns, and Dependencies modes.";
+  input.value = "Show example questions I can ask in Chat, Search, Code Patterns, Dependencies, and Audit modes.";
   autoResize();
   setStatus("Capabilities example inserted");
 });

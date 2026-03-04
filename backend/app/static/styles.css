@@ -695,6 +695,17 @@ body.compact-mode .citation-card .toggle-snippet-btn {
   font-weight: 600;
 }
 
+.audit-launch-btn {
+  border-color: rgba(209, 115, 111, 0.45);
+  background: rgba(209, 115, 111, 0.12);
+  font-weight: 600;
+}
+
+.audit-launch-btn.active {
+  border-color: rgba(209, 115, 111, 0.55);
+  background: rgba(209, 115, 111, 0.2);
+}
+
 .attachment-list {
   width: min(960px, 100% - 16px);
   margin: 0 auto 8px;

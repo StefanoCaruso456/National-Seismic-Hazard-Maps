@@ -178,6 +178,7 @@ body {
 .topbar-actions {
   display: flex;
   gap: 8px;
+  margin-left: auto;
 }
 
 .icon-btn {

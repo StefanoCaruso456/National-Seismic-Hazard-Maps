@@ -82,6 +82,13 @@ const MODE_CONFIG = {
     heroCopy:
       "Dependency mode surfaces call sites, module usage, and shared common blocks from the top retrieved chunks.",
   },
+  diagrams: {
+    label: "Diagrams",
+    placeholder: "Select a diagram type to map architecture, execution, data flow, or dependencies...",
+    heroTitle: "Generate Repository Diagrams",
+    heroCopy:
+      "Diagram mode generates Mermaid diagrams from repository evidence so engineers can quickly understand system structure and runtime flow.",
+  },
   audit: {
     label: "Audit",
     placeholder: "Run a full codebase audit or describe a focus area...",
@@ -136,6 +143,136 @@ Required content inside the report:
 ${AUDIT_REPORT_CONTRACT}`,
 };
 
+const DIAGRAM_WORKFLOWS = {
+  systemArchitecture: {
+    title: "System Architecture Diagram",
+    reportType: "System Architecture Diagram",
+    followUps: [
+      "Refine architecture diagram around ingestion and compute boundaries",
+      "Add external systems and deployment boundary nodes",
+      "Generate a zoomed-in diagram for the hazard engine subsystem",
+    ],
+    prompt: `You are a senior software architect analyzing a code repository.
+
+Task: generate a HIGH-LEVEL SYSTEM ARCHITECTURE DIAGRAM.
+
+Process requirements:
+1) Scan the repository structure first.
+2) Build an internal repo map before reasoning.
+3) Identify major components: entry scripts, core compute modules, config/data inputs, build tools, outputs, external deps.
+4) Group components into logical subsystems.
+5) Identify directional relationships between subsystems.
+
+Output requirements:
+- Return ONLY Mermaid.
+- Use flowchart TD.
+- Keep it high-level with 8-12 nodes.
+- Prefer subsystem names, not individual files.
+- No prose outside the Mermaid block.`,
+  },
+  executionPipeline: {
+    title: "Execution Pipeline Diagram",
+    reportType: "Execution Pipeline Diagram",
+    followUps: [
+      "Trace startup path from the primary run script in more detail",
+      "Add optional and error branches in the pipeline",
+      "Generate pipeline focused only on output generation stages",
+    ],
+    prompt: `You are a software engineer investigating repository execution.
+
+Task: produce an EXECUTION PIPELINE DIAGRAM.
+
+Process requirements:
+1) Find entry points (shell scripts, mains, run scripts, Make targets).
+2) Determine execution order.
+3) Identify key runtime stages (preprocess, init, compute, aggregate, export).
+4) Trace runtime sequence end-to-end.
+
+Output requirements:
+- Return ONLY Mermaid.
+- Use flowchart LR.
+- Show strict execution order.
+- Max 10 nodes.
+- Avoid low-level function names.`,
+  },
+  dataFlow: {
+    title: "Data Flow Diagram",
+    reportType: "Data Flow Diagram",
+    followUps: [
+      "Add more detail for configuration and lookup-table lineage",
+      "Show intermediate datasets and transformation boundaries",
+      "Generate data flow only for one critical output artifact",
+    ],
+    prompt: `You are a data systems architect.
+
+Task: produce a DATA FLOW DIAGRAM for this repository.
+
+Process requirements:
+1) Identify major data inputs (configs, datasets, model parameters, lookup tables).
+2) Identify transformations.
+3) Identify outputs (maps, simulation outputs, processed datasets).
+4) Trace lineage from input to output.
+
+Output requirements:
+- Return ONLY Mermaid.
+- Use flowchart TD.
+- Show transformations clearly with descriptive node names.
+- Max 12 nodes.`,
+  },
+  dependencyGraph: {
+    title: "Code Dependency Graph",
+    reportType: "Module Dependency Graph",
+    followUps: [
+      "Expand dependency graph around the most central module",
+      "Map dependency chains starting from run scripts",
+      "Highlight possible circular dependencies and shared utility overload",
+    ],
+    prompt: `You are analyzing internal code dependencies of a repository.
+
+Task: create a MODULE DEPENDENCY GRAPH.
+
+Process requirements:
+1) Scan source code first.
+2) Identify major modules/packages/files.
+3) Detect directional dependencies from imports, usage, and call relationships.
+4) Focus on central modules only.
+
+Output requirements:
+- Return ONLY Mermaid.
+- Use graph TD.
+- Include top 10 most important modules only.
+- Do not include every file.`,
+  },
+  buildRuntime: {
+    title: "Build & Runtime Environment Diagram",
+    reportType: "Build and Runtime Environment Diagram",
+    followUps: [
+      "Add CI/CD and deployment stages to the environment diagram",
+      "Expand runtime dependency nodes for configs and data mounts",
+      "Generate a reproducibility-focused build/run diagram",
+    ],
+    prompt: `You are a build systems engineer.
+
+Task: create a BUILD AND RUNTIME ENVIRONMENT DIAGRAM.
+
+Process requirements:
+1) Identify build system and toolchain (Make, scripts, compiler commands).
+2) Identify compiler/runtime artifacts.
+3) Identify runtime dependencies (data, config, env vars).
+4) Identify final executable/services and outputs.
+
+Output requirements:
+- Return ONLY Mermaid.
+- Use flowchart TD.
+- Focus on build and runtime environment.
+- Keep it readable; avoid low-level file detail.`,
+  },
+};
+
+const DIAGRAM_PROMPT_TO_TYPE = Object.fromEntries(
+  Object.entries(DIAGRAM_WORKFLOWS).map(([type, workflow]) => [workflow.title, type]),
+);
+
 const PROMPT_MODE_CATEGORIES = [
   {
     key: "system-overview",
@@ -175,6 +312,25 @@ const PROMPT_MODE_CATEGORIES = [
       "Trace dependencies from run_all_hazard.sh",
       "Which modules depend on hazard curve routines?",
       "Show the call chain for hazgridX",
+    ],
+  },
+  {
+    key: "diagram-types",
+    title: "DIAGRAMS",
+    mode: "diagrams",
+    prompts: [
+      DIAGRAM_WORKFLOWS.systemArchitecture.title,
+      DIAGRAM_WORKFLOWS.executionPipeline.title,
+      DIAGRAM_WORKFLOWS.dataFlow.title,
+    ],
+  },
+  {
+    key: "diagram-types-advanced",
+    title: "DIAGRAMS ADVANCED",
+    mode: "diagrams",
+    prompts: [
+      DIAGRAM_WORKFLOWS.dependencyGraph.title,
+      DIAGRAM_WORKFLOWS.buildRuntime.title,
     ],
   },
   {
@@ -218,6 +374,7 @@ const state = {
   currentSessionTitle: null,
   contextFile: "",
   suggestionModalOpen: false,
+  activeDiagramType: "systemArchitecture",
 };
 
 function autoResize() {
@@ -483,6 +640,9 @@ function setBusy(isBusy) {
   sendBtn.disabled = state.loading;
   refreshBtn.disabled = state.loading;
   suggestionBtn.disabled = state.loading;
+  modeButtons.forEach((btn) => {
+    btn.disabled = state.loading;
+  });
   if (auditLaunchBtn) {
     auditLaunchBtn.disabled = state.loading;
   }
@@ -654,8 +814,60 @@ function buildAuditDispatch(promptText) {
   };
 }
 
+function inferDiagramType(text) {
+  const normalized = String(text || "").trim().toLowerCase();
+  if (!normalized) return state.activeDiagramType || "systemArchitecture";
+  if (normalized.includes("execution") || normalized.includes("pipeline") || normalized.includes("runtime flow")) {
+    return "executionPipeline";
+  }
+  if (normalized.includes("data flow") || normalized.includes("lineage")) {
+    return "dataFlow";
+  }
+  if (normalized.includes("dependency") || normalized.includes("module graph") || normalized.includes("import")) {
+    return "dependencyGraph";
+  }
+  if (normalized.includes("build") || normalized.includes("runtime environment") || normalized.includes("compiler")) {
+    return "buildRuntime";
+  }
+  return "systemArchitecture";
+}
+
+function diagramFollowUpsForType(diagramType) {
+  const workflow = DIAGRAM_WORKFLOWS[diagramType];
+  if (!workflow) return [];
+  return workflow.followUps.slice(0, 3);
+}
+
+function buildDiagramWorkflowPrompt(diagramType, userIntent = "") {
+  const resolvedType = DIAGRAM_WORKFLOWS[diagramType] ? diagramType : inferDiagramType(userIntent);
+  const workflow = DIAGRAM_WORKFLOWS[resolvedType];
+  const intent = String(userIntent || "").trim();
+  const focusLine = intent
+    ? `Focus request from user: ${intent}\nConstrain node labels and scope around this focus where possible.`
+    : "Focus request from user: full repository baseline.";
+
+  return `${workflow.prompt}
+
+Global guardrails:
+- First scan repo, then reason, then draw.
+- Use evidence from discovered files/modules; avoid invented components.
+- Keep node labels concise and engineering-relevant.
+
+${focusLine}`;
+}
+
+function buildDiagramDispatch(promptText) {
+  const mappedType = DIAGRAM_PROMPT_TO_TYPE[promptText];
+  const diagramType = mappedType || inferDiagramType(promptText);
+  return {
+    diagramType,
+    displayText: DIAGRAM_WORKFLOWS[diagramType].title,
+    workflowPrompt: buildDiagramWorkflowPrompt(diagramType, promptText),
+  };
+}
+
 function apiModeForMode(mode) {
-  return mode === "audit" ? "chat" : mode;
+  return mode === "audit" || mode === "diagrams" ? "chat" : mode;
 }
 
 function PromptChip(promptText, mode, onSelect) {
@@ -757,9 +969,16 @@ async function onPromptSelected(promptText, mode) {
   setMode(mode);
   let dispatchPrompt = promptText;
   let displayPrompt = promptText;
+  let diagramType = null;
 
   if (mode === "audit") {
     const dispatch = buildAuditDispatch(promptText);
+    dispatchPrompt = dispatch.workflowPrompt;
+    displayPrompt = dispatch.displayText;
+  } else if (mode === "diagrams") {
+    const dispatch = buildDiagramDispatch(promptText);
+    diagramType = dispatch.diagramType;
+    state.activeDiagramType = dispatch.diagramType;
     dispatchPrompt = dispatch.workflowPrompt;
     displayPrompt = dispatch.displayText;
   }
@@ -773,6 +992,8 @@ async function onPromptSelected(promptText, mode) {
     questionOverride: dispatchPrompt,
     displayOverride: displayPrompt,
     skipAuditWrap: mode === "audit",
+    skipDiagramWrap: mode === "diagrams",
+    diagramType,
   });
 }
 
@@ -890,6 +1111,7 @@ function resetSession() {
   state.lastDebugPayload = null;
   state.currentSessionTitle = null;
   state.contextFile = "";
+  state.activeDiagramType = "systemArchitecture";
   closeSuggestionModal();
   renderAttachmentList();
   renderPinnedSources();
@@ -915,6 +1137,7 @@ function buildMetaText(role, meta) {
 
 function defaultResultTypeForMode(mode) {
   if (mode === "audit") return AUDIT_WORKFLOW.reportType;
+  if (mode === "diagrams") return "Mermaid Diagram";
   if (mode === "dependencies") return "Dependency Graph";
   if (mode === "patterns") return "Pattern Examples";
   if (mode === "search") return "Ranked Chunks";
@@ -1341,8 +1564,9 @@ async function runModeQuery(mode, question, files = []) {
     });
   };
 
-  if (uiMode === "chat" || uiMode === "audit") {
-    const requestTopK = uiMode === "audit" ? Math.min(20, Math.max(state.topK, 8)) : state.topK;
+  if (uiMode === "chat" || uiMode === "audit" || uiMode === "diagrams") {
+    const requestTopK =
+      uiMode === "audit" || uiMode === "diagrams" ? Math.min(20, Math.max(state.topK, 8)) : state.topK;
     const data = hasUploads
       ? await postMultipart("/api/query/upload", {
           question,
@@ -1369,7 +1593,12 @@ async function runModeQuery(mode, question, files = []) {
       evidence: data.evidence_strength || {},
       debug: data.debug || null,
       resultType: defaultResultTypeForMode(uiMode),
-      followUps: uiMode === "audit" ? auditFollowUps() : [],
+      followUps:
+        uiMode === "audit"
+          ? auditFollowUps()
+          : uiMode === "diagrams"
+            ? diagramFollowUpsForType(state.activeDiagramType)
+            : [],
     };
   }
 
@@ -1430,6 +1659,10 @@ async function submitQuestion(options = {}) {
   let question = rawQuestion;
   if (currentMode === "audit" && !options.skipAuditWrap) {
     question = buildAuditWorkflowPrompt(rawQuestion);
+  } else if (currentMode === "diagrams" && !options.skipDiagramWrap) {
+    const diagramType = options.diagramType || state.activeDiagramType || inferDiagramType(rawQuestion);
+    state.activeDiagramType = diagramType;
+    question = buildDiagramWorkflowPrompt(diagramType, rawQuestion);
   }
   const preparedQuestion = trimQuestionForBackend(question);
   question = preparedQuestion.value;
@@ -1453,6 +1686,8 @@ async function submitQuestion(options = {}) {
     question,
     display: displaySeed,
     skipAuditWrap: currentMode === "audit",
+    skipDiagramWrap: currentMode === "diagrams",
+    diagramType: state.mode === "diagrams" ? state.activeDiagramType : null,
   };
   setStatus(
     `Running ${MODE_CONFIG[state.mode].label.toLowerCase()} request${
@@ -1564,6 +1799,8 @@ async function refreshLastPrompt() {
     questionOverride: state.lastRequest.question,
     displayOverride: state.lastRequest.display,
     skipAuditWrap: Boolean(state.lastRequest.skipAuditWrap),
+    skipDiagramWrap: Boolean(state.lastRequest.skipDiagramWrap),
+    diagramType: state.lastRequest.diagramType || null,
   });
 }
 
@@ -1658,6 +1895,14 @@ function initSpeech() {
 modeButtons.forEach((item) => {
   item.addEventListener("click", () => {
     const mode = item.dataset.mode;
+    if (mode === "diagrams") {
+      setMode("diagrams");
+      openSuggestionModal({
+        filterKeys: ["diagram-types", "diagram-types-advanced"],
+        focusKey: "diagram-types",
+      });
+      return;
+    }
     if (mode === "audit") {
       const dispatch = buildAuditDispatch(AUDIT_WORKFLOW.title);
       closeSuggestionModal();
@@ -1712,7 +1957,7 @@ exploreCapabilitiesLink.addEventListener("click", (event) => {
   event.preventDefault();
   closeSuggestionModal();
   setMode("chat");
-  input.value = "Show example questions I can ask in Chat, Search, Code Patterns, Dependencies, and Run Audit modes.";
+  input.value = "Show example questions I can ask in Chat, Search, Code Patterns, Dependencies, Diagrams, and Run Audit modes.";
   autoResize();
   setStatus("Capabilities example inserted");
 });

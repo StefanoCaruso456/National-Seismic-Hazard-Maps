@@ -84,10 +84,10 @@ const MODE_CONFIG = {
   },
   audit: {
     label: "Audit",
-    placeholder: "Select an audit type or describe the area you want audited...",
-    heroTitle: "Run Structured Engineering Audits",
+    placeholder: "Run a full codebase audit or describe a focus area...",
+    heroTitle: "Run A Unified Codebase Audit",
     heroCopy:
-      "Audit mode generates scannable reports with findings, evidence, recommended fixes, and prioritized next actions.",
+      "Run one fast baseline audit across architecture, stack/dependencies, and maintainability, then drill deeper on selected areas.",
   },
 };
 
@@ -106,112 +106,35 @@ For every finding include:
 
 If the repository is large, start with a fast scan and add a "Deeper Pass Targets" subsection in Next Actions.`;
 
-const AUDIT_WORKFLOWS = {
-  architecture: {
-    title: "Architecture Audit (System Map + Critical Paths)",
-    reportType: "Architecture Audit",
-    followUps: [
-      "Deeper pass: trace dependency chains from run_all_hazard.sh",
-      "Deeper pass: analyze top 3 high-risk coupling areas",
-      "Deeper pass: map runtime flow for the ingestion pipeline",
-    ],
-    prompt: `You are a senior staff engineer performing an Architecture Audit on this codebase.
+const AUDIT_WORKFLOW = {
+  title: "Run Codebase Audit",
+  reportType: "Audit Report",
+  followUps: [
+    "Deeper pass: architecture map + critical execution paths",
+    "Deeper pass: stack/build/runtime dependency risk register",
+    "Deeper pass: maintainability hotspots + test gap plan",
+  ],
+  prompt: `You are a senior staff engineer performing a unified Codebase Audit for a legacy or brownfield repository.
 
-Objectives:
-- Identify true entry points (CLI, scripts, services, jobs, UI bootstraps, schedulers).
-- Build a component map of major domains/modules and responsibilities.
-- Trace critical execution paths for top 3-5 core flows.
-- Surface hidden coupling, circular dependencies, tight integrations, and high-risk areas.
-- Highlight global state, side effects, concurrency hazards, IO-heavy sections, and brittle integrations.
+Primary goals:
+- Build a system map: entry points, major modules, critical call chains, and high-risk coupling.
+- Inventory stack and runtime: languages, frameworks, build/run commands, manifests, runtime assumptions, infra integrations.
+- Identify maintainability and change-risk hotspots: complexity, duplication, weak boundaries, test gaps, reliability concerns.
 
 Method:
-- Start with a repository scan, then trace from entry points inward.
-- Use evidence-based reporting with concrete files/functions.
-- Prefer concrete call chains over vague descriptions.
-- No rewrites; prioritize incremental, safe refactors.
+- Use a trace-driven approach: start from entry points and follow real execution/data flow.
+- Start with a fast scan baseline for the full repo, then mark best candidates for deeper pass.
+- Distinguish verified evidence vs inference; label uncertain claims as "Hypothesis" with verification steps.
+- Prioritize incremental fixes and safe refactors; do not recommend rewrites.
 
-Required sections:
-- Executive Summary (10 lines max)
-- System Map (component purpose, inputs/outputs, key files)
-- Entry Points (how invoked, what triggered, key call chain)
-- Critical Paths (top 3-5, step-by-step with file/function refs)
-- Dependency and Coupling Risks
-- Architecture Recommendations (5-10 actions by ROI)
-- Immediate Next Steps ("If I had 2 days, I'd do X")
+Required content inside the report:
+- Architecture: component map, where execution starts, top critical paths, coupling risks.
+- Stack and Dependencies: stack snapshot, build/run golden path, dependency risks, config/env gaps.
+- Maintainability and Risk: hotspot leaderboard, test/quality gaps, reliability/observability issues.
+- Priority for every finding: High | Medium | Low, with why it matters.
 
 ${AUDIT_REPORT_CONTRACT}`,
-  },
-  stack: {
-    title: "Stack & Dependency Audit (Tech + Runtime + Build)",
-    reportType: "Stack & Dependency Audit",
-    followUps: [
-      "Deeper pass: dependency risk register with patch plan",
-      "Deeper pass: build and environment reproducibility audit",
-      "Deeper pass: runtime topology with external integration risks",
-    ],
-    prompt: `You are a senior platform engineer performing a Stack and Dependency Audit.
-
-Objectives:
-- Identify full stack: languages, frameworks, libraries, and major subsystems.
-- Document build/run pipeline with install, config, test, build, and start steps.
-- Map runtime architecture: services, workers, scripts, jobs, databases, caches, external APIs.
-- Audit dependency risks (outdated versions, vulnerable/unmaintained libs, overlap).
-- Identify config and environment risks: secrets, env var sprawl, non-reproducible builds.
-
-Method:
-- Enumerate manifests, lockfiles, build scripts, CI/CD descriptors, and runtime configs.
-- Distinguish verified facts vs inferred assumptions.
-- Prefer minimal-change recommendations that reduce risk quickly.
-
-Required sections:
-- Stack Snapshot (table: category, technology, where found)
-- Build and Run Golden Path (commands, env vars, common failures/fixes)
-- Runtime Topology (components and communication map)
-- Dependency Risk Register (top 10 risks with impact and effort)
-- Security and Secrets Review
-- Recommended Standardization (5-10 improvements)
-- Next Actions (prioritized checklist)
-
-${AUDIT_REPORT_CONTRACT}`,
-  },
-  maintainability: {
-    title: "Maintainability & Risk Audit (Hotspots + Debt + Test Health)",
-    reportType: "Maintainability & Risk Audit",
-    followUps: [
-      "Deeper pass: top 10 hotspot modules with refactor sequence",
-      "Deeper pass: critical-path test gap analysis",
-      "Deeper pass: reliability and observability risk drill-down",
-    ],
-    prompt: `You are a senior engineering lead running a Maintainability and Risk Audit.
-
-Objectives:
-- Identify change-risk hotspots: complexity, coupling, high-churn zones, TODO/FIXME heavy areas.
-- Find maintainability smells: duplication, god modules, unclear boundaries, hidden side effects.
-- Assess test health: missing tests on critical paths, flaky patterns, integration gaps.
-- Assess operational risk: error handling gaps, weak observability, retry/idempotency issues.
-- Deliver a phased refactor and test plan with quick wins and medium-term actions.
-
-Method:
-- Start with directory-level triage, then deep-dive top 10 central modules.
-- Use objective signals (size, complexity approximation, fan-in/fan-out, dependency depth).
-- Avoid rewrites; optimize for safe incremental progress.
-
-Required sections:
-- Executive Summary (10 lines max)
-- Hotspot Leaderboard (ranked with risk reason and ROI)
-- Technical Debt Themes (3-7 recurring issues with examples)
-- Test and Quality Assessment
-- Reliability and Observability Gaps
-- Refactor Plan (Phase 0-3)
-- Definition of Done with measurable outcomes
-
-${AUDIT_REPORT_CONTRACT}`,
-  },
 };
-
-const AUDIT_PROMPT_TO_TYPE = Object.fromEntries(
-  Object.entries(AUDIT_WORKFLOWS).map(([type, workflow]) => [workflow.title, type]),
-);
 
 const PROMPT_MODE_CATEGORIES = [
   {
@@ -255,14 +178,10 @@ const PROMPT_MODE_CATEGORIES = [
     ],
   },
   {
-    key: "audit-workflows",
-    title: "AUDIT",
+    key: "audit",
+    title: "RUN AUDIT",
     mode: "audit",
-    prompts: [
-      AUDIT_WORKFLOWS.architecture.title,
-      AUDIT_WORKFLOWS.stack.title,
-      AUDIT_WORKFLOWS.maintainability.title,
-    ],
+    prompts: [AUDIT_WORKFLOW.title],
   },
 ];
 
@@ -272,7 +191,7 @@ const DEFAULT_UPLOAD_LIMITS = {
   maxTotalBytes: 6_000_000,
 };
 
-const BACKEND_QUERY_SOFT_MAX = 1900;
+const BACKEND_QUERY_SOFT_MAX = 7600;
 
 const state = {
   mode: "chat",
@@ -299,7 +218,6 @@ const state = {
   currentSessionTitle: null,
   contextFile: "",
   suggestionModalOpen: false,
-  activeAuditType: "architecture",
 };
 
 function autoResize() {
@@ -656,37 +574,17 @@ function contextSuggestions(contextFile) {
   ];
 }
 
-function inferAuditType(text) {
-  const normalized = String(text || "").trim().toLowerCase();
-  if (!normalized) return state.activeAuditType || "architecture";
-  if (normalized.includes("stack") || normalized.includes("dependency")) return "stack";
-  if (
-    normalized.includes("maintainability")
-    || normalized.includes("risk")
-    || normalized.includes("hotspot")
-    || normalized.includes("debt")
-    || normalized.includes("test")
-  ) {
-    return "maintainability";
-  }
-  return "architecture";
+function auditFollowUps() {
+  return AUDIT_WORKFLOW.followUps.slice(0, 3);
 }
 
-function auditFollowUpsForType(auditType) {
-  const workflow = AUDIT_WORKFLOWS[auditType];
-  if (!workflow) return [];
-  return workflow.followUps.slice(0, 3);
-}
-
-function buildAuditWorkflowPrompt(auditType, userIntent = "") {
-  const resolvedType = AUDIT_WORKFLOWS[auditType] ? auditType : inferAuditType(userIntent);
-  const workflow = AUDIT_WORKFLOWS[resolvedType];
+function buildAuditWorkflowPrompt(userIntent = "") {
   const intent = String(userIntent || "").trim();
   const contextLine = intent
     ? `Audit focus request from user: ${intent}\nConstrain recommendations to this focus where possible.`
     : "Audit focus request from user: full repository baseline scan.";
 
-  return `${workflow.prompt}
+  return `${AUDIT_WORKFLOW.prompt}
 
 Execution requirements:
 - Start with a fast scan baseline.
@@ -749,12 +647,10 @@ function trimQuestionForBackend(question) {
 }
 
 function buildAuditDispatch(promptText) {
-  const mappedType = AUDIT_PROMPT_TO_TYPE[promptText];
-  const auditType = mappedType || inferAuditType(promptText);
+  const isDefaultPrompt = String(promptText || "").trim() === AUDIT_WORKFLOW.title;
   return {
-    auditType,
-    displayText: AUDIT_WORKFLOWS[auditType].title,
-    workflowPrompt: buildAuditWorkflowPrompt(auditType, promptText),
+    displayText: AUDIT_WORKFLOW.title,
+    workflowPrompt: buildAuditWorkflowPrompt(isDefaultPrompt ? "" : promptText),
   };
 }
 
@@ -861,12 +757,9 @@ async function onPromptSelected(promptText, mode) {
   setMode(mode);
   let dispatchPrompt = promptText;
   let displayPrompt = promptText;
-  let auditType = null;
 
   if (mode === "audit") {
     const dispatch = buildAuditDispatch(promptText);
-    auditType = dispatch.auditType;
-    state.activeAuditType = dispatch.auditType;
     dispatchPrompt = dispatch.workflowPrompt;
     displayPrompt = dispatch.displayText;
   }
@@ -880,7 +773,6 @@ async function onPromptSelected(promptText, mode) {
     questionOverride: dispatchPrompt,
     displayOverride: displayPrompt,
     skipAuditWrap: mode === "audit",
-    auditType,
   });
 }
 
@@ -998,7 +890,6 @@ function resetSession() {
   state.lastDebugPayload = null;
   state.currentSessionTitle = null;
   state.contextFile = "";
-  state.activeAuditType = "architecture";
   closeSuggestionModal();
   renderAttachmentList();
   renderPinnedSources();
@@ -1023,7 +914,7 @@ function buildMetaText(role, meta) {
 }
 
 function defaultResultTypeForMode(mode) {
-  if (mode === "audit") return "Audit Report";
+  if (mode === "audit") return AUDIT_WORKFLOW.reportType;
   if (mode === "dependencies") return "Dependency Graph";
   if (mode === "patterns") return "Pattern Examples";
   if (mode === "search") return "Ranked Chunks";
@@ -1478,7 +1369,7 @@ async function runModeQuery(mode, question, files = []) {
       evidence: data.evidence_strength || {},
       debug: data.debug || null,
       resultType: defaultResultTypeForMode(uiMode),
-      followUps: uiMode === "audit" ? auditFollowUpsForType(state.activeAuditType) : [],
+      followUps: uiMode === "audit" ? auditFollowUps() : [],
     };
   }
 
@@ -1538,9 +1429,7 @@ async function submitQuestion(options = {}) {
 
   let question = rawQuestion;
   if (currentMode === "audit" && !options.skipAuditWrap) {
-    const auditType = options.auditType || state.activeAuditType || inferAuditType(rawQuestion);
-    state.activeAuditType = auditType;
-    question = buildAuditWorkflowPrompt(auditType, rawQuestion);
+    question = buildAuditWorkflowPrompt(rawQuestion);
   }
   const preparedQuestion = trimQuestionForBackend(question);
   question = preparedQuestion.value;
@@ -1564,7 +1453,6 @@ async function submitQuestion(options = {}) {
     question,
     display: displaySeed,
     skipAuditWrap: currentMode === "audit",
-    auditType: state.activeAuditType || null,
   };
   setStatus(
     `Running ${MODE_CONFIG[state.mode].label.toLowerCase()} request${
@@ -1676,7 +1564,6 @@ async function refreshLastPrompt() {
     questionOverride: state.lastRequest.question,
     displayOverride: state.lastRequest.display,
     skipAuditWrap: Boolean(state.lastRequest.skipAuditWrap),
-    auditType: state.lastRequest.auditType || null,
   });
 }
 
@@ -1771,13 +1658,22 @@ function initSpeech() {
 modeButtons.forEach((item) => {
   item.addEventListener("click", () => {
     const mode = item.dataset.mode;
-    setMode(mode);
     if (mode === "audit") {
-      openSuggestionModal({
-        filterKeys: ["audit-workflows"],
-        focusKey: "audit-workflows",
+      const dispatch = buildAuditDispatch(AUDIT_WORKFLOW.title);
+      closeSuggestionModal();
+      input.value = dispatch.displayText;
+      autoResize();
+      updateEvidencePill(null);
+      setStatus(`Mode: ${MODE_CONFIG.audit.label} • Evidence: n/a • TopK: ${state.topK}`);
+      submitQuestion({
+        modeOverride: "audit",
+        questionOverride: dispatch.workflowPrompt,
+        displayOverride: dispatch.displayText,
+        skipAuditWrap: true,
       });
+      return;
     }
+    setMode(mode);
   });
 });
 
@@ -1816,7 +1712,7 @@ exploreCapabilitiesLink.addEventListener("click", (event) => {
   event.preventDefault();
   closeSuggestionModal();
   setMode("chat");
-  input.value = "Show example questions I can ask in Chat, Search, Code Patterns, Dependencies, and Audit modes.";
+  input.value = "Show example questions I can ask in Chat, Search, Code Patterns, Dependencies, and Run Audit modes.";
   autoResize();
   setStatus("Capabilities example inserted");
 });

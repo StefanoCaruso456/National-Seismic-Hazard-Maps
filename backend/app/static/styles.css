@@ -85,6 +85,12 @@ body {
   font-size: 12px;
 }
 
+.sidebar-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 .action-btn,
 .mode-btn,
 .recent-chat-item,
@@ -163,7 +169,7 @@ body {
 }
 
 .topbar {
-  display: flex;
+  display: none;
   align-items: center;
   justify-content: space-between;
   padding: 20px 28px 16px;
@@ -173,12 +179,6 @@ body {
   margin: 0;
   font-family: "Cormorant Garamond", serif;
   font-size: 34px;
-}
-
-.topbar-actions {
-  display: flex;
-  gap: 8px;
-  margin-left: auto;
 }
 
 .icon-btn {
@@ -954,7 +954,9 @@ textarea {
   }
 
   .topbar {
+    display: flex;
     padding: 14px 16px;
+    justify-content: flex-start;
   }
 
   .topbar h2 {

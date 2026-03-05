@@ -7,6 +7,7 @@ import io
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import threading
 from collections import defaultdict
@@ -635,8 +636,18 @@ def ensure_gitnexus_source_checkout() -> Path | None:
         return None
 
     if target.exists() and any(target.iterdir()):
-        logger.warning("GitNexus bootstrap target exists and is not empty: %s", target)
-        return None
+        target_str = str(target)
+        safe_tmp_path = target_str.startswith("/tmp/") or target_str.startswith("/var/tmp/")
+        if safe_tmp_path:
+            try:
+                shutil.rmtree(target)
+                target.mkdir(parents=True, exist_ok=True)
+            except Exception as exc:
+                logger.warning("GitNexus bootstrap failed to reset stale target %s: %s", target, exc)
+                return None
+        else:
+            logger.warning("GitNexus bootstrap target exists and is not empty: %s", target)
+            return None
 
     clone_cmd = ["git", "clone", "--depth", "1"]
     branch = str(settings.gitnexus_bootstrap_repo_ref or "").strip()

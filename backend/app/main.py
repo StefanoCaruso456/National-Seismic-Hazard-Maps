@@ -1983,7 +1983,7 @@ def lexical_candidate_files(question: str) -> dict[str, Any]:
 
     for token in identifiers:
         token_pattern = rf"\b{re.escape(token)}\b" if re.fullmatch(r"[a-zA-Z0-9_]+", token) else re.escape(token)
-        args = ["rg", "--no-heading", "--line-number", "--color", "never", "-S", "-m", "120", "-e", token_pattern]
+        args = ["rg", "--no-heading", "--line-number", "--color", "never", "-S", "-i", "-m", "120", "-e", token_pattern]
         for glob in globs:
             args.extend(["-g", glob])
         args.append(".")

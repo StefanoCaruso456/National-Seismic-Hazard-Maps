@@ -23,6 +23,15 @@ class Settings(BaseSettings):
     retrieval_focus_term_guardrail_enabled: bool = True
     retrieval_focus_term_absent_cap: float = 0.20
     retrieval_focus_term_partial_coverage_cap: float = 0.45
+    retrieval_query_cache_ttl_seconds: float = 20.0
+    retrieval_query_cache_max_entries: int = 256
+    retrieval_identifier_file_limit: int = 80
+    retrieval_identifier_lexical_enabled: bool = True
+    retrieval_deterministic_rerank_enabled: bool = True
+    retrieval_context_expansion_enabled: bool = True
+    retrieval_context_neighbor_lines: int = 6
+    retrieval_context_parent_max_lines: int = 220
+    retrieval_context_header_lines: int = 18
     hybrid_top_k_default: int = 12
     hybrid_max_candidate_files: int = 50
     gitnexus_enabled: bool = True

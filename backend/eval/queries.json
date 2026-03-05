@@ -1,0 +1,252 @@
+[
+  {
+    "id": "DEP-01",
+    "category": "dependency_entrypoint",
+    "question": "What is the main entrypoint script for the hazard run pipeline?",
+    "expected_paths": ["run_all_hazard.sh"],
+    "expected_terms": ["run_all_hazard", "hazrun"]
+  },
+  {
+    "id": "DEP-02",
+    "category": "dependency_entrypoint",
+    "question": "Which scripts are launched by run_all_hazard.sh for regional runs?",
+    "expected_paths": ["run_all_hazard.sh", "scripts/hazrun_casc_2014.sh", "scripts/hazrun_ceus_2014.sh", "scripts/hazrun_wus_2014.sh"],
+    "expected_terms": ["hazrun_casc_2014", "hazrun_ceus_2014", "hazrun_wus_2014"]
+  },
+  {
+    "id": "DEP-03",
+    "category": "dependency_entrypoint",
+    "question": "Where is CEUS hazard execution configured and launched?",
+    "expected_paths": ["scripts/hazrun_ceus_2014.sh", "conf/CEUS"],
+    "expected_terms": ["ceus", "hazrun_ceus_2014"]
+  },
+  {
+    "id": "DEP-04",
+    "category": "dependency_entrypoint",
+    "question": "Where is WUS hazard execution configured and launched?",
+    "expected_paths": ["scripts/hazrun_wus_2014.sh", "conf/WUS"],
+    "expected_terms": ["wus", "hazrun_wus_2014"]
+  },
+  {
+    "id": "DEP-05",
+    "category": "dependency_entrypoint",
+    "question": "Where is Cascadia hazard execution configured and launched?",
+    "expected_paths": ["scripts/hazrun_casc_2014.sh", "conf/CASC"],
+    "expected_terms": ["casc", "hazrun_casc_2014"]
+  },
+  {
+    "id": "DEP-06",
+    "category": "dependency_entrypoint",
+    "question": "Which source file and build target produce hazgridXnga13l?",
+    "expected_paths": ["Makefile", "src/hazgridXnga13l.f"],
+    "expected_terms": ["hazgridXnga13l", "gfortran", "bin/"]
+  },
+  {
+    "id": "DEP-07",
+    "category": "dependency_entrypoint",
+    "question": "Where is deaggregation workflow implemented?",
+    "expected_paths": ["src/deaggGRID.f", "src/deaggSUBD.f", "src/deaggFLTH.f"],
+    "expected_terms": ["deagg", "subroutine", "gailtable"]
+  },
+  {
+    "id": "DEP-08",
+    "category": "dependency_entrypoint",
+    "question": "Which file handles hazard interpolation and resampling?",
+    "expected_paths": ["src/hazinterpnga.f"],
+    "expected_terms": ["resampling", "hazinterp", "openwx"]
+  },
+  {
+    "id": "DEP-09",
+    "category": "dependency_entrypoint",
+    "question": "Where is combine logic for hazard products implemented?",
+    "expected_paths": ["src/combine_cms.f", "src/combineL.v2.f", "scripts/combine2014_all.sh", "conf/combine"],
+    "expected_terms": ["combine", "hazard", "map"]
+  },
+  {
+    "id": "DEP-10",
+    "category": "dependency_entrypoint",
+    "question": "Where is getmeanrjf preprocessing wired into the run flow?",
+    "expected_paths": ["src/util/getmeanrjf.v2.f", "src/util/getmeanrjf.f", "scripts/meanrjb.sh", "run_all_hazard.sh"],
+    "expected_terms": ["getmeanrjf", "meanrjb", "preprocess"]
+  },
+  {
+    "id": "ID-01",
+    "category": "identifier_mutation",
+    "question": "Where is subroutine GailTable(i) defined?",
+    "expected_paths": ["src/hazgridXnga13l.f", "src/hazFXnga13l.f", "src/hazFXnga13p.f", "src/deaggGRID.f", "src/deaggFLTH.f"],
+    "expected_terms": ["subroutine gailtable", "end subroutine gailtable"]
+  },
+  {
+    "id": "ID-02",
+    "category": "identifier_mutation",
+    "question": "Where is subroutine getFEA defined?",
+    "expected_paths": ["src/hazgridXnga13l.f", "src/hazFXnga13l.f", "src/hazFXnga13p.f", "src/deaggGRID.f", "src/deaggFLTH.f"],
+    "expected_terms": ["subroutine getfea", "end subroutine getfea"]
+  },
+  {
+    "id": "ID-03",
+    "category": "identifier_mutation",
+    "question": "Where is subroutine getABsub defined?",
+    "expected_paths": ["src/hazgridXnga13l.f", "src/hazSUBX.f", "src/deaggGRID.f", "src/deaggSUBD.f"],
+    "expected_terms": ["subroutine getabsub", "end subroutine getabsub"]
+  },
+  {
+    "id": "ID-04",
+    "category": "identifier_mutation",
+    "question": "Which routine parses command-line args using CALL getarg?",
+    "expected_paths": ["src/deaggGRID.f", "src/hazinterpnga.f"],
+    "expected_terms": ["call getarg", "command line"]
+  },
+  {
+    "id": "ID-05",
+    "category": "identifier_mutation",
+    "question": "Where are ALLOCATE and DEALLOCATE used for prob/prob2 buffers?",
+    "expected_paths": ["src/hazinterpnga.f"],
+    "expected_terms": ["allocate", "deallocate", "prob2"]
+  },
+  {
+    "id": "ID-06",
+    "category": "identifier_mutation",
+    "question": "Where are openr and getbuf2 called to load grid files?",
+    "expected_paths": ["src/deaggGRID.f", "src/hazinterpnga.f"],
+    "expected_terms": ["openr", "getbuf2", "agrid"]
+  },
+  {
+    "id": "ID-07",
+    "category": "identifier_mutation",
+    "question": "Where are AB06 model tables or coefficients referenced?",
+    "expected_paths": ["src/deaggGRID.f", "src/hazgridXnga13l.f", "scripts/GR/AB06revA_Rcd.rev", "scripts/GR/AB06revA_Rcd.dat"],
+    "expected_terms": ["ab06", "table", "coeff"]
+  },
+  {
+    "id": "ID-08",
+    "category": "identifier_mutation",
+    "question": "Which files define common /gail1/ style common blocks?",
+    "expected_paths": ["src/hazgridXnga13l.f", "src/hazFXnga13l.f", "src/hazFXnga13p.f", "src/deaggGRID.f", "src/deaggFLTH.f"],
+    "expected_terms": ["common/gail1", "common", "gail"]
+  },
+  {
+    "id": "ID-09",
+    "category": "identifier_mutation",
+    "question": "Where are STOP statements used for file-not-found or retry errors in deaggGRID?",
+    "expected_paths": ["src/deaggGRID.f"],
+    "expected_terms": ["stop", "retry", "file not found"]
+  },
+  {
+    "id": "ID-10",
+    "category": "identifier_mutation",
+    "question": "Where is subroutine getFEAtab declared?",
+    "expected_paths": ["src/hazFXnga13l.f", "src/hazFXnga13p.f", "src/deaggFLTH.f"],
+    "expected_terms": ["subroutine getfeatab", "end subroutine getfeatab"]
+  },
+  {
+    "id": "PAT-01",
+    "category": "pattern_io_error_allocation",
+    "question": "Show read/write/open I/O patterns in the interpolation path.",
+    "expected_paths": ["src/hazinterpnga.f"],
+    "expected_terms": ["read", "write", "open", "openwx"]
+  },
+  {
+    "id": "PAT-02",
+    "category": "pattern_io_error_allocation",
+    "question": "Find open(unit=...,status='old') usage for input files.",
+    "expected_paths": ["src/deaggGRID.f", "src/hazinterpnga.f"],
+    "expected_terms": ["open(unit", "status='old'"]
+  },
+  {
+    "id": "PAT-03",
+    "category": "pattern_io_error_allocation",
+    "question": "Find allocate statements in Fortran computational routines.",
+    "expected_paths": ["src/hazinterpnga.f", "src/deaggGRID.f"],
+    "expected_terms": ["allocate", "stat="]
+  },
+  {
+    "id": "PAT-04",
+    "category": "pattern_io_error_allocation",
+    "question": "Find deallocate patterns and memory cleanup logic.",
+    "expected_paths": ["src/hazinterpnga.f"],
+    "expected_terms": ["deallocate", "status"]
+  },
+  {
+    "id": "PAT-05",
+    "category": "pattern_io_error_allocation",
+    "question": "Find error-handling stop messages that instruct users to retry.",
+    "expected_paths": ["src/deaggGRID.f", "src/hazinterpnga.f"],
+    "expected_terms": ["stop", "retry", "please"]
+  },
+  {
+    "id": "PAT-06",
+    "category": "pattern_io_error_allocation",
+    "question": "Find common block patterns in hazard source files.",
+    "expected_paths": ["src/hazgridXnga13l.f", "src/hazFXnga13l.f", "src/hazFXnga13p.f", "src/deaggGRID.f"],
+    "expected_terms": ["common/", "common "]
+  },
+  {
+    "id": "PAT-07",
+    "category": "pattern_io_error_allocation",
+    "question": "Find output writing patterns for .bin files in deaggregation.",
+    "expected_paths": ["src/deaggGRID.f"],
+    "expected_terms": [".bin", "write", "open(33"]
+  },
+  {
+    "id": "PAT-08",
+    "category": "pattern_io_error_allocation",
+    "question": "Find shell patterns that combine hazard outputs.",
+    "expected_paths": ["scripts/combine2014_all.sh", "conf/combine"],
+    "expected_terms": ["combine", "wus", "ceus"]
+  },
+  {
+    "id": "PAT-09",
+    "category": "pattern_io_error_allocation",
+    "question": "Find call sites for getbuf2 across the computational pipeline.",
+    "expected_paths": ["src/deaggGRID.f", "src/hazinterpnga.f"],
+    "expected_terms": ["call getbuf2"]
+  },
+  {
+    "id": "PAT-10",
+    "category": "pattern_io_error_allocation",
+    "question": "Find output serialization flow using openwx -> puthead -> putbufx.",
+    "expected_paths": ["src/hazinterpnga.f"],
+    "expected_terms": ["openwx", "puthead", "putbufx"]
+  },
+  {
+    "id": "NEG-01",
+    "category": "negative_not_found",
+    "negative": true,
+    "question": "What functions modify CUSTOMER-RECORD?",
+    "expected_paths": [],
+    "expected_terms": ["customer-record", "customer_record"]
+  },
+  {
+    "id": "NEG-02",
+    "category": "negative_not_found",
+    "negative": true,
+    "question": "Explain the CALCULATE-INTEREST paragraph implementation.",
+    "expected_paths": [],
+    "expected_terms": ["calculate-interest"]
+  },
+  {
+    "id": "NEG-03",
+    "category": "negative_not_found",
+    "negative": true,
+    "question": "Where is MODULE-X initializer executed?",
+    "expected_paths": [],
+    "expected_terms": ["module-x"]
+  },
+  {
+    "id": "NEG-04",
+    "category": "negative_not_found",
+    "negative": true,
+    "question": "Show handling for ERROR_CODE_7788 in the pipeline.",
+    "expected_paths": [],
+    "expected_terms": ["error_code_7788"]
+  },
+  {
+    "id": "NEG-05",
+    "category": "negative_not_found",
+    "negative": true,
+    "question": "Where is NON_EXISTENT_ROUTINE_XYZ called?",
+    "expected_paths": [],
+    "expected_terms": ["non_existent_routine_xyz"]
+  }
+]

@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import os
+import shlex
 import subprocess
 import threading
 from collections import defaultdict
@@ -142,6 +143,7 @@ IDENTIFIER_STOPWORDS = {
 }
 DEBUG_CANDIDATE_LIMIT = 64
 GRAPH_PROCESS_PRIORITY_THRESHOLD = 0.20
+GENERIC_REPO_NAMES = {"app", "workspace", "repo"}
 
 UPLOAD_MAX_FILES = 8
 UPLOAD_MAX_FILE_BYTES = 1_500_000
@@ -335,6 +337,16 @@ query_result_cache_lock = threading.Lock()
 query_result_cache: dict[str, dict[str, Any]] = {}
 lexical_candidate_cache_lock = threading.Lock()
 lexical_candidate_cache: dict[str, dict[str, Any]] = {}
+gitnexus_bootstrap_lock = threading.Lock()
+gitnexus_bootstrap_state: dict[str, Any] = {
+    "attempted": False,
+    "ok": None,
+    "repo_id": None,
+    "repo_path": None,
+    "error": None,
+}
+runtime_repo_root_override: Path | None = None
+runtime_gitnexus_repo_override: str | None = None
 
 
 app = FastAPI(
@@ -481,6 +493,11 @@ def enforce_startup_smoke_gate() -> None:
 
 @app.on_event("startup")
 def startup_event() -> None:
+    if settings.gitnexus_enabled and settings.gitnexus_bootstrap_enabled:
+        try:
+            ensure_gitnexus_bootstrap_index(force=False)
+        except Exception as exc:
+            logger.warning("GitNexus bootstrap on startup failed: %s", exc)
     apply_startup_smoke_probe()
 
 
@@ -556,16 +573,178 @@ def get_pinecone_index():
     return pinecone_client.Index(settings.pinecone_index_name)
 
 
+def gitnexus_bootstrap_repo_path() -> Path:
+    raw = str(settings.gitnexus_bootstrap_repo_path or "").strip() or "/tmp/nshmp-main"
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        return (Path.cwd() / path).resolve()
+    return path.resolve()
+
+
+def _tail_text(value: str, limit: int = 240) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    return f"...{text[-limit:]}"
+
+
+def _available_repo_names(rows: list[dict[str, Any]] | None) -> list[str]:
+    names: list[str] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        name = _repo_name_from_row(row)
+        if isinstance(name, str) and name.strip():
+            names.append(name.strip())
+    return dedupe_preserve_order(names)
+
+
+def ensure_gitnexus_source_checkout() -> Path | None:
+    repo_url = str(settings.gitnexus_bootstrap_repo_url or "").strip()
+    if not repo_url:
+        return None
+
+    target = gitnexus_bootstrap_repo_path()
+    target_git = target / ".git"
+    if target_git.is_dir():
+        return target
+
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        logger.warning("GitNexus bootstrap could not create parent directory (%s): %s", target.parent, exc)
+        return None
+
+    if target.exists() and any(target.iterdir()):
+        logger.warning("GitNexus bootstrap target exists and is not empty: %s", target)
+        return None
+
+    clone_cmd = ["git", "clone", "--depth", "1"]
+    branch = str(settings.gitnexus_bootstrap_repo_ref or "").strip()
+    if branch:
+        clone_cmd.extend(["--branch", branch])
+    clone_cmd.extend([repo_url, str(target)])
+
+    timeout_seconds = max(float(settings.gitnexus_analyze_timeout_seconds), 30.0)
+    try:
+        proc = subprocess.run(
+            clone_cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except Exception as exc:
+        logger.warning("GitNexus bootstrap git clone failed: %s", exc)
+        return None
+
+    if proc.returncode != 0:
+        logger.warning(
+            "GitNexus bootstrap git clone failed (rc=%s): %s",
+            proc.returncode,
+            _tail_text((proc.stderr or "") + " " + (proc.stdout or "")),
+        )
+        return None
+
+    return target if target_git.is_dir() else None
+
+
+def ensure_gitnexus_bootstrap_index(force: bool = False) -> dict[str, Any]:
+    global gitnexus_bootstrap_state, runtime_repo_root_override, runtime_gitnexus_repo_override
+    snapshot = dict(gitnexus_bootstrap_state)
+    if not settings.gitnexus_enabled or not settings.gitnexus_bootstrap_enabled:
+        return snapshot
+
+    with gitnexus_bootstrap_lock:
+        current = dict(gitnexus_bootstrap_state)
+        if not force and current.get("attempted") and current.get("ok"):
+            return current
+
+        next_state: dict[str, Any] = {
+            "attempted": True,
+            "ok": False,
+            "repo_id": None,
+            "repo_path": None,
+            "error": None,
+        }
+        source_path = ensure_gitnexus_source_checkout()
+        if source_path is None:
+            next_state["error"] = "source_checkout_unavailable"
+            gitnexus_bootstrap_state = next_state
+            return dict(next_state)
+
+        analyze_prefix = str(settings.gitnexus_analyze_command or "").strip() or "gitnexus analyze"
+        analyze_cmd = shlex.split(analyze_prefix) + [str(source_path)]
+        timeout_seconds = max(float(settings.gitnexus_analyze_timeout_seconds), 30.0)
+        try:
+            proc = subprocess.run(
+                analyze_cmd,
+                capture_output=True,
+                text=True,
+                cwd=str(source_path),
+                check=False,
+                timeout=timeout_seconds,
+            )
+        except Exception as exc:
+            next_state["error"] = f"analyze_exception:{_tail_text(exc)}"
+            gitnexus_bootstrap_state = next_state
+            return dict(next_state)
+
+        if proc.returncode != 0:
+            next_state["error"] = f"analyze_failed:{_tail_text((proc.stderr or '') + ' ' + (proc.stdout or ''))}"
+            gitnexus_bootstrap_state = next_state
+            return dict(next_state)
+
+        repo_id = source_path.name
+        runtime_repo_root_override = source_path
+        runtime_gitnexus_repo_override = repo_id
+        next_state.update(
+            {
+                "ok": True,
+                "repo_id": repo_id,
+                "repo_path": str(source_path),
+                "error": None,
+            }
+        )
+        gitnexus_bootstrap_state = next_state
+        logger.info("GitNexus bootstrap index ready for repo=%s path=%s", repo_id, source_path)
+        return dict(next_state)
+
+
+def gitnexus_bootstrap_debug_state(state: dict[str, Any] | None = None) -> dict[str, Any]:
+    row = state or gitnexus_bootstrap_state
+    payload: dict[str, Any] = {
+        "attempted": bool(row.get("attempted")),
+        "ok": row.get("ok"),
+        "repo_id": row.get("repo_id"),
+        "repo_path": str(row.get("repo_path") or "") or None,
+        "error": row.get("error"),
+    }
+    return payload
+
+
 def default_gitnexus_repo() -> str:
+    if isinstance(runtime_gitnexus_repo_override, str) and runtime_gitnexus_repo_override.strip():
+        return runtime_gitnexus_repo_override.strip()
+
     configured = (settings.gitnexus_default_repo or "").strip()
-    if configured:
+    if configured and configured.lower() not in GENERIC_REPO_NAMES:
         return configured
-    inferred = repo_root_path().name.strip()
-    if inferred and inferred.lower() not in {"app", "workspace", "repo"}:
-        return inferred
+
     namespace_hint = str(settings.pinecone_namespace or "").split(":", 1)[0].strip()
     if namespace_hint:
         return namespace_hint
+
+    bootstrap_hint = gitnexus_bootstrap_repo_path().name.strip()
+    if settings.gitnexus_bootstrap_enabled and bootstrap_hint and bootstrap_hint.lower() not in GENERIC_REPO_NAMES:
+        return bootstrap_hint
+
+    if configured:
+        return configured
+
+    inferred = repo_root_path().name.strip()
+    if inferred and inferred.lower() not in GENERIC_REPO_NAMES:
+        return inferred
     if inferred:
         return inferred
     return "unknown-repo"
@@ -649,6 +828,32 @@ def _repo_index_details(
         "node_count": node_count,
         "edge_count": edge_count,
     }
+
+
+def resolve_gitnexus_repo_name(selected_repo: str, available_repos: list[str]) -> str:
+    names = [str(item).strip() for item in available_repos if str(item).strip()]
+    if not names:
+        return selected_repo
+
+    namespace_hint = str(settings.pinecone_namespace or "").split(":", 1)[0].strip()
+    configured = str(settings.gitnexus_default_repo or "").strip()
+    bootstrap_hint = str((gitnexus_bootstrap_repo_path().name if settings.gitnexus_bootstrap_enabled else "")).strip()
+
+    if selected_repo in names:
+        if selected_repo.lower() in GENERIC_REPO_NAMES and namespace_hint and namespace_hint in names:
+            return namespace_hint
+        return selected_repo
+    if namespace_hint and namespace_hint in names:
+        return namespace_hint
+    if configured and configured in names:
+        return configured
+    if isinstance(runtime_gitnexus_repo_override, str) and runtime_gitnexus_repo_override in names:
+        return runtime_gitnexus_repo_override
+    if bootstrap_hint and bootstrap_hint in names:
+        return bootstrap_hint
+    if len(names) == 1:
+        return names[0]
+    return selected_repo
 
 
 def get_gitnexus_client() -> GitNexusClient:
@@ -748,17 +953,198 @@ def graph_entrypoints(query_result: dict[str, Any]) -> list[str]:
     return dedupe_preserve_order(labels)
 
 
+def _graph_value(row: dict[str, Any], keys: tuple[str, ...]) -> str:
+    for key in keys:
+        value = row.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _graph_node_id(kind: str, value: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9_.:/-]+", "_", str(value or "").strip().lower()).strip("_")
+    return f"{kind}:{slug or 'unknown'}"
+
+
+def _graph_impact_rows(payload: dict[str, Any]) -> list[tuple[int, dict[str, Any]]]:
+    by_depth = payload.get("byDepth", {}) if isinstance(payload, dict) else {}
+    if not isinstance(by_depth, dict):
+        return []
+    rows: list[tuple[int, dict[str, Any]]] = []
+    for depth_key, values in by_depth.items():
+        try:
+            depth = int(depth_key)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(values, list):
+            continue
+        for row in values:
+            if isinstance(row, dict):
+                rows.append((depth, row))
+    return rows
+
+
+def build_hybrid_graph_canvas(
+    question: str,
+    query_result: dict[str, Any],
+    context_result: dict[str, Any],
+    impact_result: dict[str, Any],
+    candidate_ranking: list[dict[str, Any]],
+) -> dict[str, Any]:
+    nodes: list[dict[str, Any]] = []
+    edges: list[dict[str, Any]] = []
+    node_ids: set[str] = set()
+    edge_ids: set[tuple[str, str, str]] = set()
+
+    def add_node(node_id: str, label: str, kind: str, size: float = 1.0, path: str | None = None) -> None:
+        if not node_id or node_id in node_ids:
+            return
+        node_ids.add(node_id)
+        payload = {
+            "id": node_id,
+            "label": (label or node_id)[:80],
+            "kind": kind,
+            "size": round(max(float(size), 0.5), 3),
+        }
+        if path:
+            payload["path"] = path
+        nodes.append(payload)
+
+    def add_edge(source: str, target: str, kind: str) -> None:
+        if not source or not target:
+            return
+        edge_key = (source, target, kind)
+        if edge_key in edge_ids:
+            return
+        edge_ids.add(edge_key)
+        edges.append({"source": source, "target": target, "kind": kind})
+
+    query_label = "Hybrid Query"
+    query_node = _graph_node_id("query", query_label)
+    add_node(query_node, query_label, "query", size=1.6)
+
+    target = infer_hybrid_target(question)
+    target_node = ""
+    if target:
+        target_node = _graph_node_id("symbol", target)
+        add_node(target_node, target, "symbol", size=1.2)
+        add_edge(query_node, target_node, "focus")
+
+    process_nodes: dict[str, str] = {}
+    for process in (query_result.get("processes", []) if isinstance(query_result, dict) else []):
+        if not isinstance(process, dict):
+            continue
+        pid = _graph_value(process, ("id",))
+        label = _graph_value(process, ("summary", "id")) or "Process"
+        node_id = _graph_node_id("process", pid or label)
+        priority = float(process.get("priority", 0.0) or 0.0) if isinstance(process.get("priority"), (int, float)) else 0.0
+        add_node(node_id, label, "process", size=1.0 + min(max(priority, 0.0), 1.0))
+        add_edge(query_node, node_id, "process")
+        if pid:
+            process_nodes[pid] = node_id
+        if len(process_nodes) >= 24:
+            break
+
+    for row in (query_result.get("process_symbols", []) if isinstance(query_result, dict) else []):
+        if not isinstance(row, dict):
+            continue
+        symbol_label = _graph_value(row, ("name", "symbol", "id", "uid"))
+        file_path = normalize_file_path(_graph_value(row, ("filePath", "file_path")))
+        process_id = _graph_value(row, ("process_id",))
+        if not symbol_label and not file_path:
+            continue
+
+        symbol_node = _graph_node_id("symbol", symbol_label or file_path or "symbol")
+        add_node(symbol_node, symbol_label or "Symbol", "symbol", size=1.0)
+        if process_id and process_id in process_nodes:
+            add_edge(process_nodes[process_id], symbol_node, "contains")
+        else:
+            add_edge(query_node, symbol_node, "symbol")
+
+        if file_path:
+            file_node = _graph_node_id("file", file_path)
+            add_node(file_node, Path(file_path).name, "file", size=0.95, path=file_path)
+            add_edge(symbol_node, file_node, "defined_in")
+        if len(nodes) >= 90:
+            break
+
+    for row in (query_result.get("definitions", []) if isinstance(query_result, dict) else []):
+        if not isinstance(row, dict):
+            continue
+        file_path = normalize_file_path(_graph_value(row, ("filePath", "file_path")))
+        symbol_label = _graph_value(row, ("name", "symbol", "id"))
+        if symbol_label:
+            symbol_node = _graph_node_id("symbol", symbol_label)
+            add_node(symbol_node, symbol_label, "symbol", size=0.95)
+            add_edge(query_node, symbol_node, "definition")
+            if file_path:
+                file_node = _graph_node_id("file", file_path)
+                add_node(file_node, Path(file_path).name, "file", size=0.9, path=file_path)
+                add_edge(symbol_node, file_node, "defined_in")
+        elif file_path:
+            file_node = _graph_node_id("file", file_path)
+            add_node(file_node, Path(file_path).name, "file", size=0.9, path=file_path)
+            add_edge(query_node, file_node, "definition_file")
+        if len(nodes) >= 100:
+            break
+
+    context_symbol = context_result.get("symbol") if isinstance(context_result, dict) else None
+    if isinstance(context_symbol, dict):
+        ctx_name = _graph_value(context_symbol, ("name", "symbol", "id", "uid"))
+        ctx_path = normalize_file_path(_graph_value(context_symbol, ("filePath", "file_path")))
+        ctx_node = _graph_node_id("symbol", ctx_name or ctx_path or "context")
+        add_node(ctx_node, ctx_name or "Context Symbol", "symbol", size=1.05)
+        add_edge(target_node or query_node, ctx_node, "context")
+        if ctx_path:
+            file_node = _graph_node_id("file", ctx_path)
+            add_node(file_node, Path(ctx_path).name, "file", size=0.9, path=ctx_path)
+            add_edge(ctx_node, file_node, "in_file")
+
+    for row in candidate_ranking[:32]:
+        if not isinstance(row, dict):
+            continue
+        file_path = normalize_file_path(str(row.get("file_path") or ""))
+        if not file_path:
+            continue
+        file_node = _graph_node_id("file", file_path)
+        score_raw = row.get("score", 1.0)
+        try:
+            score = max(float(score_raw), 0.2)
+        except (TypeError, ValueError):
+            score = 1.0
+        add_node(file_node, Path(file_path).name, "file", size=min(1.4, 0.8 + (score * 0.12)), path=file_path)
+        add_edge(query_node, file_node, "candidate")
+
+    impact_rows = _graph_impact_rows(impact_result if isinstance(impact_result, dict) else {})
+    for depth, row in impact_rows[:40]:
+        if not isinstance(row, dict):
+            continue
+        label = _graph_value(row, ("name", "symbol", "id", "uid"))
+        file_path = normalize_file_path(_graph_value(row, ("filePath", "file_path")))
+        impact_node = _graph_node_id("impact", label or file_path or f"depth{depth}")
+        add_node(impact_node, label or f"Impact depth {depth}", "impact", size=0.9)
+        add_edge(target_node or query_node, impact_node, f"impact_d{depth}")
+        if file_path:
+            file_node = _graph_node_id("file", file_path)
+            add_node(file_node, Path(file_path).name, "file", size=0.88, path=file_path)
+            add_edge(impact_node, file_node, "touches")
+
+    return {"nodes": nodes[:120], "edges": edges[:220]}
+
+
 def run_gitnexus_graph(question: str, repo_name: str | None = None) -> dict[str, Any]:
     normalized_question = " ".join(str(question or "").split())
     selected_repo = (repo_name or default_gitnexus_repo()).strip()
     graph: dict[str, Any] = {
         "repo": selected_repo,
+        "repo_requested": selected_repo,
         "query": normalized_question,
         "processes": [],
         "entrypoints": [],
         "impact": {},
         "candidate_files": [],
         "candidate_file_ranking": [],
+        "canvas": {"nodes": [], "edges": []},
         "target_symbol": None,
         "errors": [],
         "raw_counts": {"processes": 0, "nodes": 0, "edges": 0, "files": 0},
@@ -771,6 +1157,7 @@ def run_gitnexus_graph(question: str, repo_name: str | None = None) -> dict[str,
             "build_timestamp": None,
             "node_count": None,
             "edge_count": None,
+            "bootstrap": gitnexus_bootstrap_debug_state(),
         },
     }
 
@@ -781,13 +1168,44 @@ def run_gitnexus_graph(question: str, repo_name: str | None = None) -> dict[str,
         graph["index"]["index_present"] = False
         return graph
 
+    bootstrap_state = gitnexus_bootstrap_debug_state()
+    if settings.gitnexus_bootstrap_enabled:
+        bootstrap_state = ensure_gitnexus_bootstrap_index(force=False)
+        graph["index"]["bootstrap"] = gitnexus_bootstrap_debug_state(bootstrap_state)
+
     try:
         client = get_gitnexus_client()
         repo_rows = client.list_repos()
+        available_repos = _available_repo_names(repo_rows)
+        resolved_repo = resolve_gitnexus_repo_name(selected_repo, available_repos)
+        if resolved_repo != selected_repo:
+            selected_repo = resolved_repo
+            graph["repo"] = selected_repo
+            graph["index"]["repo_id"] = selected_repo
+
         index_info = _repo_index_details(selected_repo, repo_rows)
         index_info["commit_hash"] = repo_commit_short()
         graph["index"] = index_info
-        if index_info.get("index_present") is False:
+        graph["index"]["bootstrap"] = gitnexus_bootstrap_debug_state(bootstrap_state)
+
+        if index_info.get("index_present") is False and settings.gitnexus_bootstrap_enabled and not bootstrap_state.get("ok"):
+            bootstrap_state = ensure_gitnexus_bootstrap_index(force=True)
+            graph["index"]["bootstrap"] = gitnexus_bootstrap_debug_state(bootstrap_state)
+            if bootstrap_state.get("ok"):
+                close_gitnexus_client()
+                client = get_gitnexus_client()
+                repo_rows = client.list_repos()
+                available_repos = _available_repo_names(repo_rows)
+                resolved_repo = resolve_gitnexus_repo_name(selected_repo, available_repos)
+                if resolved_repo != selected_repo:
+                    selected_repo = resolved_repo
+                    graph["repo"] = selected_repo
+                index_info = _repo_index_details(selected_repo, repo_rows)
+                index_info["commit_hash"] = repo_commit_short()
+                index_info["bootstrap"] = gitnexus_bootstrap_debug_state(bootstrap_state)
+                graph["index"] = index_info
+
+        if graph["index"].get("index_present") is False:
             graph["errors"].append(f"gitnexus_repo_not_indexed:{selected_repo}")
 
         query_result = client.query(
@@ -839,6 +1257,13 @@ def run_gitnexus_graph(question: str, repo_name: str | None = None) -> dict[str,
         )
         graph["candidate_files"] = candidate_files
         graph["candidate_file_ranking"] = candidate_ranking
+        graph["canvas"] = build_hybrid_graph_canvas(
+            question=normalized_question,
+            query_result=query_result if isinstance(query_result, dict) else {},
+            context_result=context_result if isinstance(context_result, dict) else {},
+            impact_result=merged_impact,
+            candidate_ranking=candidate_ranking,
+        )
 
         process_symbols = query_result.get("process_symbols", []) if isinstance(query_result, dict) else []
         definitions = query_result.get("definitions", []) if isinstance(query_result, dict) else []
@@ -874,6 +1299,14 @@ def run_gitnexus_graph(question: str, repo_name: str | None = None) -> dict[str,
             + outgoing_count
         )
         edge_count = incoming_count + outgoing_count + impact_count
+        canvas_payload = graph.get("canvas", {})
+        if isinstance(canvas_payload, dict):
+            canvas_nodes = canvas_payload.get("nodes", [])
+            canvas_edges = canvas_payload.get("edges", [])
+            if isinstance(canvas_nodes, list):
+                node_count = max(node_count, len(canvas_nodes))
+            if isinstance(canvas_edges, list):
+                edge_count = max(edge_count, len(canvas_edges))
         graph["raw_counts"] = {
             "processes": len(graph["processes"]) if isinstance(graph["processes"], list) else 0,
             "nodes": max(node_count, 0),
@@ -2467,6 +2900,21 @@ def build_context(citations: list[Citation], chunks: list[str]) -> str:
 
 
 def repo_root_path() -> Path:
+    if isinstance(runtime_repo_root_override, Path) and runtime_repo_root_override.is_dir():
+        return runtime_repo_root_override
+
+    configured_override = str(settings.repo_root_override or "").strip()
+    if configured_override:
+        candidate_override = Path(configured_override).expanduser()
+        if not candidate_override.is_absolute():
+            candidate_override = (Path.cwd() / candidate_override).resolve()
+        if candidate_override.is_dir():
+            return candidate_override
+
+    bootstrap_path = gitnexus_bootstrap_repo_path()
+    if settings.gitnexus_bootstrap_enabled and bootstrap_path.is_dir():
+        return bootstrap_path
+
     resolved = Path(__file__).resolve()
     candidate = resolved.parents[2]
     # In container builds, app code may live at /app/app/main.py where parents[2] is "/".

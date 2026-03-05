@@ -1408,6 +1408,10 @@ function renderHybridArchitecturePanel(panel, graphPayload) {
   const entrypoints = Array.isArray(graph.entrypoints) ? graph.entrypoints : [];
   const candidateFiles = Array.isArray(graph.candidate_files) ? graph.candidate_files : [];
   const errors = Array.isArray(graph.errors) ? graph.errors : [];
+  const hybridDebug = graph.hybrid_debug && typeof graph.hybrid_debug === "object" ? graph.hybrid_debug : {};
+  const graphMeta = hybridDebug.graph_metadata && typeof hybridDebug.graph_metadata === "object"
+    ? hybridDebug.graph_metadata
+    : {};
 
   const lines = [];
   lines.push(`Repo: ${String(graph.repo || "n/a")}`);
@@ -1422,6 +1426,15 @@ function renderHybridArchitecturePanel(panel, graphPayload) {
   }
   if (errors.length) {
     lines.push(`Graph errors: ${errors.slice(0, 3).join(" | ")}`);
+  }
+  if (Object.prototype.hasOwnProperty.call(hybridDebug, "graph_index_present")) {
+    lines.push(`Graph index present: ${Boolean(hybridDebug.graph_index_present)}`);
+  }
+  if (hybridDebug.fallback_reason) {
+    lines.push(`Fallback reason: ${String(hybridDebug.fallback_reason)}`);
+  }
+  if (graphMeta.commit_hash) {
+    lines.push(`Graph commit: ${String(graphMeta.commit_hash)}`);
   }
 
   const impact = graph.impact && typeof graph.impact === "object" ? graph.impact : {};

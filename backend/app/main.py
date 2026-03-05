@@ -83,6 +83,27 @@ FORTRAN_ACTION_PATTERN = re.compile(
     re.IGNORECASE,
 )
 CONFIG_DIR_HINTS = ("conf/", "etc/", "scripts/", "makefile", "readme", "run_", "run.")
+TEST_QUERY_HINTS = (
+    "test",
+    "tests",
+    "pytest",
+    "spec",
+    "failing test",
+    "regression",
+    "coverage",
+    "assert",
+    "assertion",
+    "mock",
+    "fixture",
+    "expected behavior",
+    "unit test",
+    "integration test",
+)
+TEST_PATH_SEGMENT_PATTERN = re.compile(r"(^|/)(tests?|__tests__)(/|$)", re.IGNORECASE)
+TEST_FILE_NAME_PATTERN = re.compile(
+    r"(^|/)(test_[^/]+\.py|[^/]+_test\.py|[^/]+\.spec\.[^/]+|[^/]+\.test\.[^/]+)$",
+    re.IGNORECASE,
+)
 MODE_VALUES = {"chat", "search", "patterns", "dependencies", "hybrid", "graph"}
 FILTERABLE_LANGUAGES = {"fortran", "text", "pdf"}
 FILTERABLE_SOURCE_TYPES = {"repo", "upload", "temp-upload"}
@@ -1210,7 +1231,11 @@ def build_hybrid_graph_canvas(
     return {"nodes": nodes[:120], "edges": edges[:220]}
 
 
-def run_gitnexus_graph(question: str, repo_name: str | None = None) -> dict[str, Any]:
+def run_gitnexus_graph(
+    question: str,
+    repo_name: str | None = None,
+    include_tests: bool = False,
+) -> dict[str, Any]:
     normalized_question = " ".join(str(question or "").split())
     selected_repo = (repo_name or default_gitnexus_repo()).strip()
     graph: dict[str, Any] = {
@@ -1314,7 +1339,7 @@ def run_gitnexus_graph(question: str, repo_name: str | None = None) -> dict[str,
                 repo=selected_repo,
                 max_depth=3,
                 min_confidence=0.75,
-                include_tests=False,
+                include_tests=include_tests,
             )
             downstream_impact = client.impact(
                 target=target,
@@ -1322,7 +1347,7 @@ def run_gitnexus_graph(question: str, repo_name: str | None = None) -> dict[str,
                 repo=selected_repo,
                 max_depth=3,
                 min_confidence=0.75,
-                include_tests=False,
+                include_tests=include_tests,
             )
         graph["impact"] = {"upstream": upstream_impact, "downstream": downstream_impact}
 
@@ -2461,6 +2486,88 @@ def is_config_query(question: str) -> bool:
 def is_dependency_query(question: str) -> bool:
     lowered = question.lower()
     return any(term in lowered for term in ("depend", "dependency", "call graph", "who calls", "callers"))
+
+
+def is_test_intent_query(question: str) -> bool:
+    lowered = str(question or "").lower()
+    return any(term in lowered for term in TEST_QUERY_HINTS)
+
+
+def is_test_file_path(path: str | None) -> bool:
+    normalized = normalize_file_path(path)
+    if not normalized:
+        return False
+    lowered = normalized.lower()
+    return bool(TEST_PATH_SEGMENT_PATTERN.search(lowered) or TEST_FILE_NAME_PATTERN.search(lowered))
+
+
+def filter_paths_by_test_policy(
+    paths: list[str] | None,
+    include_tests: bool,
+) -> tuple[list[str], int, int]:
+    normalized = dedupe_preserve_order(
+        [path for path in (normalize_file_path(item) for item in (paths or [])) if path]
+    )
+    if include_tests:
+        test_count = sum(1 for path in normalized if is_test_file_path(path))
+        return normalized, 0, test_count
+
+    filtered: list[str] = []
+    excluded = 0
+    for path in normalized:
+        if is_test_file_path(path):
+            excluded += 1
+            continue
+        filtered.append(path)
+    final_test_count = sum(1 for path in filtered if is_test_file_path(path))
+    return filtered, excluded, final_test_count
+
+
+def filter_candidate_ranking_rows_by_test_policy(
+    rows: list[dict[str, Any]] | None,
+    include_tests: bool,
+) -> tuple[list[dict[str, Any]], int, int]:
+    ranking = [row for row in (rows or []) if isinstance(row, dict)]
+    if include_tests:
+        test_count = sum(1 for row in ranking if is_test_file_path(row.get("file_path")))
+        return ranking, 0, test_count
+
+    filtered: list[dict[str, Any]] = []
+    excluded = 0
+    for row in ranking:
+        if is_test_file_path(row.get("file_path")):
+            excluded += 1
+            continue
+        filtered.append(row)
+    final_test_count = sum(1 for row in filtered if is_test_file_path(row.get("file_path")))
+    return filtered, excluded, final_test_count
+
+
+def filter_citation_pairs_by_test_policy(
+    citations: list[Citation],
+    chunks: list[str],
+    include_tests: bool,
+    limit: int | None = None,
+) -> tuple[list[Citation], list[str], int, int]:
+    if include_tests:
+        final_test_count = sum(1 for citation in citations if is_test_file_path(citation.file_path))
+        bounded_citations = citations[:limit] if isinstance(limit, int) and limit > 0 else citations
+        bounded_chunks = chunks[: len(bounded_citations)]
+        return bounded_citations, bounded_chunks, 0, final_test_count
+
+    filtered_citations: list[Citation] = []
+    filtered_chunks: list[str] = []
+    excluded = 0
+    for citation, chunk in zip(citations, chunks, strict=False):
+        if is_test_file_path(citation.file_path):
+            excluded += 1
+            continue
+        filtered_citations.append(citation)
+        filtered_chunks.append(chunk)
+        if isinstance(limit, int) and limit > 0 and len(filtered_citations) >= limit:
+            break
+    final_test_count = sum(1 for citation in filtered_citations if is_test_file_path(citation.file_path))
+    return filtered_citations, filtered_chunks, excluded, final_test_count
 
 
 def search_expansion_terms(question: str) -> list[str]:
@@ -3776,6 +3883,7 @@ def metadata_matches_filters(
     source_type: str | None = None,
     candidate_files: list[str] | None = None,
     repo_name: str | None = None,
+    include_tests: bool = True,
 ) -> bool:
     file_path = str(metadata.get("file_path", "")).replace("\\", "/").lstrip("/")
     meta_language = str(metadata.get("language", "")).strip().lower()
@@ -3789,6 +3897,8 @@ def metadata_matches_filters(
     if language and meta_language != language:
         return False
     if source_type and meta_source_type != source_type:
+        return False
+    if not include_tests and is_test_file_path(file_path):
         return False
     if candidate_files:
         normalized_candidates = {item.lower() for item in candidate_files if item}
@@ -3812,6 +3922,7 @@ def retrieve_citations_and_chunks(
     repo_name: str | None = None,
     lexical_file_scores: dict[str, float] | None = None,
     candidate_top_k_override: int | None = None,
+    include_tests: bool = True,
 ) -> tuple[list[Citation], list[str], dict[str, Any]]:
     queries = retrieval_queries or [question]
     target_namespaces = namespaces or query_namespaces()
@@ -3832,8 +3943,9 @@ def retrieve_citations_and_chunks(
                 status_code=503,
                 detail=f"Failed to resolve Pinecone index dimension: {startup_smoke_error(exc)}",
             ) from exc
-    normalized_candidate_files = dedupe_preserve_order(
-        [path for path in (normalize_file_path(item) for item in (candidate_files or [])) if path]
+    normalized_candidate_files, excluded_candidate_tests, _ = filter_paths_by_test_policy(
+        candidate_files,
+        include_tests=include_tests,
     )
     lexical_scores = {
         str(normalize_file_path(path) or ""): max(0.0, min(1.0, float(score)))
@@ -3853,6 +3965,7 @@ def retrieve_citations_and_chunks(
     pinecone_ms = 0.0
     cache_hits = 0
     cache_misses = 0
+    excluded_test_candidates = max(int(excluded_candidate_tests), 0)
     for query_text in queries:
         embed_started = time.perf_counter()
         question_vector = embed_question(query_text)
@@ -3893,6 +4006,9 @@ def retrieve_citations_and_chunks(
             file_path = normalize_file_path(metadata.get("file_path"))
             if file_path and file_path in lexical_scores:
                 metadata["_lexical_file_score"] = lexical_scores[file_path]
+            if file_path and not include_tests and is_test_file_path(file_path):
+                excluded_test_candidates += 1
+                continue
             if not metadata_matches_filters(
                 metadata,
                 path_prefix=path_prefix,
@@ -3900,6 +4016,7 @@ def retrieve_citations_and_chunks(
                 source_type=source_type_filter,
                 candidate_files=normalized_candidate_files,
                 repo_name=repo_name,
+                include_tests=include_tests,
             ):
                 continue
             matches.append({"score": match_score(match), "metadata": metadata})
@@ -3919,6 +4036,11 @@ def retrieve_citations_and_chunks(
                     "rerank": 0.0,
                 },
                 "cache": {"hits": cache_hits, "misses": cache_misses},
+                "test_filter": {
+                    "include_tests": bool(include_tests),
+                    "excluded_test_candidates": excluded_test_candidates,
+                    "final_test_candidates": 0,
+                },
             },
         )
 
@@ -3927,6 +4049,7 @@ def retrieve_citations_and_chunks(
     rerank_ms = (time.perf_counter() - rerank_started) * 1000.0
     citations = [Citation(**extract_citation(metadata, score)) for metadata, score in reranked]
     chunks = [metadata_chunk_text(metadata) for metadata, _ in reranked]
+    final_test_candidates = sum(1 for citation in citations if is_test_file_path(citation.file_path))
     debug = {
         "candidates": debug_candidates,
         "subqueries": subquery_counts,
@@ -3936,6 +4059,11 @@ def retrieve_citations_and_chunks(
             "rerank": round(rerank_ms, 2),
         },
         "cache": {"hits": cache_hits, "misses": cache_misses},
+        "test_filter": {
+            "include_tests": bool(include_tests),
+            "excluded_test_candidates": excluded_test_candidates,
+            "final_test_candidates": final_test_candidates,
+        },
     }
     return citations, chunks, debug
 
@@ -3950,6 +4078,7 @@ def retrieve_uploaded_citations_and_chunks(
     source_type_filter: str | None = None,
     candidate_files: list[str] | None = None,
     repo_name: str | None = None,
+    include_tests: bool = True,
 ) -> tuple[list[Citation], list[str], dict[str, Any]]:
     if not uploaded_files:
         return [], [], {"candidates": [], "subqueries": []}
@@ -3958,11 +4087,13 @@ def retrieve_uploaded_citations_and_chunks(
     if not metadata_chunks:
         return [], [], {"candidates": [], "subqueries": []}
 
-    normalized_candidate_files = dedupe_preserve_order(
-        [path for path in (normalize_file_path(item) for item in (candidate_files or [])) if path]
+    normalized_candidate_files, excluded_candidate_tests, _ = filter_paths_by_test_policy(
+        candidate_files,
+        include_tests=include_tests,
     )
     matches: list[dict] = []
     subquery_counts: list[dict[str, Any]] = []
+    excluded_test_candidates = max(int(excluded_candidate_tests), 0)
     queries = retrieval_queries or [question]
     for query_text in queries:
         question_vector = embed_question(query_text)
@@ -3976,6 +4107,9 @@ def retrieve_uploaded_citations_and_chunks(
             for metadata, embedding in zip(metadata_batch, embeddings, strict=True):
                 scoped = metadata.copy()
                 scoped["query_used"] = query_text
+                if not include_tests and is_test_file_path(scoped.get("file_path")):
+                    excluded_test_candidates += 1
+                    continue
                 if not metadata_matches_filters(
                     scoped,
                     path_prefix=path_prefix,
@@ -3983,6 +4117,7 @@ def retrieve_uploaded_citations_and_chunks(
                     source_type=source_type_filter,
                     candidate_files=normalized_candidate_files,
                     repo_name=repo_name,
+                    include_tests=include_tests,
                 ):
                     continue
                 matches.append(
@@ -3995,12 +4130,33 @@ def retrieve_uploaded_citations_and_chunks(
         subquery_counts.append({"query": query_text, "matches": count})
 
     if not matches:
-        return [], [], {"candidates": [], "subqueries": subquery_counts}
+        return (
+            [],
+            [],
+            {
+                "candidates": [],
+                "subqueries": subquery_counts,
+                "test_filter": {
+                    "include_tests": bool(include_tests),
+                    "excluded_test_candidates": excluded_test_candidates,
+                    "final_test_candidates": 0,
+                },
+            },
+        )
 
     reranked, debug_candidates = rerank_matches(question=question, matches=matches, top_k=top_k)
     citations = [Citation(**extract_citation(metadata, score)) for metadata, score in reranked]
     chunks = [metadata_chunk_text(metadata) for metadata, _ in reranked]
-    debug = {"candidates": debug_candidates, "subqueries": subquery_counts}
+    final_test_candidates = sum(1 for citation in citations if is_test_file_path(citation.file_path))
+    debug = {
+        "candidates": debug_candidates,
+        "subqueries": subquery_counts,
+        "test_filter": {
+            "include_tests": bool(include_tests),
+            "excluded_test_candidates": excluded_test_candidates,
+            "final_test_candidates": final_test_candidates,
+        },
+    }
     return citations, chunks, debug
 
 
@@ -4129,6 +4285,9 @@ def retrieve_with_optional_uploads(
     repo_name: str | None = None,
     disable_internal_lexical: bool = False,
     candidate_top_k_override: int | None = None,
+    include_tests: bool | None = None,
+    test_intent_detected: bool | None = None,
+    fallback_with_tests: bool = False,
 ) -> tuple[list[Citation], list[str], dict[str, Any]]:
     started = time.perf_counter()
     normalized_mode = normalize_mode(mode)
@@ -4138,6 +4297,8 @@ def retrieve_with_optional_uploads(
 
     include_repo = scope in {"repo", "both"}
     include_uploads = scope in {"uploads", "both"}
+    resolved_test_intent = is_test_intent_query(question) if test_intent_detected is None else bool(test_intent_detected)
+    include_tests_effective = bool(include_tests) if include_tests is not None else resolved_test_intent
     rewrite_started = time.perf_counter()
     rewritten_query, subqueries = rewrite_and_decompose_query(question)
     rewrite_ms = (time.perf_counter() - rewrite_started) * 1000.0
@@ -4162,12 +4323,21 @@ def retrieve_with_optional_uploads(
         else {"enabled": False, "identifiers": [], "candidate_files": [], "file_scores": {}, "hits": []}
     )
     lexical_ms = (time.perf_counter() - lexical_started) * 1000.0
-    lexical_files = [path for path in (normalize_file_path(item) for item in lexical_debug.get("candidate_files", []) or []) if path]
+    lexical_files_raw = [path for path in (normalize_file_path(item) for item in lexical_debug.get("candidate_files", []) or []) if path]
+    lexical_files, _, lexical_final_tests = filter_paths_by_test_policy(
+        lexical_files_raw,
+        include_tests=include_tests_effective,
+    )
     lexical_scores = lexical_debug.get("file_scores", {}) if isinstance(lexical_debug, dict) else {}
-    provided_candidates = [path for path in (normalize_file_path(item) for item in (candidate_files or [])) if path]
+    provided_candidates_raw = [path for path in (normalize_file_path(item) for item in (candidate_files or [])) if path]
+    provided_candidates, _, provided_final_tests = filter_paths_by_test_policy(
+        provided_candidates_raw,
+        include_tests=include_tests_effective,
+    )
     primary_candidate_files = dedupe_preserve_order(
         [*provided_candidates, *(lexical_files if provided_candidates else [])]
     )
+    excluded_test_candidates = 0
 
     if include_repo:
         try:
@@ -4184,6 +4354,7 @@ def retrieve_with_optional_uploads(
                 repo_name=repo_name,
                 lexical_file_scores=lexical_scores,
                 candidate_top_k_override=candidate_top_k_override,
+                include_tests=include_tests_effective,
             )
             # For identifier-heavy queries, run a focused lexical pass and merge with a small bonus.
             if lexical_enabled and lexical_files and not provided_candidates:
@@ -4200,6 +4371,7 @@ def retrieve_with_optional_uploads(
                     repo_name=repo_name,
                     lexical_file_scores=lexical_scores,
                     candidate_top_k_override=candidate_top_k_override,
+                    include_tests=include_tests_effective,
                 )
         except HTTPException as exc:
             logger.warning("Indexed retrieval unavailable: %s", exc.detail)
@@ -4221,6 +4393,7 @@ def retrieve_with_optional_uploads(
                 candidate_files=provided_candidates,
                 repo_name=repo_name,
                 candidate_top_k_override=candidate_top_k_override,
+                include_tests=include_tests_effective,
             )
         except HTTPException as exc:
             logger.warning("Attachment retrieval unavailable: %s", exc.detail)
@@ -4238,6 +4411,7 @@ def retrieve_with_optional_uploads(
                 source_type_filter=source_type_filter,
                 candidate_files=provided_candidates,
                 repo_name=repo_name,
+                include_tests=include_tests_effective,
             )
 
     sets_to_merge: list[tuple[list[Citation], list[str], float]] = []
@@ -4249,6 +4423,13 @@ def retrieve_with_optional_uploads(
         sets_to_merge.append((persistent_upload_citations, persistent_upload_chunks, UPLOAD_SOURCE_BONUS))
         sets_to_merge.append((temp_upload_citations, temp_upload_chunks, UPLOAD_PRIORITY_BONUS))
     citations, chunks = merge_citation_sets(sets=sets_to_merge, top_k=effective_top_k)
+    citations, chunks, excluded_citation_tests, final_test_candidates = filter_citation_pairs_by_test_policy(
+        citations,
+        chunks,
+        include_tests=include_tests_effective,
+        limit=effective_top_k,
+    )
+    excluded_test_candidates += excluded_citation_tests
     citations, chunks = dedupe_citation_pairs(citations, chunks, limit=effective_top_k)
     citations, chunks, intent_debug = apply_config_intent_priority(question, citations, chunks)
     focus_guardrail = analyze_focus_term_alignment(question, citations, chunks)
@@ -4266,8 +4447,32 @@ def retrieve_with_optional_uploads(
     context_started = time.perf_counter()
     if settings.retrieval_context_expansion_enabled:
         citations, chunks = expand_context_for_citations(question, citations, chunks, limit=effective_top_k)
+        citations, chunks, post_context_excluded, final_test_candidates = filter_citation_pairs_by_test_policy(
+            citations,
+            chunks,
+            include_tests=include_tests_effective,
+            limit=effective_top_k,
+        )
+        excluded_test_candidates += post_context_excluded
         citations, chunks = dedupe_citation_pairs(citations, chunks, limit=effective_top_k)
     context_ms = (time.perf_counter() - context_started) * 1000.0
+    final_test_candidates = sum(1 for citation in citations if is_test_file_path(citation.file_path))
+    excluded_test_candidates += max(
+        int((index_debug.get("test_filter", {}) or {}).get("excluded_test_candidates", 0)),
+        0,
+    )
+    excluded_test_candidates += max(
+        int((lexical_index_debug.get("test_filter", {}) or {}).get("excluded_test_candidates", 0)),
+        0,
+    )
+    excluded_test_candidates += max(
+        int((persistent_upload_debug.get("test_filter", {}) or {}).get("excluded_test_candidates", 0)),
+        0,
+    )
+    excluded_test_candidates += max(
+        int((temp_upload_debug.get("test_filter", {}) or {}).get("excluded_test_candidates", 0)),
+        0,
+    )
 
     upload_debug = {
         "persistent": persistent_upload_debug,
@@ -4307,8 +4512,21 @@ def retrieve_with_optional_uploads(
             "language": language,
             "source_type": source_type_filter,
             "candidate_files_count": len(provided_candidates),
+            "candidate_files_raw_count": len(provided_candidates_raw),
             "lexical_candidate_files_count": len(lexical_files),
+            "lexical_candidate_files_raw_count": len(lexical_files_raw),
             "repo": repo_name,
+        },
+        "test_filter": {
+            "include_tests": bool(include_tests_effective),
+            "test_intent_detected": bool(resolved_test_intent),
+            "fallback_with_tests": bool(fallback_with_tests),
+            "excluded_test_candidates": max(int(excluded_test_candidates), 0),
+            "final_test_candidates": max(int(final_test_candidates), 0),
+            "candidate_test_files": {
+                "provided": int(provided_final_tests),
+                "lexical": int(lexical_final_tests),
+            },
         },
     }
     return citations, chunks, debug
@@ -4363,6 +4581,11 @@ def build_hybrid_debug_payload(
     fallback_reason: str,
     candidate_files_count: int,
     citations: list[Citation],
+    include_tests: bool = False,
+    test_intent_detected: bool = False,
+    fallback_with_tests: bool = False,
+    excluded_test_candidates: int = 0,
+    final_test_candidates: int | None = None,
 ) -> dict[str, Any]:
     graph_index = graph_payload.get("index", {}) if isinstance(graph_payload, dict) else {}
     raw_counts = graph_payload.get("raw_counts", {}) if isinstance(graph_payload, dict) else {}
@@ -4378,11 +4601,20 @@ def build_hybrid_debug_payload(
     threshold = float(graph_score.get("threshold") or GRAPH_PROCESS_PRIORITY_THRESHOLD)
     passed = bool(graph_score.get("passed")) if isinstance(graph_score, dict) else False
 
+    final_test_count = (
+        int(final_test_candidates)
+        if isinstance(final_test_candidates, int)
+        else len({citation.file_path for citation in citations if is_test_file_path(citation.file_path)})
+    )
+
     return {
         "graph_enabled": bool(settings.gitnexus_enabled),
         "graph_index_present": graph_index_present,
         "graph_query": str(graph_payload.get("query") or question),
         "graph_query_type": "natural_language",
+        "include_tests": bool(include_tests),
+        "test_intent_detected": bool(test_intent_detected),
+        "fallback_with_tests": bool(fallback_with_tests),
         "graph_hits": {
             "processes": safe_int(raw_counts.get("processes")) or 0,
             "nodes": safe_int(raw_counts.get("nodes")) or 0,
@@ -4395,6 +4627,8 @@ def build_hybrid_debug_payload(
             "passed": bool(passed),
         },
         "fallback_reason": fallback_reason,
+        "excluded_test_candidates": max(int(excluded_test_candidates), 0),
+        "final_test_candidates": max(final_test_count, 0),
         "candidate_files_count": max(int(candidate_files_count), 0),
         "evidence_files_count": len({citation.file_path for citation in citations}),
         "graph_repo": str(graph_payload.get("repo") or ""),
@@ -4428,10 +4662,16 @@ def run_routed_retrieval_plan(
         elif selected_plan == PLAN_KEYWORD_PLUS_VECTOR:
             selected_plan = PLAN_GRAPH_PLUS_KEYWORD_PLUS_VECTOR
     signals = detect_route_signals(question)
+    test_intent_detected = is_test_intent_query(normalized_question)
+    signals["test_intent_detected"] = bool(test_intent_detected)
     route_debug = route_debug_template(route=selected_plan, signals=signals)
     route_debug["initial_route"] = base_plan
     if selected_plan != base_plan:
         route_debug["mode_override"] = "hybrid_prefers_graph"
+    include_tests = bool(test_intent_detected)
+    fallback_with_tests = False
+    excluded_test_candidates = 0
+    final_test_candidates = 0
 
     final_top_k = min(max(int(top_k), 1), 5)
     target_repo = default_gitnexus_repo()
@@ -4457,7 +4697,9 @@ def run_routed_retrieval_plan(
             "edge_count": None,
         },
     }
+    graph_files_all: list[str] = []
     graph_files: list[str] = []
+    keyword_files_all: list[str] = []
     keyword_files: list[str] = []
     retrieval_debug: dict[str, Any] = {"subqueries": [], "candidates": []}
     citations: list[Citation] = []
@@ -4469,12 +4711,31 @@ def run_routed_retrieval_plan(
     keyword_done = False
 
     def step_graph() -> None:
-        nonlocal graph_payload, graph_files, graph_done
+        nonlocal graph_payload, graph_files_all, graph_files, graph_done, excluded_test_candidates
         if graph_done:
             return
         started = time.perf_counter()
-        graph_payload = run_gitnexus_graph(normalized_question, repo_name=target_repo)
-        graph_files = _normalized_candidate_paths(graph_payload.get("candidate_files", []) if isinstance(graph_payload, dict) else [])
+        graph_payload = run_gitnexus_graph(
+            normalized_question,
+            repo_name=target_repo,
+            include_tests=include_tests,
+        )
+        graph_files_all = _normalized_candidate_paths(
+            graph_payload.get("candidate_files", []) if isinstance(graph_payload, dict) else []
+        )
+        graph_files, graph_excluded_tests, _ = filter_paths_by_test_policy(graph_files_all, include_tests=include_tests)
+        excluded_test_candidates += graph_excluded_tests
+        ranking_rows, ranking_excluded_tests, _ = filter_candidate_ranking_rows_by_test_policy(
+            graph_payload.get("candidate_file_ranking", []) if isinstance(graph_payload, dict) else [],
+            include_tests=include_tests,
+        )
+        excluded_test_candidates += ranking_excluded_tests
+        if isinstance(graph_payload, dict):
+            graph_payload["candidate_files"] = list(graph_files)
+            graph_payload["candidate_file_ranking"] = ranking_rows
+            raw_counts = graph_payload.get("raw_counts")
+            if isinstance(raw_counts, dict):
+                raw_counts["files"] = len(graph_files)
         processes = graph_payload.get("processes", []) if isinstance(graph_payload, dict) else []
         entrypoints = graph_payload.get("entrypoints", []) if isinstance(graph_payload, dict) else []
         graph_errors = graph_payload.get("errors", []) if isinstance(graph_payload, dict) else []
@@ -4494,14 +4755,19 @@ def run_routed_retrieval_plan(
         graph_done = True
 
     def step_keyword() -> None:
-        nonlocal keyword_files, keyword_done
+        nonlocal keyword_files_all, keyword_files, keyword_done, excluded_test_candidates
         if keyword_done:
             return
         started = time.perf_counter()
         lexical_payload = lexical_candidate_files(normalized_question)
-        keyword_files = _normalized_candidate_paths(
+        keyword_files_all = _normalized_candidate_paths(
             lexical_payload.get("candidate_files", []) if isinstance(lexical_payload, dict) else []
         )
+        keyword_files, keyword_excluded_tests, _ = filter_paths_by_test_policy(
+            keyword_files_all,
+            include_tests=include_tests,
+        )
+        excluded_test_candidates += keyword_excluded_tests
         hits = lexical_payload.get("hits", []) if isinstance(lexical_payload, dict) else []
         lexical_errors = lexical_payload.get("errors", []) if isinstance(lexical_payload, dict) else []
         keyword_step: dict[str, Any] = {
@@ -4516,7 +4782,12 @@ def run_routed_retrieval_plan(
         route_debug["steps"].append(keyword_step)
         keyword_done = True
 
-    def step_vector(candidate_files: list[str] | None) -> tuple[list[Citation], list[str], dict[str, Any]]:
+    def step_vector(
+        candidate_files: list[str] | None,
+        include_tests_for_step: bool,
+        fallback_with_tests_flag: bool = False,
+    ) -> tuple[list[Citation], list[str], dict[str, Any]]:
+        nonlocal excluded_test_candidates
         started = time.perf_counter()
         local_citations, local_chunks, local_debug = retrieve_with_optional_uploads(
             question=normalized_question,
@@ -4532,12 +4803,17 @@ def run_routed_retrieval_plan(
             repo_name=target_repo if candidate_files else None,
             disable_internal_lexical=True,
             candidate_top_k_override=ROUTER_PINECONE_TOP_K,
+            include_tests=include_tests_for_step,
+            test_intent_detected=test_intent_detected,
+            fallback_with_tests=fallback_with_tests_flag,
         )
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         index_debug = (local_debug.get("index", {}) if isinstance(local_debug, dict) else {}) or {}
         index_timing = (index_debug.get("timings_ms", {}) if isinstance(index_debug, dict) else {}) or {}
         pinecone_ms = float(index_timing.get("pinecone_query") or 0.0)
         rerank_ms = float(index_timing.get("rerank") or 0.0)
+        local_test_debug = (local_debug.get("test_filter", {}) if isinstance(local_debug, dict) else {}) or {}
+        excluded_test_candidates += max(int(local_test_debug.get("excluded_test_candidates", 0) or 0), 0)
 
         route_debug["steps"].append(
             {
@@ -4545,6 +4821,7 @@ def run_routed_retrieval_plan(
                 "ms": round(pinecone_ms if pinecone_ms > 0 else elapsed_ms, 2),
                 "top_k": ROUTER_PINECONE_TOP_K,
                 "filtered": bool(candidate_files),
+                "include_tests": bool(include_tests_for_step),
             }
         )
         route_debug["steps"].append(
@@ -4556,6 +4833,17 @@ def run_routed_retrieval_plan(
         )
         return local_citations, local_chunks, local_debug
 
+    def candidate_files_for_plan(plan: str, include_tests_for_candidates: bool) -> list[str]:
+        graph_candidates = graph_files_all if include_tests_for_candidates else graph_files
+        keyword_candidates = keyword_files_all if include_tests_for_candidates else keyword_files
+        if plan == PLAN_GRAPH_PLUS_VECTOR:
+            return list(graph_candidates)
+        if plan == PLAN_KEYWORD_PLUS_VECTOR:
+            return list(keyword_candidates)
+        if plan == PLAN_GRAPH_PLUS_KEYWORD_PLUS_VECTOR:
+            return _normalized_candidate_paths([*graph_candidates, *keyword_candidates])
+        return []
+
     if selected_plan == PLAN_GRAPH_ONLY:
         step_graph()
         fallback_reason = classify_graph_fallback_reason(graph_payload, signals, low_conf_reason=None)
@@ -4563,9 +4851,21 @@ def run_routed_retrieval_plan(
             question=normalized_question,
             graph_payload=graph_payload,
             fallback_reason=fallback_reason,
-            candidate_files_count=0,
+            candidate_files_count=len(graph_files),
             citations=[],
+            include_tests=include_tests,
+            test_intent_detected=test_intent_detected,
+            fallback_with_tests=False,
+            excluded_test_candidates=excluded_test_candidates,
+            final_test_candidates=0,
         )
+        route_debug["test_filter"] = {
+            "include_tests": bool(include_tests),
+            "test_intent_detected": bool(test_intent_detected),
+            "fallback_with_tests": False,
+            "excluded_test_candidates": max(int(excluded_test_candidates), 0),
+            "final_test_candidates": 0,
+        }
         route_debug["hybrid_debug"] = hybrid_debug
         graph_payload["hybrid_debug"] = hybrid_debug
         logger.info("hybrid_debug=%s", json.dumps(hybrid_debug, sort_keys=True))
@@ -4576,16 +4876,13 @@ def run_routed_retrieval_plan(
     if selected_plan in {PLAN_KEYWORD_ONLY, PLAN_KEYWORD_PLUS_VECTOR, PLAN_GRAPH_PLUS_KEYWORD_PLUS_VECTOR}:
         step_keyword()
 
-    candidate_files: list[str] = []
-    if selected_plan == PLAN_GRAPH_PLUS_VECTOR:
-        candidate_files = graph_files
-    elif selected_plan == PLAN_KEYWORD_PLUS_VECTOR:
-        candidate_files = keyword_files
-    elif selected_plan == PLAN_GRAPH_PLUS_KEYWORD_PLUS_VECTOR:
-        candidate_files = _normalized_candidate_paths([*graph_files, *keyword_files])
-
+    candidate_files = candidate_files_for_plan(selected_plan, include_tests_for_candidates=include_tests)
     selected_candidate_files = list(candidate_files)
-    citations, chunks, retrieval_debug = step_vector(candidate_files or None)
+    citations, chunks, retrieval_debug = step_vector(
+        candidate_files or None,
+        include_tests_for_step=include_tests,
+        fallback_with_tests_flag=False,
+    )
 
     low_conf_reason = low_confidence_reason(citations)
     if not low_conf_reason and selected_plan in {PLAN_GRAPH_PLUS_VECTOR, PLAN_GRAPH_PLUS_KEYWORD_PLUS_VECTOR}:
@@ -4600,20 +4897,45 @@ def run_routed_retrieval_plan(
         selected_plan = next_plan
         route_debug["route"] = selected_plan
 
-        if selected_plan == PLAN_KEYWORD_PLUS_VECTOR:
+        if selected_plan in {PLAN_KEYWORD_PLUS_VECTOR, PLAN_GRAPH_PLUS_KEYWORD_PLUS_VECTOR}:
             step_keyword()
-            escalation_candidates = keyword_files
-        elif selected_plan == PLAN_GRAPH_PLUS_KEYWORD_PLUS_VECTOR:
+        if selected_plan in {PLAN_GRAPH_PLUS_VECTOR, PLAN_GRAPH_PLUS_KEYWORD_PLUS_VECTOR}:
             step_graph()
-            step_keyword()
-            escalation_candidates = _normalized_candidate_paths([*graph_files, *keyword_files])
-        else:
-            escalation_candidates = []
 
+        escalation_candidates = candidate_files_for_plan(selected_plan, include_tests_for_candidates=include_tests)
         selected_candidate_files = list(escalation_candidates)
-        citations, chunks, retrieval_debug = step_vector(escalation_candidates or None)
+        citations, chunks, retrieval_debug = step_vector(
+            escalation_candidates or None,
+            include_tests_for_step=include_tests,
+            fallback_with_tests_flag=False,
+        )
+        low_conf_reason = low_confidence_reason(citations)
     else:
         route_debug["escalation"] = {"did_escalate": False, "reason": None}
+
+    if (not include_tests) and low_conf_reason:
+        fallback_with_tests = True
+        fallback_candidates = candidate_files_for_plan(selected_plan, include_tests_for_candidates=True)
+        fallback_citations, fallback_chunks, fallback_debug = step_vector(
+            fallback_candidates or None,
+            include_tests_for_step=True,
+            fallback_with_tests_flag=True,
+        )
+        include_tests = True
+        if isinstance(graph_payload, dict):
+            graph_payload["candidate_files"] = list(fallback_candidates)
+            raw_counts = graph_payload.get("raw_counts")
+            if isinstance(raw_counts, dict):
+                raw_counts["files"] = len(fallback_candidates)
+        route_debug["escalation"] = {"did_escalate": True, "reason": f"tests_fallback:{low_conf_reason}"}
+        if fallback_citations:
+            citations = fallback_citations
+            chunks = fallback_chunks
+            retrieval_debug = fallback_debug
+            selected_candidate_files = list(fallback_candidates)
+        low_conf_reason = low_confidence_reason(citations)
+
+    final_test_candidates = sum(1 for citation in citations if is_test_file_path(citation.file_path))
 
     fallback_reason = classify_graph_fallback_reason(graph_payload, signals, low_conf_reason)
     hybrid_debug = build_hybrid_debug_payload(
@@ -4622,7 +4944,19 @@ def run_routed_retrieval_plan(
         fallback_reason=fallback_reason,
         candidate_files_count=len(selected_candidate_files),
         citations=citations,
+        include_tests=include_tests,
+        test_intent_detected=test_intent_detected,
+        fallback_with_tests=fallback_with_tests,
+        excluded_test_candidates=excluded_test_candidates,
+        final_test_candidates=final_test_candidates,
     )
+    route_debug["test_filter"] = {
+        "include_tests": bool(include_tests),
+        "test_intent_detected": bool(test_intent_detected),
+        "fallback_with_tests": bool(fallback_with_tests),
+        "excluded_test_candidates": max(int(excluded_test_candidates), 0),
+        "final_test_candidates": max(int(final_test_candidates), 0),
+    }
     route_debug["hybrid_debug"] = hybrid_debug
     if isinstance(graph_payload, dict):
         graph_payload["hybrid_debug"] = hybrid_debug

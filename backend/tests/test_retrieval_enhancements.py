@@ -38,6 +38,23 @@ class RetrievalEnhancementTests(unittest.TestCase):
         hints = main.extract_identifier_hints("Where is the main entry point of this program?")
         self.assertEqual(hints, [])
 
+    def test_test_intent_detection(self) -> None:
+        self.assertTrue(main.is_test_intent_query("Which tests cover GailTable regression behavior?"))
+        self.assertTrue(main.is_test_intent_query("Why is this pytest assertion failing?"))
+        self.assertFalse(main.is_test_intent_query("Show call chain for GailTable"))
+
+    def test_test_path_filtering(self) -> None:
+        paths = [
+            "backend/tests/test_router.py",
+            "src/deaggGRID.f",
+            "backend/app/main.py",
+            "frontend/__tests__/chat.spec.ts",
+        ]
+        filtered, excluded, final_tests = main.filter_paths_by_test_policy(paths, include_tests=False)
+        self.assertEqual(filtered, ["src/deaggGRID.f", "backend/app/main.py"])
+        self.assertEqual(excluded, 2)
+        self.assertEqual(final_tests, 0)
+
     def test_rerank_prefers_exact_identifier_and_symbol_match(self) -> None:
         matches = [
             {

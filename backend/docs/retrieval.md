@@ -37,6 +37,12 @@
    - Adds neighbor lines and optional file header context.
    - Preserves citation line ranges for answer grounding.
 
+6. Test-file retrieval policy (`retrieve_with_optional_uploads`, `run_routed_retrieval_plan`):
+   - Test files remain indexed in Pinecone and graph storage.
+   - Default retrieval excludes test paths (`/tests/`, `/test/`, `__tests__/`, `*.spec.*`, `*.test.*`, `test_*.py`, `*_test.py`).
+   - Queries with test/debug intent (`pytest`, `coverage`, `assert`, `unit test`, etc.) set `include_tests=true`.
+   - If non-test retrieval is empty/low-confidence, Hybrid runs one fallback pass with `include_tests=true`.
+
 ## Fortran-Aware Ingestion
 Implemented in `app/ingest.py`:
 - Recursive file discovery with extension allowlist and build/vendor exclusion.
@@ -68,6 +74,13 @@ These flags are useful for controlled evaluation and rollback.
 - total latency
 
 Debug candidate rows include semantic rank and rerank rank for before/after comparison.
+
+Test-filter telemetry is emitted in debug payloads:
+- `include_tests`
+- `test_intent_detected`
+- `fallback_with_tests`
+- `excluded_test_candidates`
+- `final_test_candidates`
 
 ## Failure Modes
 - Identifier not present in codebase: retrieval may still return semantically related chunks; focus-term guardrail can suppress unsupported answers.

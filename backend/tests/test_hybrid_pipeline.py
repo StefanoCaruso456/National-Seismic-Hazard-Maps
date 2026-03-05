@@ -167,7 +167,7 @@ class HybridPipelineTests(unittest.TestCase):
         original_run_gitnexus_graph = main.run_gitnexus_graph
         original_retrieve = main.retrieve_with_optional_uploads
         try:
-            main.run_gitnexus_graph = lambda question, repo_name=None: {  # type: ignore[assignment]
+            main.run_gitnexus_graph = lambda question, repo_name=None, include_tests=False: {  # type: ignore[assignment]
                 "repo": repo_name or "nshmp-main",
                 "query": question,
                 "processes": [{"id": "hazard_flow", "summary": "Hazard flow", "priority": 0.92}],
@@ -250,7 +250,7 @@ class HybridPipelineTests(unittest.TestCase):
         try:
             called = {"graph": 0}
 
-            def _fake_graph(question, repo_name=None):  # type: ignore[no-untyped-def]
+            def _fake_graph(question, repo_name=None, include_tests=False):  # type: ignore[no-untyped-def]
                 called["graph"] += 1
                 return {
                     "repo": repo_name or "nshmp-main",
@@ -292,6 +292,202 @@ class HybridPipelineTests(unittest.TestCase):
             self.assertGreaterEqual(called["graph"], 1)
             self.assertEqual(route_debug.get("mode_override"), "hybrid_prefers_graph")
             self.assertTrue(any(step.get("name") == "graph" for step in route_debug.get("steps", [])))
+        finally:
+            main.run_gitnexus_graph = original_run_gitnexus_graph  # type: ignore[assignment]
+            main.retrieve_with_optional_uploads = original_retrieve  # type: ignore[assignment]
+
+    def test_architecture_query_excludes_tests_by_default(self) -> None:
+        original_run_gitnexus_graph = main.run_gitnexus_graph
+        original_retrieve = main.retrieve_with_optional_uploads
+        try:
+            main.run_gitnexus_graph = lambda question, repo_name=None, include_tests=False: {  # type: ignore[assignment]
+                "repo": repo_name or "nshmp-main",
+                "query": question,
+                "processes": [{"id": "p1", "summary": "Main -> GailTable", "priority": 0.84}],
+                "entrypoints": ["Main -> GailTable"],
+                "impact": {},
+                "candidate_files": ["backend/tests/test_router.py", "src/deaggGRID.f"],
+                "candidate_file_ranking": [
+                    {"file_path": "backend/tests/test_router.py", "score": 2.0, "reasons": ["query.process_symbols"]},
+                    {"file_path": "src/deaggGRID.f", "score": 1.8, "reasons": ["query.process_symbols"]},
+                ],
+                "target_symbol": "gailtable",
+                "errors": [],
+                "raw_counts": {"processes": 1, "nodes": 4, "edges": 3, "files": 2},
+                "score": {"best": 0.84, "threshold": 0.2, "passed": True},
+                "index": {"repo_id": repo_name or "nshmp-main", "index_present": True},
+            }
+
+            def _fake_retrieve(**kwargs):  # type: ignore[no-untyped-def]
+                include_tests = bool(kwargs.get("include_tests"))
+                debug = {
+                    "index": {"timings_ms": {"pinecone_query": 12.0, "rerank": 2.0}},
+                    "test_filter": {
+                        "include_tests": include_tests,
+                        "excluded_test_candidates": 0,
+                        "final_test_candidates": 0,
+                    },
+                }
+                return (
+                    [
+                        main.Citation(
+                            file_path="src/deaggGRID.f",
+                            line_start=100,
+                            line_end=130,
+                            score=0.83,
+                            source_type="repo",
+                        )
+                    ],
+                    ["subroutine gailtable"],
+                    debug,
+                )
+
+            main.retrieve_with_optional_uploads = _fake_retrieve  # type: ignore[assignment]
+
+            _, _, _, graph_payload, route_debug, _ = main.run_routed_retrieval_plan(
+                question="Show the call chain for GailTable including upstream callers and downstream impact.",
+                mode="hybrid",
+                top_k=5,
+                scope="repo",
+                project_id="nshmp-main",
+            )
+
+            hybrid_debug = route_debug.get("hybrid_debug", {})
+            self.assertFalse(hybrid_debug.get("include_tests"))
+            self.assertFalse(hybrid_debug.get("test_intent_detected"))
+            self.assertFalse(hybrid_debug.get("fallback_with_tests"))
+            self.assertGreater(hybrid_debug.get("excluded_test_candidates", 0), 0)
+            self.assertNotIn("backend/tests/test_router.py", graph_payload.get("candidate_files", []))
+        finally:
+            main.run_gitnexus_graph = original_run_gitnexus_graph  # type: ignore[assignment]
+            main.retrieve_with_optional_uploads = original_retrieve  # type: ignore[assignment]
+
+    def test_test_query_enables_tests(self) -> None:
+        original_run_gitnexus_graph = main.run_gitnexus_graph
+        original_retrieve = main.retrieve_with_optional_uploads
+        try:
+            main.run_gitnexus_graph = lambda question, repo_name=None, include_tests=False: {  # type: ignore[assignment]
+                "repo": repo_name or "nshmp-main",
+                "query": question,
+                "processes": [{"id": "p1", "summary": "Tests -> GailTable", "priority": 0.62}],
+                "entrypoints": ["Tests -> GailTable"],
+                "impact": {},
+                "candidate_files": ["backend/tests/test_router.py", "src/deaggGRID.f"],
+                "candidate_file_ranking": [],
+                "target_symbol": "gailtable",
+                "errors": [],
+                "raw_counts": {"processes": 1, "nodes": 3, "edges": 2, "files": 2},
+                "score": {"best": 0.62, "threshold": 0.2, "passed": True},
+                "index": {"repo_id": repo_name or "nshmp-main", "index_present": True},
+            }
+
+            def _fake_retrieve(**kwargs):  # type: ignore[no-untyped-def]
+                include_tests = bool(kwargs.get("include_tests"))
+                file_path = "backend/tests/test_router.py" if include_tests else "src/deaggGRID.f"
+                debug = {
+                    "index": {"timings_ms": {"pinecone_query": 11.0, "rerank": 2.0}},
+                    "test_filter": {
+                        "include_tests": include_tests,
+                        "excluded_test_candidates": 0,
+                        "final_test_candidates": 1 if include_tests else 0,
+                    },
+                }
+                return (
+                    [
+                        main.Citation(
+                            file_path=file_path,
+                            line_start=12,
+                            line_end=33,
+                            score=0.79,
+                            source_type="repo",
+                        )
+                    ],
+                    ["test coverage reference"],
+                    debug,
+                )
+
+            main.retrieve_with_optional_uploads = _fake_retrieve  # type: ignore[assignment]
+
+            _, _, _, _, route_debug, _ = main.run_routed_retrieval_plan(
+                question="Which tests cover GailTable?",
+                mode="hybrid",
+                top_k=5,
+                scope="repo",
+                project_id="nshmp-main",
+            )
+
+            hybrid_debug = route_debug.get("hybrid_debug", {})
+            self.assertTrue(hybrid_debug.get("include_tests"))
+            self.assertTrue(hybrid_debug.get("test_intent_detected"))
+            self.assertFalse(hybrid_debug.get("fallback_with_tests"))
+        finally:
+            main.run_gitnexus_graph = original_run_gitnexus_graph  # type: ignore[assignment]
+            main.retrieve_with_optional_uploads = original_retrieve  # type: ignore[assignment]
+
+    def test_low_confidence_triggers_single_fallback_with_tests(self) -> None:
+        original_run_gitnexus_graph = main.run_gitnexus_graph
+        original_retrieve = main.retrieve_with_optional_uploads
+        try:
+            main.run_gitnexus_graph = lambda question, repo_name=None, include_tests=False: {  # type: ignore[assignment]
+                "repo": repo_name or "nshmp-main",
+                "query": question,
+                "processes": [{"id": "p1", "summary": "Main -> Unknown", "priority": 0.41}],
+                "entrypoints": ["Main -> Unknown"],
+                "impact": {},
+                "candidate_files": ["src/deaggGRID.f", "backend/tests/test_router.py"],
+                "candidate_file_ranking": [],
+                "target_symbol": "unknown",
+                "errors": [],
+                "raw_counts": {"processes": 1, "nodes": 2, "edges": 1, "files": 2},
+                "score": {"best": 0.41, "threshold": 0.2, "passed": True},
+                "index": {"repo_id": repo_name or "nshmp-main", "index_present": True},
+            }
+
+            calls = {"count": 0}
+
+            def _fake_retrieve(**kwargs):  # type: ignore[no-untyped-def]
+                calls["count"] += 1
+                include_tests = bool(kwargs.get("include_tests"))
+                debug = {
+                    "index": {"timings_ms": {"pinecone_query": 9.0, "rerank": 1.5}},
+                    "test_filter": {
+                        "include_tests": include_tests,
+                        "excluded_test_candidates": 1 if not include_tests else 0,
+                        "final_test_candidates": 1 if include_tests else 0,
+                    },
+                }
+                if not include_tests:
+                    return [], [], debug
+                return (
+                    [
+                        main.Citation(
+                            file_path="backend/tests/test_router.py",
+                            line_start=21,
+                            line_end=44,
+                            score=0.77,
+                            source_type="repo",
+                        )
+                    ],
+                    ["assert route debug"],
+                    debug,
+                )
+
+            main.retrieve_with_optional_uploads = _fake_retrieve  # type: ignore[assignment]
+
+            citations, _, _, _, route_debug, _ = main.run_routed_retrieval_plan(
+                question="Show call chain for GailTable including upstream callers and downstream impact.",
+                mode="hybrid",
+                top_k=5,
+                scope="repo",
+                project_id="nshmp-main",
+            )
+
+            hybrid_debug = route_debug.get("hybrid_debug", {})
+            self.assertTrue(route_debug.get("escalation", {}).get("did_escalate"))
+            self.assertTrue(hybrid_debug.get("fallback_with_tests"))
+            self.assertTrue(hybrid_debug.get("include_tests"))
+            self.assertTrue(citations)
+            self.assertGreaterEqual(calls["count"], 2)
         finally:
             main.run_gitnexus_graph = original_run_gitnexus_graph  # type: ignore[assignment]
             main.retrieve_with_optional_uploads = original_retrieve  # type: ignore[assignment]

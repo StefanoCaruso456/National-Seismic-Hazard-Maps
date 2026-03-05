@@ -189,6 +189,58 @@ class HybridPipelineTests(unittest.TestCase):
             main.run_gitnexus_graph = original_run_gitnexus_graph  # type: ignore[assignment]
             main.retrieve_with_optional_uploads = original_retrieve  # type: ignore[assignment]
 
+    def test_hybrid_mode_always_executes_graph_step(self) -> None:
+        original_run_gitnexus_graph = main.run_gitnexus_graph
+        original_retrieve = main.retrieve_with_optional_uploads
+        try:
+            called = {"graph": 0}
+
+            def _fake_graph(question, repo_name=None):  # type: ignore[no-untyped-def]
+                called["graph"] += 1
+                return {
+                    "repo": repo_name or "nshmp-main",
+                    "query": question,
+                    "processes": [],
+                    "entrypoints": [],
+                    "impact": {},
+                    "candidate_files": [],
+                    "candidate_file_ranking": [],
+                    "target_symbol": None,
+                    "errors": [],
+                    "raw_counts": {"processes": 0, "nodes": 0, "edges": 0, "files": 0},
+                    "score": {"best": 0.0, "threshold": 0.2, "passed": False},
+                    "index": {
+                        "repo_id": repo_name or "nshmp-main",
+                        "commit_hash": "abc1234",
+                        "available_repos": [repo_name or "nshmp-main"],
+                        "index_present": True,
+                        "build_timestamp": "2026-03-05T00:00:00Z",
+                        "node_count": 1200,
+                        "edge_count": 3400,
+                    },
+                }
+
+            def _fake_retrieve(**_kwargs):  # type: ignore[no-untyped-def]
+                return [], [], {"index": {"timings_ms": {"pinecone_query": 10.0, "rerank": 2.0}}}
+
+            main.run_gitnexus_graph = _fake_graph  # type: ignore[assignment]
+            main.retrieve_with_optional_uploads = _fake_retrieve  # type: ignore[assignment]
+
+            _, _, _, _, route_debug, _ = main.run_routed_retrieval_plan(
+                question="Explain this repository at a high level.",
+                mode="hybrid",
+                top_k=5,
+                scope="repo",
+                project_id="nshmp-main",
+            )
+
+            self.assertGreaterEqual(called["graph"], 1)
+            self.assertEqual(route_debug.get("mode_override"), "hybrid_prefers_graph")
+            self.assertTrue(any(step.get("name") == "graph" for step in route_debug.get("steps", [])))
+        finally:
+            main.run_gitnexus_graph = original_run_gitnexus_graph  # type: ignore[assignment]
+            main.retrieve_with_optional_uploads = original_retrieve  # type: ignore[assignment]
+
 
 if __name__ == "__main__":
     unittest.main()

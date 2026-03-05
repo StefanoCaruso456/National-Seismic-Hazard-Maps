@@ -3809,6 +3809,17 @@ def classify_graph_fallback_reason(
     if low_conf_reason:
         return f"retrieval_{low_conf_reason}"
     raw_counts = graph_payload.get("raw_counts", {}) if isinstance(graph_payload, dict) else {}
+    score = graph_payload.get("score", {}) if isinstance(graph_payload, dict) else {}
+    try:
+        best = float((score or {}).get("best") or 0.0)
+    except (TypeError, ValueError):
+        best = 0.0
+    try:
+        threshold = float((score or {}).get("threshold") or GRAPH_PROCESS_PRIORITY_THRESHOLD)
+    except (TypeError, ValueError):
+        threshold = GRAPH_PROCESS_PRIORITY_THRESHOLD
+    if best > 0 and best < threshold:
+        return "graph_score_below_threshold"
     processes = safe_int(raw_counts.get("processes")) or 0
     files = safe_int(raw_counts.get("files")) or 0
     if bool(signals.get("structure_intent")) and processes == 0 and files == 0:
@@ -3878,14 +3889,44 @@ def run_routed_retrieval_plan(
     source_type_filter: str | None = None,
 ) -> tuple[list[Citation], list[str], dict[str, Any], dict[str, Any], dict[str, Any], str]:
     normalized_question = " ".join(str(question or "").split())
-    selected_plan = select_retrieval_plan(question=normalized_question, mode=mode)
+    base_plan = select_retrieval_plan(question=normalized_question, mode=mode)
+    selected_plan = base_plan
+    normalized_mode = normalize_mode(mode)
+    if normalized_mode == "hybrid":
+        if selected_plan == PLAN_VECTOR_ONLY:
+            selected_plan = PLAN_GRAPH_PLUS_VECTOR
+        elif selected_plan == PLAN_KEYWORD_PLUS_VECTOR:
+            selected_plan = PLAN_GRAPH_PLUS_KEYWORD_PLUS_VECTOR
     signals = detect_route_signals(question)
     route_debug = route_debug_template(route=selected_plan, signals=signals)
-    route_debug["initial_route"] = selected_plan
+    route_debug["initial_route"] = base_plan
+    if selected_plan != base_plan:
+        route_debug["mode_override"] = "hybrid_prefers_graph"
 
     final_top_k = min(max(int(top_k), 1), 5)
     target_repo = default_gitnexus_repo()
-    graph_payload: dict[str, Any] = {}
+    graph_payload: dict[str, Any] = {
+        "repo": target_repo,
+        "query": normalized_question,
+        "processes": [],
+        "entrypoints": [],
+        "impact": {},
+        "candidate_files": [],
+        "candidate_file_ranking": [],
+        "target_symbol": None,
+        "errors": [],
+        "raw_counts": {"processes": 0, "nodes": 0, "edges": 0, "files": 0},
+        "score": {"best": 0.0, "threshold": GRAPH_PROCESS_PRIORITY_THRESHOLD, "passed": False},
+        "index": {
+            "repo_id": target_repo,
+            "commit_hash": repo_commit_short(),
+            "available_repos": [],
+            "index_present": None,
+            "build_timestamp": None,
+            "node_count": None,
+            "edge_count": None,
+        },
+    }
     graph_files: list[str] = []
     keyword_files: list[str] = []
     retrieval_debug: dict[str, Any] = {"subqueries": [], "candidates": []}

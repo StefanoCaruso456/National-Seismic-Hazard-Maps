@@ -1846,8 +1846,8 @@ def rerank_matches(question: str, matches: list, top_k: int) -> tuple[list[tuple
     seen_ranges: set[tuple[str, int, int]] = set()
     for hybrid, semantic, lexical, metadata, _ in rescored:
         file_path = str(metadata.get("file_path", "unknown"))
-        line_start = safe_int(metadata.get("line_start")) or 1
-        line_end = safe_int(metadata.get("line_end")) or line_start
+        line_start = safe_int(metadata.get("line_start")) or safe_int(metadata.get("start_line")) or 1
+        line_end = safe_int(metadata.get("line_end")) or safe_int(metadata.get("end_line")) or line_start
         key = (file_path, line_start, line_end)
         if key in seen_ranges:
             continue
@@ -1885,11 +1885,11 @@ def rerank_matches(question: str, matches: list, top_k: int) -> tuple[list[tuple
 
 def extract_citation(metadata: dict, score: float) -> dict:
     try:
-        line_start = int(metadata.get("line_start", 1))
+        line_start = int(metadata.get("line_start", metadata.get("start_line", 1)))
     except (TypeError, ValueError):
         line_start = 1
     try:
-        line_end = int(metadata.get("line_end", line_start))
+        line_end = int(metadata.get("line_end", metadata.get("end_line", line_start)))
     except (TypeError, ValueError):
         line_end = line_start
 

@@ -3804,6 +3804,8 @@ def classify_graph_fallback_reason(
         return "graph_repo_unknown"
     if any("repo_not_indexed" in item for item in errors):
         return "graph_not_indexed"
+    if any("no indexed repositories" in item for item in errors):
+        return "graph_not_indexed"
     if any("gitnexus_unavailable" in item for item in errors) or any("no such file or directory: 'npx'" in item for item in errors):
         return "graph_runtime_unavailable"
     if low_conf_reason == "graph_no_candidates":

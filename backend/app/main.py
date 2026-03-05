@@ -31,6 +31,9 @@ IDENTIFIER_PATTERN = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]{2,}")
 WORD_PATTERN = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]*")
 SAFE_UPLOAD_NAME_PATTERN = re.compile(r"[^a-zA-Z0-9._-]+")
 SAFE_PROJECT_ID_PATTERN = re.compile(r"[^a-zA-Z0-9._-]+")
+FOCUS_TERM_QUOTED_PATTERN = re.compile(r"[\"'`]([^\"'`]{3,140})[\"'`]")
+FOCUS_TERM_HYPHENATED_PATTERN = re.compile(r"\b[a-zA-Z][a-zA-Z0-9_]*-[a-zA-Z0-9_-]+\b")
+FOCUS_TERM_UNDERSCORED_PATTERN = re.compile(r"\b[a-zA-Z][a-zA-Z0-9]*_[a-zA-Z0-9_]+\b")
 FORTRAN_DEF_PATTERN = re.compile(
     r"^\s*(program|subroutine|function|module(?!\s+procedure)|block\s+data|interface)\s+([a-zA-Z_][a-zA-Z0-9_]*)",
     re.IGNORECASE,
@@ -162,6 +165,9 @@ class RepoScanResponse(BaseModel):
 class RetrievalInfoResponse(BaseModel):
     lexical_weight: float
     min_hybrid_score: float
+    focus_term_guardrail_enabled: bool
+    focus_term_absent_cap: float
+    focus_term_partial_coverage_cap: float
     candidate_multiplier: int
     max_candidates: int
     rag_max_context_chunks: int
@@ -410,6 +416,9 @@ def retrieval_info() -> RetrievalInfoResponse:
     return RetrievalInfoResponse(
         lexical_weight=min(max(settings.retrieval_lexical_weight, 0.0), 1.0),
         min_hybrid_score=min(max(settings.retrieval_min_hybrid_score, 0.0), 1.0),
+        focus_term_guardrail_enabled=bool(settings.retrieval_focus_term_guardrail_enabled),
+        focus_term_absent_cap=min(max(float(settings.retrieval_focus_term_absent_cap), 0.0), 1.0),
+        focus_term_partial_coverage_cap=min(max(float(settings.retrieval_focus_term_partial_coverage_cap), 0.0), 1.0),
         candidate_multiplier=max(settings.retrieval_candidate_multiplier, 1),
         max_candidates=max(settings.retrieval_max_candidates, 1),
         rag_max_context_chunks=max(settings.rag_max_context_chunks, 1),
@@ -1331,6 +1340,118 @@ def tokenize_question(question: str) -> tuple[set[str], set[str]]:
     return words, identifiers
 
 
+def normalize_focus_term(term: str) -> str:
+    trimmed = " ".join(term.strip().strip("`'\"").split())
+    return trimmed.strip(".,:;()[]{}")
+
+
+def is_likely_code_focus_term(term: str) -> bool:
+    normalized = normalize_focus_term(term)
+    if len(normalized) < 4:
+        return False
+    if "_" in normalized:
+        return True
+    if "-" in normalized:
+        if any(char.isupper() for char in normalized):
+            return True
+        if any(char.isdigit() for char in normalized):
+            return True
+        return len(normalized) >= 12
+    if " " in normalized:
+        return "_" in normalized or "-" in normalized
+    return False
+
+
+def extract_focus_terms(question: str) -> list[str]:
+    terms: list[str] = []
+    for value in FOCUS_TERM_QUOTED_PATTERN.findall(question):
+        normalized = normalize_focus_term(value)
+        if normalized and is_likely_code_focus_term(normalized):
+            terms.append(normalized.lower())
+    for value in FOCUS_TERM_HYPHENATED_PATTERN.findall(question):
+        normalized = normalize_focus_term(value)
+        if normalized and is_likely_code_focus_term(normalized):
+            terms.append(normalized.lower())
+    for value in FOCUS_TERM_UNDERSCORED_PATTERN.findall(question):
+        normalized = normalize_focus_term(value)
+        if normalized and is_likely_code_focus_term(normalized):
+            terms.append(normalized.lower())
+    return dedupe_preserve_order(terms)
+
+
+def focus_term_present(term: str, source_text: str) -> bool:
+    lookup = term.lower().strip()
+    if not lookup:
+        return False
+    lower_source = source_text.lower()
+    if lookup in lower_source:
+        return True
+    compact_lookup = re.sub(r"[-_\s]+", "", lookup)
+    if len(compact_lookup) < 4:
+        return False
+    compact_source = re.sub(r"[-_\s]+", "", lower_source)
+    return compact_lookup in compact_source
+
+
+def focus_term_match_count(required_terms: list[str], source_text: str) -> int:
+    if not required_terms:
+        return 0
+    return sum(1 for term in required_terms if focus_term_present(term, source_text))
+
+
+def analyze_focus_term_alignment(
+    question: str,
+    citations: list[Citation],
+    chunks: list[str],
+) -> dict[str, Any]:
+    required_terms = extract_focus_terms(question)
+    if not required_terms:
+        return {
+            "enabled": bool(settings.retrieval_focus_term_guardrail_enabled),
+            "required_terms": [],
+            "matched_terms": [],
+            "unmatched_terms": [],
+            "coverage": 1.0,
+            "matched_citation_count": 0,
+            "action": "none",
+        }
+
+    matched_terms: set[str] = set()
+    matched_citation_count = 0
+    for citation, chunk in zip(citations, chunks, strict=False):
+        source = f"{citation.file_path}\n{citation.snippet or ''}\n{chunk}"
+        local_hits = 0
+        for term in required_terms:
+            if focus_term_present(term, source):
+                matched_terms.add(term)
+                local_hits += 1
+        if local_hits > 0:
+            matched_citation_count += 1
+
+    matched_list = sorted(matched_terms)
+    unmatched_list = [term for term in required_terms if term not in matched_terms]
+    coverage = (len(matched_list) / len(required_terms)) if required_terms else 1.0
+
+    return {
+        "enabled": bool(settings.retrieval_focus_term_guardrail_enabled),
+        "required_terms": required_terms,
+        "matched_terms": matched_list,
+        "unmatched_terms": unmatched_list,
+        "coverage": round(coverage, 3),
+        "matched_citation_count": matched_citation_count,
+        "action": "none",
+    }
+
+
+def missing_focus_terms_from_debug(retrieval_debug: dict[str, Any]) -> list[str]:
+    guardrail = retrieval_debug.get("focus_guardrail", {}) if isinstance(retrieval_debug, dict) else {}
+    unmatched = guardrail.get("unmatched_terms", []) if isinstance(guardrail, dict) else []
+    if not isinstance(unmatched, list):
+        return []
+    terms = [str(item).strip().lower() for item in unmatched if str(item).strip()]
+    return dedupe_preserve_order(terms)
+
+
 def dedupe_preserve_order(items: list[str]) -> list[str]:
     deduped: list[str] = []
     seen: set[str] = set()
@@ -1510,6 +1631,7 @@ def lexical_score(question_terms: set[str], identifiers: set[str], metadata: dic
 
 def rerank_matches(question: str, matches: list, top_k: int) -> tuple[list[tuple[dict, float]], list[dict[str, Any]]]:
     question_terms, identifiers = tokenize_question(question)
+    focus_terms = extract_focus_terms(question)
     lexical_weight = min(max(settings.retrieval_lexical_weight, 0.0), 1.0)
 
     rescored: list[tuple[float, float, float, dict, object]] = []
@@ -1518,6 +1640,17 @@ def rerank_matches(question: str, matches: list, top_k: int) -> tuple[list[tuple
         semantic = normalize_semantic_score(match_score(match))
         lexical = lexical_score(question_terms, identifiers, metadata)
         hybrid = ((1.0 - lexical_weight) * semantic) + (lexical_weight * lexical)
+        source = (
+            f"{metadata.get('file_path', '')}\n"
+            f"{metadata.get('section_name', '')}\n"
+            f"{metadata_chunk_text(metadata)[:3000]}"
+        )
+        focus_hits = focus_term_match_count(focus_terms, source)
+        if focus_terms:
+            if focus_hits == 0:
+                hybrid *= 0.70
+            else:
+                hybrid = min(1.0, hybrid + (0.10 * (focus_hits / len(focus_terms))))
         rescored.append((hybrid, semantic, lexical, metadata, match))
 
     rescored.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
@@ -1545,6 +1678,15 @@ def rerank_matches(question: str, matches: list, top_k: int) -> tuple[list[tuple
                     "lexical_score": round(lexical, 4),
                     "query_used": str(metadata.get("query_used", "")),
                     "section_name": str(metadata.get("section_name", "")),
+                    "focus_terms": focus_terms,
+                    "focus_term_hits": focus_term_match_count(
+                        focus_terms,
+                        (
+                            f"{file_path}\n"
+                            f"{metadata.get('section_name', '')}\n"
+                            f"{metadata_chunk_text(metadata)[:600]}"
+                        ),
+                    ),
                 }
             )
         if len(deduped) >= top_k:
@@ -2541,6 +2683,17 @@ def retrieve_with_optional_uploads(
     citations, chunks = merge_citation_sets(sets=sets_to_merge, top_k=effective_top_k)
     citations, chunks = dedupe_citation_pairs(citations, chunks, limit=effective_top_k)
     citations, chunks, intent_debug = apply_config_intent_priority(question, citations, chunks)
+    focus_guardrail = analyze_focus_term_alignment(question, citations, chunks)
+    if (
+        settings.retrieval_focus_term_guardrail_enabled
+        and focus_guardrail.get("required_terms")
+        and not focus_guardrail.get("matched_terms")
+    ):
+        citations = []
+        chunks = []
+        focus_guardrail["action"] = "drop_all_without_exact_term_match"
+    elif focus_guardrail.get("required_terms"):
+        focus_guardrail["action"] = "retain_exact_term_matches_found"
 
     upload_debug = {
         "persistent": persistent_upload_debug,
@@ -2560,6 +2713,7 @@ def retrieve_with_optional_uploads(
         "index": index_debug,
         "uploads": upload_debug,
         "intent_router": intent_debug,
+        "focus_guardrail": focus_guardrail,
         "retrieval_top_k": effective_top_k,
         "filters": {
             "path_prefix": path_prefix,
@@ -2624,6 +2778,18 @@ def compute_evidence_strength(
     covered_subqueries = sum(1 for count in dedup_subquery.values() if count > 0)
     subquery_coverage = (covered_subqueries / total_subqueries) if total_subqueries > 0 else 1.0
 
+    focus_guardrail = retrieval_debug.get("focus_guardrail", {}) if isinstance(retrieval_debug, dict) else {}
+    required_focus_terms = focus_guardrail.get("required_terms", []) if isinstance(focus_guardrail, dict) else []
+    matched_focus_terms = focus_guardrail.get("matched_terms", []) if isinstance(focus_guardrail, dict) else []
+    unmatched_focus_terms = focus_guardrail.get("unmatched_terms", []) if isinstance(focus_guardrail, dict) else []
+    if not isinstance(required_focus_terms, list):
+        required_focus_terms = []
+    if not isinstance(matched_focus_terms, list):
+        matched_focus_terms = []
+    if not isinstance(unmatched_focus_terms, list):
+        unmatched_focus_terms = []
+    focus_coverage = (len(matched_focus_terms) / len(required_focus_terms)) if required_focus_terms else 1.0
+
     normalized_files = min(distinct_files / 4.0, 1.0)
     normalized_symbols = min(symbol_match_count / max(len(citations), 1), 1.0)
     confidence_score = (
@@ -2670,6 +2836,14 @@ def compute_evidence_strength(
         if len(citations) < 3:
             confidence_score = min(confidence_score, 0.70)
 
+    if settings.retrieval_focus_term_guardrail_enabled and required_focus_terms:
+        absent_cap = max(0.0, min(1.0, float(settings.retrieval_focus_term_absent_cap)))
+        partial_cap = max(0.0, min(1.0, float(settings.retrieval_focus_term_partial_coverage_cap)))
+        if not matched_focus_terms:
+            confidence_score = min(confidence_score, absent_cap)
+        elif focus_coverage < 0.5:
+            confidence_score = min(confidence_score, partial_cap)
+
     confidence_score = round(max(0.0, min(1.0, confidence_score)), 3)
 
     label = "Low"
@@ -2683,6 +2857,10 @@ def compute_evidence_strength(
         "Medium": "Useful evidence found, but some ambiguity remains.",
         "Low": "Retrieved evidence is weak or fragmented for this question.",
     }[label]
+    if settings.retrieval_focus_term_guardrail_enabled and required_focus_terms and not matched_focus_terms:
+        reason = "Requested identifier/phrase was not found in retrieved evidence."
+    elif settings.retrieval_focus_term_guardrail_enabled and required_focus_terms and focus_coverage < 1.0:
+        reason = "Evidence only partially covers the requested identifier/phrase."
 
     return {
         "label": label,
@@ -2694,6 +2872,10 @@ def compute_evidence_strength(
             "distinct_files": distinct_files,
             "symbol_match_count": symbol_match_count,
             "subquery_coverage": round(subquery_coverage, 3),
+            "focus_term_count": len(required_focus_terms),
+            "focus_term_matches": len(matched_focus_terms),
+            "focus_term_unmatched": len(unmatched_focus_terms),
+            "focus_term_coverage": round(focus_coverage, 3),
             "mode": normalized_mode,
             **metrics_payload,
         },
@@ -2725,12 +2907,19 @@ def suggest_next_investigation(question: str, citations: list[Citation]) -> dict
     return {"files": file_suggestions, "terms": term_suggestions}
 
 
-def insufficient_evidence_answer(question: str, suggestions: dict[str, list[str]]) -> str:
+def insufficient_evidence_answer(
+    question: str,
+    suggestions: dict[str, list[str]],
+    missing_terms: list[str] | None = None,
+) -> str:
     files = ", ".join(suggestions.get("files", []))
     terms = ", ".join(suggestions.get("terms", []))
+    missing = ", ".join((missing_terms or [])[:4])
+    missing_line = f"Missing exact terms: {missing}\n" if missing else ""
     return (
         "I don't have enough evidence from the repo to answer confidently.\n"
         f"Question: {question}\n"
+        f"{missing_line}"
         f"Next files to inspect: {files}\n"
         f"Next search terms: {terms}"
     )
@@ -2888,6 +3077,7 @@ def query(payload: QueryRequest) -> QueryResponse:
     )
     if not citations:
         suggestions = suggest_next_investigation(payload.question, citations)
+        missing_terms = missing_focus_terms_from_debug(retrieval_debug)
         context = ""
         debug_payload: dict[str, Any] = {}
         if payload.debug:
@@ -2897,7 +3087,7 @@ def query(payload: QueryRequest) -> QueryResponse:
                 latency_ms=(time.perf_counter() - started) * 1000.0,
             )
         return QueryResponse(
-            answer=insufficient_evidence_answer(payload.question, suggestions),
+            answer=insufficient_evidence_answer(payload.question, suggestions, missing_terms=missing_terms),
             citations=[],
             evidence_strength=evidence,
             debug=debug_payload,
@@ -2906,6 +3096,8 @@ def query(payload: QueryRequest) -> QueryResponse:
     context = build_context(citations, chunks)
     if is_weak_evidence(evidence):
         suggestions = suggest_next_investigation(payload.question, citations)
+        missing_terms = missing_focus_terms_from_debug(retrieval_debug)
+        response_citations = [] if missing_terms else citations
         debug_payload: dict[str, Any] = {}
         if payload.debug:
             debug_payload = build_debug_payload(
@@ -2914,8 +3106,8 @@ def query(payload: QueryRequest) -> QueryResponse:
                 latency_ms=(time.perf_counter() - started) * 1000.0,
             )
         return QueryResponse(
-            answer=insufficient_evidence_answer(payload.question, suggestions),
-            citations=citations,
+            answer=insufficient_evidence_answer(payload.question, suggestions, missing_terms=missing_terms),
+            citations=response_citations,
             evidence_strength=evidence,
             debug=debug_payload,
         )
@@ -3155,6 +3347,7 @@ async def query_with_uploads(
     )
     if not citations:
         suggestions = suggest_next_investigation(payload.question, citations)
+        missing_terms = missing_focus_terms_from_debug(retrieval_debug)
         debug_payload: dict[str, Any] = {}
         if payload.debug:
             debug_payload = build_debug_payload(
@@ -3163,7 +3356,7 @@ async def query_with_uploads(
                 latency_ms=(time.perf_counter() - started) * 1000.0,
             )
         return QueryResponse(
-            answer=insufficient_evidence_answer(payload.question, suggestions),
+            answer=insufficient_evidence_answer(payload.question, suggestions, missing_terms=missing_terms),
             citations=[],
             evidence_strength=evidence,
             debug=debug_payload,
@@ -3172,6 +3365,8 @@ async def query_with_uploads(
     context = build_context(citations, chunks)
     if is_weak_evidence(evidence):
         suggestions = suggest_next_investigation(payload.question, citations)
+        missing_terms = missing_focus_terms_from_debug(retrieval_debug)
+        response_citations = [] if missing_terms else citations
         debug_payload: dict[str, Any] = {}
         if payload.debug:
             debug_payload = build_debug_payload(
@@ -3180,8 +3375,8 @@ async def query_with_uploads(
                 latency_ms=(time.perf_counter() - started) * 1000.0,
             )
         return QueryResponse(
-            answer=insufficient_evidence_answer(payload.question, suggestions),
-            citations=citations,
+            answer=insufficient_evidence_answer(payload.question, suggestions, missing_terms=missing_terms),
+            citations=response_citations,
             evidence_strength=evidence,
             debug=debug_payload,
         )

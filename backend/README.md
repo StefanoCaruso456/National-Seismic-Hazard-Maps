@@ -97,6 +97,7 @@ The backend uses:
 - Retry with exponential backoff for OpenAI + Pinecone calls
 - In-memory query embedding cache (LRU)
 - Candidate expansion (`top_k * multiplier`) then hybrid rerank (semantic + lexical identifier overlap)
+- Exact-term guardrail for quoted/hyphenated identifiers (e.g. `CUSTOMER-RECORD`): weak/irrelevant evidence is downranked or refused
 - Dedup by `file_path + line range`
 - Minimum hybrid score filter (fallback to best available results if no match passes threshold)
 - Optional namespace fallback (`PINECONE_FALLBACK_NAMESPACE`)
@@ -131,6 +132,9 @@ Required env vars:
 - `RETRIEVAL_MAX_CANDIDATES` (default: `40`)
 - `RETRIEVAL_LEXICAL_WEIGHT` (default: `0.25`)
 - `RETRIEVAL_MIN_HYBRID_SCORE` (default: `0.35`)
+- `RETRIEVAL_FOCUS_TERM_GUARDRAIL_ENABLED` (default: `true`)
+- `RETRIEVAL_FOCUS_TERM_ABSENT_CAP` (default: `0.20`)
+- `RETRIEVAL_FOCUS_TERM_PARTIAL_COVERAGE_CAP` (default: `0.45`)
 - `RAG_MAX_CONTEXT_CHUNKS` (default: `6`)
 - `PINECONE_FALLBACK_NAMESPACE` (optional; empty by default)
 - `STARTUP_SMOKE_MODE` (`off|warn|strict`, default: `off`)

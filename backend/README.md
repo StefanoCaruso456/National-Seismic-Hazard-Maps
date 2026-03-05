@@ -148,6 +148,7 @@ Required env vars:
 - `GITNEXUS_BOOTSTRAP_REPO_URL` (optional source git URL used by bootstrap)
 - `GITNEXUS_BOOTSTRAP_REPO_PATH` (default: `/tmp/nshmp-main`)
 - `GITNEXUS_BOOTSTRAP_REPO_REF` (optional branch/tag for bootstrap clone)
+- `GITNEXUS_BOOTSTRAP_GIT_TOKEN` (optional; required for private GitHub repos)
 - `GITNEXUS_ANALYZE_COMMAND` (default: `gitnexus analyze`)
 - `GITNEXUS_ANALYZE_TIMEOUT_SECONDS` (default: `180`)
 - `REPO_ROOT_OVERRIDE` (optional absolute path used for repo file reads / lexical search)

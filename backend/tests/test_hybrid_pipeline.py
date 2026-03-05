@@ -154,6 +154,15 @@ class HybridPipelineTests(unittest.TestCase):
         self.assertTrue(payload.get("nodes"))
         self.assertTrue(payload.get("edges"))
 
+    def test_gitnexus_bootstrap_clone_url_injects_token(self) -> None:
+        original_token = main.settings.gitnexus_bootstrap_git_token
+        try:
+            main.settings.gitnexus_bootstrap_git_token = "abc123"
+            clone_url = main.gitnexus_bootstrap_clone_url("https://github.com/org/private-repo")
+            self.assertIn("x-access-token:abc123@", clone_url)
+        finally:
+            main.settings.gitnexus_bootstrap_git_token = original_token
+
     def test_run_routed_hybrid_includes_graph_debug_when_graph_hits_exist(self) -> None:
         original_run_gitnexus_graph = main.run_gitnexus_graph
         original_retrieve = main.retrieve_with_optional_uploads

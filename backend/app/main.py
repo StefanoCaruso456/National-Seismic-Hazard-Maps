@@ -14,6 +14,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 from datetime import datetime, timezone
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
@@ -583,6 +584,9 @@ def gitnexus_bootstrap_repo_path() -> Path:
 
 def _tail_text(value: str, limit: int = 240) -> str:
     text = " ".join(str(value or "").split())
+    secret = str(settings.gitnexus_bootstrap_git_token or "").strip()
+    if secret:
+        text = text.replace(secret, "***")
     if len(text) <= limit:
         return text
     return f"...{text[-limit:]}"
@@ -597,6 +601,21 @@ def _available_repo_names(rows: list[dict[str, Any]] | None) -> list[str]:
         if isinstance(name, str) and name.strip():
             names.append(name.strip())
     return dedupe_preserve_order(names)
+
+
+def gitnexus_bootstrap_clone_url(repo_url: str) -> str:
+    url = str(repo_url or "").strip()
+    token = str(settings.gitnexus_bootstrap_git_token or "").strip()
+    if not url or not token:
+        return url
+    parsed = urlsplit(url)
+    if parsed.scheme not in {"http", "https"}:
+        return url
+    if "@" in parsed.netloc:
+        return url
+    token_part = quote(token, safe="")
+    auth_netloc = f"x-access-token:{token_part}@{parsed.netloc}"
+    return urlunsplit((parsed.scheme, auth_netloc, parsed.path, parsed.query, parsed.fragment))
 
 
 def ensure_gitnexus_source_checkout() -> Path | None:
@@ -623,7 +642,7 @@ def ensure_gitnexus_source_checkout() -> Path | None:
     branch = str(settings.gitnexus_bootstrap_repo_ref or "").strip()
     if branch:
         clone_cmd.extend(["--branch", branch])
-    clone_cmd.extend([repo_url, str(target)])
+    clone_cmd.extend([gitnexus_bootstrap_clone_url(repo_url), str(target)])
 
     timeout_seconds = max(float(settings.gitnexus_analyze_timeout_seconds), 30.0)
     try:

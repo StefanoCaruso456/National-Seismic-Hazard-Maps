@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     gitnexus_bootstrap_repo_url: str | None = None
     gitnexus_bootstrap_repo_path: str = "/tmp/nshmp-main"
     gitnexus_bootstrap_repo_ref: str | None = None
+    gitnexus_bootstrap_git_token: str | None = None
     gitnexus_analyze_command: str = "gitnexus analyze"
     gitnexus_analyze_timeout_seconds: float = 180.0
     repo_root_override: str | None = None

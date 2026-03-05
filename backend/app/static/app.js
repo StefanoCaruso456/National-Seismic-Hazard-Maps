@@ -1484,7 +1484,7 @@ function buildHybridGraphModel(graphPayload) {
   return { nodes: nodes.slice(0, 120), edges: edges.slice(0, 220) };
 }
 
-function drawHybridGraphCanvas(canvas, model) {
+function drawHybridGraphSnapshot(canvas, model) {
   if (!canvas || !model || !Array.isArray(model.nodes) || !model.nodes.length) return;
   const host = canvas.parentElement;
   const width = Math.max(300, Math.min(900, (host?.clientWidth || 640) - 6));
@@ -1499,7 +1499,6 @@ function drawHybridGraphCanvas(canvas, model) {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, width, height);
 
-  const nodesById = new Map(model.nodes.map((node) => [node.id, node]));
   const queryNode = model.nodes.find((node) => node.kind === "query") || model.nodes[0];
   const centerX = width * 0.5;
   const centerY = height * 0.5;
@@ -1582,6 +1581,36 @@ function drawHybridGraphCanvas(canvas, model) {
   });
 }
 
+function hybridNodeKindColor(kind) {
+  return HYBRID_GRAPH_COLORS[kind] || HYBRID_GRAPH_COLORS.default;
+}
+
+function hybridGraphNodeLabel(node) {
+  const label = String(node?.label || node?.id || "node");
+  const kind = String(node?.kind || "node");
+  const path = String(node?.path || "");
+  if (path) {
+    return `${label}\n${kind}\n${path}`;
+  }
+  return `${label}\n${kind}`;
+}
+
+function openGraphNodeSource(node) {
+  const path = String(node?.path || "").trim();
+  if (!path) {
+    setStatus(`Selected graph node: ${String(node?.label || node?.id || "node")}`);
+    return;
+  }
+  const citation = { file_path: path, line_start: 1, line_end: 1 };
+  const link = sourceLink(citation);
+  state.contextFile = path;
+  if (!link) {
+    setStatus(`Graph file selected: ${path}`);
+    return;
+  }
+  window.open(link, "_blank", "noopener,noreferrer");
+}
+
 function renderHybridGraphCanvas(panel, graphPayload) {
   const model = buildHybridGraphModel(graphPayload);
   const wrap = document.createElement("div");
@@ -1596,17 +1625,106 @@ function renderHybridGraphCanvas(panel, graphPayload) {
     return;
   }
 
-  const canvas = document.createElement("canvas");
-  canvas.className = "hybrid-graph-canvas";
-  wrap.appendChild(canvas);
+  const toolbar = document.createElement("div");
+  toolbar.className = "hybrid-graph-toolbar";
+
+  const title = document.createElement("span");
+  title.className = "hybrid-graph-title";
+  title.textContent = "Interactive Graph";
+  toolbar.appendChild(title);
+
+  const status = document.createElement("span");
+  status.className = "hybrid-graph-status";
+  status.textContent = `${model.nodes.length} nodes • ${model.edges.length} edges`;
+  toolbar.appendChild(status);
+
+  const viewport = document.createElement("div");
+  viewport.className = "hybrid-graph-viewport";
+
+  const details = document.createElement("div");
+  details.className = "hybrid-graph-details";
+  details.textContent = "Click a node to inspect details and open linked files.";
 
   const legend = document.createElement("div");
   legend.className = "hybrid-graph-legend";
   legend.textContent = "query process symbol entrypoint impact file";
-  wrap.appendChild(legend);
 
+  wrap.append(toolbar, viewport, details, legend);
   panel.appendChild(wrap);
-  drawHybridGraphCanvas(canvas, model);
+
+  const GraphFactory = window.ForceGraph3D;
+  if (typeof GraphFactory !== "function") {
+    const canvas = document.createElement("canvas");
+    canvas.className = "hybrid-graph-canvas";
+    viewport.appendChild(canvas);
+    drawHybridGraphSnapshot(canvas, model);
+    details.textContent = "3D graph library unavailable. Showing static snapshot fallback.";
+    return;
+  }
+
+  const graphData = {
+    nodes: model.nodes.map((node) => ({
+      ...node,
+      val: Math.max(1, Math.min(12, Number(node.size || 1) * 3.2)),
+    })),
+    links: model.edges.map((edge, idx) => ({
+      id: `edge-${idx}`,
+      source: edge.source,
+      target: edge.target,
+      kind: edge.kind || "edge",
+    })),
+  };
+
+  const graph3d = GraphFactory({
+    controlType: "orbit",
+    rendererConfig: { antialias: true, alpha: true },
+  })(viewport)
+    .backgroundColor("rgba(0,0,0,0)")
+    .graphData(graphData)
+    .nodeColor((node) => hybridNodeKindColor(String(node.kind || "default")))
+    .nodeLabel((node) => hybridGraphNodeLabel(node))
+    .nodeVal((node) => Number(node.val || 2))
+    .linkColor(() => HYBRID_GRAPH_COLORS.edge)
+    .linkOpacity(0.42)
+    .linkWidth((link) => (String(link.kind || "").startsWith("impact_") ? 1.8 : 1.15))
+    .onNodeHover((node) => {
+      viewport.style.cursor = node ? "pointer" : "grab";
+    })
+    .onNodeClick((node) => {
+      const kind = String(node?.kind || "node");
+      const label = String(node?.label || node?.id || "node");
+      const path = String(node?.path || "");
+      details.textContent = path ? `${kind}: ${label} (${path})` : `${kind}: ${label}`;
+      openGraphNodeSource(node);
+    })
+    .onLinkClick((link) => {
+      const source = typeof link?.source === "object" ? link.source?.label || link.source?.id : link?.source;
+      const target = typeof link?.target === "object" ? link.target?.label || link.target?.id : link?.target;
+      details.textContent = `edge: ${String(link?.kind || "related")} • ${source} -> ${target}`;
+    });
+
+  try {
+    graph3d.d3Force("charge").strength(-95);
+    graph3d.d3VelocityDecay(0.32);
+  } catch (_err) {
+    // Ignore if force engine internals differ.
+  }
+
+  const controls = graph3d.controls?.();
+  if (controls) {
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.14;
+    controls.rotateSpeed = 0.7;
+    controls.zoomSpeed = 0.8;
+  }
+
+  requestAnimationFrame(() => {
+    try {
+      graph3d.zoomToFit(900, 60);
+    } catch (_err) {
+      // Ignore initial layout timing errors.
+    }
+  });
 }
 
 function renderHybridArchitecturePanel(panel, graphPayload) {

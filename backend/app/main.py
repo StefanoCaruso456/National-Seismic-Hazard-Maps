@@ -626,7 +626,58 @@ def ensure_gitnexus_source_checkout() -> Path | None:
 
     target = gitnexus_bootstrap_repo_path()
     target_git = target / ".git"
+    timeout_seconds = max(float(settings.gitnexus_analyze_timeout_seconds), 30.0)
+    branch = str(settings.gitnexus_bootstrap_repo_ref or "").strip()
+    safe_tmp_path = str(target).startswith("/tmp/") or str(target).startswith("/var/tmp/")
+
     if target_git.is_dir():
+        if not branch:
+            return target
+        fetch_cmd = ["git", "-C", str(target), "fetch", "--depth", "1", "origin", branch]
+        checkout_cmd = ["git", "-C", str(target), "checkout", "--force", "FETCH_HEAD"]
+        try:
+            fetch_proc = subprocess.run(
+                fetch_cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=timeout_seconds,
+            )
+        except Exception as exc:
+            logger.warning("GitNexus bootstrap git fetch failed: %s", exc)
+            return None
+        if fetch_proc.returncode != 0:
+            logger.warning(
+                "GitNexus bootstrap git fetch failed for ref %s (rc=%s): %s",
+                branch,
+                fetch_proc.returncode,
+                _tail_text((fetch_proc.stderr or "") + " " + (fetch_proc.stdout or "")),
+            )
+            if safe_tmp_path:
+                try:
+                    shutil.rmtree(target)
+                except Exception:
+                    return None
+            return None
+        try:
+            checkout_proc = subprocess.run(
+                checkout_cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=timeout_seconds,
+            )
+        except Exception as exc:
+            logger.warning("GitNexus bootstrap git checkout failed: %s", exc)
+            return None
+        if checkout_proc.returncode != 0:
+            logger.warning(
+                "GitNexus bootstrap git checkout failed for ref %s (rc=%s): %s",
+                branch,
+                checkout_proc.returncode,
+                _tail_text((checkout_proc.stderr or "") + " " + (checkout_proc.stdout or "")),
+            )
+            return None
         return target
 
     try:
@@ -636,8 +687,6 @@ def ensure_gitnexus_source_checkout() -> Path | None:
         return None
 
     if target.exists() and any(target.iterdir()):
-        target_str = str(target)
-        safe_tmp_path = target_str.startswith("/tmp/") or target_str.startswith("/var/tmp/")
         if safe_tmp_path:
             try:
                 shutil.rmtree(target)
@@ -650,7 +699,6 @@ def ensure_gitnexus_source_checkout() -> Path | None:
             return None
 
     clone_cmd = ["git", "clone", "--depth", "1"]
-    branch = str(settings.gitnexus_bootstrap_repo_ref or "").strip()
     if branch:
         clone_cmd.extend(["--branch", branch])
     clone_cmd.extend([gitnexus_bootstrap_clone_url(repo_url), str(target)])

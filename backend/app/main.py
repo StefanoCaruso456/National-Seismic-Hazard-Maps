@@ -561,11 +561,13 @@ def default_gitnexus_repo() -> str:
     if configured:
         return configured
     inferred = repo_root_path().name.strip()
-    if inferred:
+    if inferred and inferred.lower() not in {"app", "workspace", "repo"}:
         return inferred
     namespace_hint = str(settings.pinecone_namespace or "").split(":", 1)[0].strip()
     if namespace_hint:
         return namespace_hint
+    if inferred:
+        return inferred
     return "unknown-repo"
 
 

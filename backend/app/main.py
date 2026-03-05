@@ -1958,6 +1958,7 @@ def lexical_candidate_files(question: str) -> dict[str, Any]:
             "candidate_files": [],
             "file_scores": {},
             "hits": [],
+            "errors": [],
         }
 
     identifiers = extract_identifier_hints(question)
@@ -1967,6 +1968,7 @@ def lexical_candidate_files(question: str) -> dict[str, Any]:
         "candidate_files": [],
         "file_scores": {},
         "hits": [],
+        "errors": [],
     }
     if not identifiers:
         return payload
@@ -1979,6 +1981,7 @@ def lexical_candidate_files(question: str) -> dict[str, Any]:
     root = repo_root_path()
     score_map: dict[str, float] = {}
     hits: list[dict[str, Any]] = []
+    errors: list[str] = []
     globs = ["*.f", "*.for", "*.f90", "*.f95", "*.f03", "*.f08", "*.inc", "*.sh", "*.py", "*.txt", "*.conf", "*.cfg"]
 
     for token in identifiers:
@@ -1996,7 +1999,11 @@ def lexical_candidate_files(question: str) -> dict[str, Any]:
                 check=False,
                 timeout=1.5,
             )
-        except Exception:
+        except FileNotFoundError:
+            errors.append("rg_not_available")
+            break
+        except Exception as exc:
+            errors.append(f"rg_error:{exc.__class__.__name__}")
             continue
         if proc.returncode not in {0, 1}:
             continue
@@ -2033,6 +2040,7 @@ def lexical_candidate_files(question: str) -> dict[str, Any]:
         "candidate_files": candidate_files,
         "file_scores": file_scores,
         "hits": hits,
+        "errors": dedupe_preserve_order(errors)[:3],
     }
     lexical_cache_put(cache_key, payload)
     return payload
@@ -3668,13 +3676,17 @@ def run_routed_retrieval_plan(
             lexical_payload.get("candidate_files", []) if isinstance(lexical_payload, dict) else []
         )
         hits = lexical_payload.get("hits", []) if isinstance(lexical_payload, dict) else []
-        route_debug["steps"].append(
-            {
-                "name": "keyword",
-                "ms": round((time.perf_counter() - started) * 1000.0, 2),
-                "candidates": {"files": len(keyword_files), "symbols": len(hits) if isinstance(hits, list) else 0},
-            }
-        )
+        lexical_errors = lexical_payload.get("errors", []) if isinstance(lexical_payload, dict) else []
+        keyword_step: dict[str, Any] = {
+            "name": "keyword",
+            "ms": round((time.perf_counter() - started) * 1000.0, 2),
+            "candidates": {"files": len(keyword_files), "symbols": len(hits) if isinstance(hits, list) else 0},
+        }
+        if isinstance(lexical_errors, list):
+            condensed_errors = [str(item).strip() for item in lexical_errors if str(item).strip()]
+            if condensed_errors:
+                keyword_step["errors"] = condensed_errors[:3]
+        route_debug["steps"].append(keyword_step)
         keyword_done = True
 
     def step_vector(candidate_files: list[str] | None) -> tuple[list[Citation], list[str], dict[str, Any]]:

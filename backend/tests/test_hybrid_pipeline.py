@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 
 from app import main
 from app.hybrid import extract_ranked_candidate_files, should_run_impact
@@ -62,6 +63,25 @@ class HybridPipelineTests(unittest.TestCase):
         question = "What calls GailTable, and what downstream routines does it impact?"
         target = main.infer_hybrid_target(question)
         self.assertEqual(str(target).lower(), "gailtable")
+
+    def test_lexical_candidate_files_reports_rg_missing(self) -> None:
+        original_run = main.subprocess.run
+        original_repo_root_path = main.repo_root_path
+        try:
+            with main.lexical_candidate_cache_lock:
+                main.lexical_candidate_cache.clear()
+
+            def _raise_file_not_found(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+                raise FileNotFoundError("rg not found")
+
+            main.subprocess.run = _raise_file_not_found  # type: ignore[assignment]
+            main.repo_root_path = lambda: Path(".")  # type: ignore[assignment]
+
+            payload = main.lexical_candidate_files("What calls GailTable in this repo?")
+            self.assertIn("rg_not_available", payload.get("errors", []))
+        finally:
+            main.subprocess.run = original_run  # type: ignore[assignment]
+            main.repo_root_path = original_repo_root_path  # type: ignore[assignment]
 
 
 if __name__ == "__main__":

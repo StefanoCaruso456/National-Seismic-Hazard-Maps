@@ -569,16 +569,67 @@ body {
 
 .hybrid-graph-wrap {
   display: grid;
-  gap: 6px;
+  gap: 8px;
   border: 1px solid rgba(95, 137, 149, 0.2);
   border-radius: 10px;
   padding: 8px;
   background: rgba(255, 255, 255, 0.52);
 }
 
+.hybrid-graph-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+
+.hybrid-graph-title {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--ink);
+  letter-spacing: 0.01em;
+}
+
+.hybrid-graph-status {
+  font-size: 11px;
+  color: var(--ink-soft);
+  border: 1px solid rgba(95, 137, 149, 0.25);
+  border-radius: 999px;
+  padding: 2px 8px;
+  background: rgba(255, 255, 255, 0.5);
+}
+
+.hybrid-graph-viewport {
+  width: 100%;
+  height: 340px;
+  min-height: 300px;
+  border-radius: 10px;
+  overflow: hidden;
+  border: 1px solid rgba(95, 137, 149, 0.24);
+  background:
+    radial-gradient(circle at 14% 16%, rgba(213, 96, 96, 0.12), transparent 40%),
+    radial-gradient(circle at 82% 12%, rgba(90, 142, 160, 0.13), transparent 38%),
+    linear-gradient(165deg, rgba(248, 252, 255, 0.95), rgba(232, 243, 248, 0.86));
+}
+
+.hybrid-graph-viewport canvas {
+  display: block;
+}
+
+.hybrid-graph-details {
+  font-size: 11px;
+  color: var(--ink-soft);
+  border: 1px solid rgba(95, 137, 149, 0.18);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.5);
+  padding: 6px 8px;
+  line-height: 1.35;
+}
+
 .hybrid-graph-canvas {
   width: 100%;
-  min-height: 280px;
+  height: 100%;
+  min-height: 300px;
   display: block;
   border-radius: 8px;
   background:
@@ -1083,6 +1134,10 @@ textarea {
   .hybrid-panels {
     grid-template-columns: 1fr;
   }
+
+  .hybrid-graph-viewport {
+    height: 300px;
+  }
 }
 
 @media (max-width: 640px) {
@@ -1122,6 +1177,15 @@ textarea {
   .send-btn {
     width: 40px;
     height: 40px;
+  }
+
+  .hybrid-graph-toolbar {
+    flex-wrap: wrap;
+  }
+
+  .hybrid-graph-viewport {
+    height: 260px;
+    min-height: 240px;
   }
 
   .message-meta {

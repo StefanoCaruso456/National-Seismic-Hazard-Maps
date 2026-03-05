@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     retrieval_max_candidates: int = 40
     retrieval_lexical_weight: float = 0.25
     retrieval_min_hybrid_score: float = 0.35
+    retrieval_focus_term_guardrail_enabled: bool = True
+    retrieval_focus_term_absent_cap: float = 0.20
+    retrieval_focus_term_partial_coverage_cap: float = 0.45
     rag_max_context_chunks: int = 6
     pinecone_fallback_namespace: str | None = None
     startup_smoke_mode: str = "off"

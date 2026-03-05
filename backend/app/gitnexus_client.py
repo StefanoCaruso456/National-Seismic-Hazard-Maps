@@ -2,6 +2,7 @@ import json
 import logging
 import queue
 import shlex
+import shutil
 import subprocess
 import threading
 from dataclasses import dataclass
@@ -318,6 +319,8 @@ def resolve_gitnexus_command(command: str) -> list[str]:
         return []
     lower = configured.lower()
     if "gitnexus@latest" in lower and "mcp" in lower:
+        if shutil.which("gitnexus"):
+            return ["gitnexus", "mcp"]
         try:
             candidates = sorted(
                 Path.home().glob(".npm/_npx/*/node_modules/gitnexus/dist/cli/index.js"),

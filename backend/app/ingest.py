@@ -26,10 +26,21 @@ EXCLUDED_DISCOVERY_DIRS = {
     "vendor",
     "node_modules",
 }
-START_PATTERN = re.compile(
-    r"^\s*(program|subroutine|function|module(?!\s+procedure)|block\s+data|interface)\b",
+FORTRAN_START_PATTERN = re.compile(
+    r"^\s*(program|subroutine|function|module(?!\s+procedure)|block\s+data|interface)\s*([a-zA-Z_][a-zA-Z0-9_]*)?",
     re.IGNORECASE,
 )
+FORTRAN_END_PATTERN = re.compile(
+    r"^\s*end\s*(program|subroutine|function|module|block\s*data|interface)?\b",
+    re.IGNORECASE,
+)
+FORTRAN_CONTAINS_PATTERN = re.compile(r"^\s*contains\b", re.IGNORECASE)
+FORTRAN_USE_PATTERN = re.compile(
+    r"^\s*use\b(?:\s*,\s*(?:intrinsic|non_intrinsic)\s*::|\s*,\s*only\s*:\s*|\s*::|\s+)?\s*([a-zA-Z_][a-zA-Z0-9_]*)",
+    re.IGNORECASE,
+)
+# Fixed-form comments use C/c/* in column 1; free-form comments use ! after optional whitespace.
+FORTRAN_COMMENT_PATTERN = re.compile(r"^\s*!|^[cC*](?:\s|$)")
 TOKEN_PATTERN = re.compile(r"\w+|[^\w\s]", re.UNICODE)
 EMBEDDING_METADATA_SCHEMA_VERSION = "v1"
 
@@ -40,6 +51,11 @@ class FileChunk:
     line_start: int
     line_end: int
     section_name: str
+    symbol_type: str
+    symbol_name: str | None
+    module_name: str | None
+    contains_block: bool
+    imports: tuple[str, ...]
     chunk_text: str
 
 
@@ -48,6 +64,11 @@ class Section:
     start_line: int
     end_line: int
     name: str
+    symbol_type: str
+    symbol_name: str | None
+    module_name: str | None
+    contains_block: bool
+    imports: tuple[str, ...]
     lines: list[str]
 
 
@@ -111,24 +132,130 @@ def read_text_with_fallback(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="ignore")
 
 
+def normalize_fortran_kind(kind: str | None) -> str:
+    lowered = str(kind or "").strip().lower().replace("  ", " ")
+    if lowered.startswith("block"):
+        return "block data"
+    return lowered
+
+
+def line_is_comment(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+    return bool(FORTRAN_COMMENT_PATTERN.match(line))
+
+
 def split_into_sections(text: str) -> list[Section]:
     lines = text.splitlines()
     if not lines:
         return []
 
-    starts: list[tuple[int, str]] = []
-    for i, line in enumerate(lines, start=1):
-        if START_PATTERN.match(line):
-            name = line.strip()[:120]
-            starts.append((i, name))
-
-    if not starts:
-        return [Section(start_line=1, end_line=len(lines), name="file", lines=lines)]
-
+    stack: list[dict[str, Any]] = []
     sections: list[Section] = []
-    for idx, (start, name) in enumerate(starts):
-        end = starts[idx + 1][0] - 1 if idx + 1 < len(starts) else len(lines)
-        sections.append(Section(start_line=start, end_line=end, name=name, lines=lines[start - 1 : end]))
+    module_context: str | None = None
+
+    def close_unit(unit: dict[str, Any], end_line: int) -> None:
+        start_line = int(unit.get("start_line") or 1)
+        capped_end = max(start_line, min(end_line, len(lines)))
+        if start_line > len(lines):
+            return
+        body = lines[start_line - 1 : capped_end]
+        symbol_type = str(unit.get("symbol_type") or "unknown")
+        symbol_name = unit.get("symbol_name")
+        module_name = unit.get("module_name")
+        imports = tuple(sorted({str(item).strip().lower() for item in (unit.get("imports") or set()) if str(item).strip()}))
+        if symbol_type == "module" and symbol_name:
+            module_name = str(symbol_name)
+        label_name = symbol_name or symbol_type or "unknown"
+        sections.append(
+            Section(
+                start_line=start_line,
+                end_line=capped_end,
+                name=f"{symbol_type} {label_name}".strip(),
+                symbol_type=symbol_type,
+                symbol_name=str(symbol_name).lower() if symbol_name else None,
+                module_name=str(module_name).lower() if module_name else None,
+                contains_block=bool(unit.get("contains_block", False)),
+                imports=imports,
+                lines=body,
+            )
+        )
+
+    for lineno, line in enumerate(lines, start=1):
+        lowered = line.lower()
+        if FORTRAN_CONTAINS_PATTERN.match(line) and stack:
+            stack[-1]["contains_block"] = True
+
+        use_match = FORTRAN_USE_PATTERN.match(line)
+        if use_match and stack:
+            stack[-1].setdefault("imports", set()).add(use_match.group(1))
+
+        if line_is_comment(line):
+            continue
+
+        start_match = FORTRAN_START_PATTERN.match(line)
+        if start_match and not lowered.startswith("end "):
+            raw_kind = start_match.group(1)
+            symbol_type = normalize_fortran_kind(raw_kind)
+            symbol_name = (start_match.group(2) or "").strip().lower() or None
+            parent_module = module_context
+            if symbol_type == "module" and symbol_name:
+                parent_module = symbol_name
+                module_context = symbol_name
+            elif symbol_type == "program":
+                parent_module = None
+            stack.append(
+                {
+                    "symbol_type": symbol_type,
+                    "symbol_name": symbol_name,
+                    "start_line": lineno,
+                    "contains_block": False,
+                    "imports": set(),
+                    "module_name": parent_module,
+                }
+            )
+            continue
+
+        end_match = FORTRAN_END_PATTERN.match(line)
+        if not end_match:
+            continue
+        if not stack:
+            continue
+
+        requested_end = normalize_fortran_kind(end_match.group(1)) if end_match.group(1) else ""
+        while stack:
+            top = stack.pop()
+            top_kind = str(top.get("symbol_type") or "")
+            close_unit(top, lineno)
+            if not requested_end or requested_end == top_kind:
+                break
+
+        module_context = None
+        for row in reversed(stack):
+            if row.get("symbol_type") == "module" and row.get("symbol_name"):
+                module_context = str(row["symbol_name"])
+                break
+
+    while stack:
+        close_unit(stack.pop(), len(lines))
+
+    if not sections:
+        return [
+            Section(
+                start_line=1,
+                end_line=len(lines),
+                name="unknown file",
+                symbol_type="unknown",
+                symbol_name=None,
+                module_name=None,
+                contains_block=False,
+                imports=tuple(),
+                lines=lines,
+            )
+        ]
+
+    sections.sort(key=lambda row: (row.start_line, row.end_line))
     return sections
 
 
@@ -136,6 +263,11 @@ def split_large_text(
     lines: list[str],
     start_line: int,
     section_name: str,
+    symbol_type: str,
+    symbol_name: str | None,
+    module_name: str | None,
+    contains_block: bool,
+    imports: tuple[str, ...],
     min_tokens: int,
     max_tokens: int,
 ) -> list[FileChunk]:
@@ -156,6 +288,11 @@ def split_large_text(
                 line_start=current_start,
                 line_end=current_end,
                 section_name=section_name,
+                symbol_type=symbol_type,
+                symbol_name=symbol_name,
+                module_name=module_name,
+                contains_block=contains_block,
+                imports=imports,
                 chunk_text=text,
             )
         )
@@ -200,6 +337,11 @@ def split_large_text(
                         line_start=prev.line_start,
                         line_end=chunk.line_end,
                         section_name=prev.section_name,
+                        symbol_type=prev.symbol_type,
+                        symbol_name=prev.symbol_name,
+                        module_name=prev.module_name,
+                        contains_block=prev.contains_block,
+                        imports=prev.imports,
                         chunk_text=combined_prev,
                     )
                     i += 1
@@ -214,6 +356,11 @@ def split_large_text(
                             line_start=chunk.line_start,
                             line_end=nxt.line_end,
                             section_name=chunk.section_name,
+                            symbol_type=chunk.symbol_type,
+                            symbol_name=chunk.symbol_name,
+                            module_name=chunk.module_name,
+                            contains_block=chunk.contains_block,
+                            imports=chunk.imports,
                             chunk_text=combined_next,
                         )
                     )
@@ -236,6 +383,11 @@ def chunk_fortran_file(path: Path, repo_root: Path, min_tokens: int, max_tokens:
             lines=section.lines,
             start_line=section.start_line,
             section_name=section.name,
+            symbol_type=section.symbol_type,
+            symbol_name=section.symbol_name,
+            module_name=section.module_name,
+            contains_block=section.contains_block,
+            imports=section.imports,
             min_tokens=min_tokens,
             max_tokens=max_tokens,
         )
@@ -408,6 +560,11 @@ def ingest(args: argparse.Namespace) -> None:
                 "repo": repo_name,
                 "section_name": chunk.section_name,
                 "language": "fortran",
+                "symbol_type": chunk.symbol_type,
+                "symbol_name": chunk.symbol_name,
+                "module_name": chunk.module_name,
+                "contains_block": bool(chunk.contains_block),
+                "imports": list(chunk.imports),
                 "source_type": "repo",
                 "chunk_text": chunk.chunk_text,
                 "embedding_model": settings.openai_embedding_model,

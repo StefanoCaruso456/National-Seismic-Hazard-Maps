@@ -5,6 +5,8 @@ import time
 import hashlib
 import io
 import json
+import subprocess
+import threading
 from collections import defaultdict
 from functools import lru_cache
 from pathlib import Path
@@ -31,6 +33,11 @@ from app.ingest import (
 logger = logging.getLogger("legacylens.api")
 IDENTIFIER_PATTERN = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]{2,}")
 WORD_PATTERN = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]*")
+IDENTIFIER_HEAVY_PATTERN = re.compile(
+    r"\b[A-Z][A-Z0-9_]{2,}\b|\b[a-z][A-Za-z0-9_]*[A-Z][A-Za-z0-9_]*\b|\b[A-Za-z_]*\d+[A-Za-z0-9_]*\b|\b[A-Za-z_]+_[A-Za-z0-9_]+\b|\b[A-Za-z][A-Za-z0-9_]*-[A-Za-z0-9_-]+\b"
+)
+CALL_TARGET_PATTERN = re.compile(r"\bcall\s+([a-zA-Z_][a-zA-Z0-9_]*)", re.IGNORECASE)
+FILE_TOKEN_PATTERN = re.compile(r"\b([a-zA-Z0-9_.-]+\.(?:f|for|f90|f95|f03|f08|inc|py|sh|txt|cfg|conf))\b", re.IGNORECASE)
 SAFE_UPLOAD_NAME_PATTERN = re.compile(r"[^a-zA-Z0-9._-]+")
 SAFE_PROJECT_ID_PATTERN = re.compile(r"[^a-zA-Z0-9._-]+")
 FOCUS_TERM_QUOTED_PATTERN = re.compile(r"[\"'`]([^\"'`]{3,140})[\"'`]")
@@ -53,12 +60,59 @@ FORTRAN_LOOP_START_PATTERN = re.compile(
 )
 FORTRAN_LOOP_END_PATTERN = re.compile(r"^\s*(?:end\s*do|enddo|\d+\s+continue)\b", re.IGNORECASE)
 FORTRAN_IO_PATTERN = re.compile(r"\b(open|read|write|inquire|rewind|backspace|close)\b", re.IGNORECASE)
+FORTRAN_ACTION_PATTERN = re.compile(
+    r"\b(call|read|write|open|allocate|deallocate|stop|error|inquire|rewind|backspace|close)\b",
+    re.IGNORECASE,
+)
 CONFIG_DIR_HINTS = ("conf/", "etc/", "scripts/", "makefile", "readme", "run_", "run.")
 MODE_VALUES = {"chat", "search", "patterns", "dependencies", "hybrid", "graph"}
 FILTERABLE_LANGUAGES = {"fortran", "text", "pdf"}
 FILTERABLE_SOURCE_TYPES = {"repo", "upload", "temp-upload"}
 STARTUP_SMOKE_MODES = {"off", "warn", "strict"}
 QUERY_MAX_CHARS = 8000
+IDENTIFIER_STOPWORDS = {
+    "where",
+    "which",
+    "what",
+    "when",
+    "why",
+    "how",
+    "does",
+    "do",
+    "did",
+    "is",
+    "are",
+    "the",
+    "this",
+    "that",
+    "from",
+    "with",
+    "about",
+    "into",
+    "for",
+    "and",
+    "or",
+    "show",
+    "find",
+    "list",
+    "tell",
+    "explain",
+    "main",
+    "entry",
+    "point",
+    "program",
+    "code",
+    "file",
+    "files",
+    "function",
+    "functions",
+    "subroutine",
+    "subroutines",
+    "module",
+    "modules",
+    "error",
+}
+DEBUG_CANDIDATE_LIMIT = 64
 
 UPLOAD_MAX_FILES = 8
 UPLOAD_MAX_FILE_BYTES = 1_500_000
@@ -80,7 +134,7 @@ EMBEDDING_METADATA_SCHEMA_VERSION = "v1"
 
 class QueryRequest(BaseModel):
     question: str = Field(min_length=3, max_length=QUERY_MAX_CHARS)
-    top_k: int = Field(default=5, ge=1, le=20)
+    top_k: int = Field(default=5, ge=1, le=50)
     mode: str = Field(default="chat")
     scope: str = Field(default="both")
     project_id: str = Field(default="nshmp-main", min_length=1, max_length=80)
@@ -248,6 +302,10 @@ startup_smoke_state: dict[str, Any] = {
     "errors": [],
     "checks": {},
 }
+query_result_cache_lock = threading.Lock()
+query_result_cache: dict[str, dict[str, Any]] = {}
+lexical_candidate_cache_lock = threading.Lock()
+lexical_candidate_cache: dict[str, dict[str, Any]] = {}
 
 
 app = FastAPI(
@@ -1792,59 +1850,321 @@ def normalized_request_filters(
     )
 
 
-def lexical_score(question_terms: set[str], identifiers: set[str], metadata: dict) -> float:
-    if not question_terms and not identifiers:
+def extract_identifier_hints(question: str) -> list[str]:
+    hints: list[str] = []
+    for token in extract_focus_terms(question):
+        normalized = token.lower().strip()
+        if normalized and normalized not in IDENTIFIER_STOPWORDS:
+            hints.append(normalized)
+    for token in IDENTIFIER_HEAVY_PATTERN.findall(question):
+        normalized = str(token).strip("`'\"").lower()
+        if len(normalized) >= 3 and normalized not in IDENTIFIER_STOPWORDS:
+            hints.append(normalized)
+    for token in CALL_TARGET_PATTERN.findall(question):
+        normalized = str(token).strip().lower()
+        if len(normalized) >= 3 and normalized not in IDENTIFIER_STOPWORDS:
+            hints.append(normalized)
+    for token in FILE_TOKEN_PATTERN.findall(question):
+        normalized = str(token).strip().lower()
+        if len(normalized) >= 3 and normalized not in IDENTIFIER_STOPWORDS:
+            hints.append(normalized)
+    _, identifiers = tokenize_question(question)
+    for token in identifiers:
+        if (
+            ("_" in token or any(ch.isdigit() for ch in token) or token.upper() == token)
+            and token not in IDENTIFIER_STOPWORDS
+        ):
+            hints.append(token.lower())
+    return dedupe_preserve_order([item for item in hints if item and len(item) >= 3])[:8]
+
+
+def lexical_cache_get(key: str) -> dict[str, Any] | None:
+    ttl = max(float(settings.retrieval_query_cache_ttl_seconds), 0.0)
+    if ttl <= 0:
+        return None
+    now = time.time()
+    with lexical_candidate_cache_lock:
+        row = lexical_candidate_cache.get(key)
+        if not isinstance(row, dict):
+            return None
+        expires_at = float(row.get("expires_at", 0.0) or 0.0)
+        if expires_at < now:
+            lexical_candidate_cache.pop(key, None)
+            return None
+        payload = row.get("payload")
+        return payload if isinstance(payload, dict) else None
+
+
+def lexical_cache_put(key: str, payload: dict[str, Any]) -> None:
+    ttl = max(float(settings.retrieval_query_cache_ttl_seconds), 0.0)
+    if ttl <= 0:
+        return
+    now = time.time()
+    with lexical_candidate_cache_lock:
+        lexical_candidate_cache[key] = {"expires_at": now + ttl, "payload": payload}
+        if len(lexical_candidate_cache) > max(int(settings.retrieval_query_cache_max_entries), 32):
+            stale = sorted(
+                lexical_candidate_cache.items(),
+                key=lambda item: float((item[1] or {}).get("expires_at", 0.0)),
+            )
+            for stale_key, _ in stale[: max(len(stale) - int(settings.retrieval_query_cache_max_entries), 1)]:
+                lexical_candidate_cache.pop(stale_key, None)
+
+
+def lexical_candidate_files(question: str) -> dict[str, Any]:
+    if not settings.retrieval_identifier_lexical_enabled:
+        return {
+            "enabled": False,
+            "identifiers": [],
+            "candidate_files": [],
+            "file_scores": {},
+            "hits": [],
+        }
+
+    identifiers = extract_identifier_hints(question)
+    payload: dict[str, Any] = {
+        "enabled": bool(identifiers),
+        "identifiers": identifiers,
+        "candidate_files": [],
+        "file_scores": {},
+        "hits": [],
+    }
+    if not identifiers:
+        return payload
+
+    cache_key = hashlib.sha1(f"lexical:{question.strip().lower()}".encode("utf-8")).hexdigest()
+    cached = lexical_cache_get(cache_key)
+    if cached:
+        return cached
+
+    root = repo_root_path()
+    score_map: dict[str, float] = {}
+    hits: list[dict[str, Any]] = []
+    globs = ["*.f", "*.for", "*.f90", "*.f95", "*.f03", "*.f08", "*.inc", "*.sh", "*.py", "*.txt", "*.conf", "*.cfg"]
+
+    for token in identifiers:
+        token_pattern = rf"\b{re.escape(token)}\b" if re.fullmatch(r"[a-zA-Z0-9_]+", token) else re.escape(token)
+        args = ["rg", "--no-heading", "--line-number", "--color", "never", "-S", "-m", "120", "-e", token_pattern]
+        for glob in globs:
+            args.extend(["-g", glob])
+        args.append(".")
+        try:
+            proc = subprocess.run(
+                args,
+                cwd=str(root),
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=1.5,
+            )
+        except Exception:
+            continue
+        if proc.returncode not in {0, 1}:
+            continue
+
+        for raw_line in proc.stdout.splitlines():
+            if raw_line.count(":") < 2:
+                continue
+            path_part, line_part, snippet = raw_line.split(":", 2)
+            normalized_path = normalize_file_path(path_part)
+            if not normalized_path:
+                continue
+            line_no = safe_int(line_part) or 1
+            snippet_lower = snippet.lower()
+            weight = 1.0
+            if re.search(rf"\b(subroutine|function|module)\s+{re.escape(token)}\b", snippet_lower):
+                weight = 3.2
+            elif re.search(rf"\bcall\s+{re.escape(token)}\b", snippet_lower):
+                weight = 2.7
+            elif token in Path(normalized_path).name.lower():
+                weight = 2.0
+            score_map[normalized_path] = score_map.get(normalized_path, 0.0) + weight
+            if len(hits) < 80:
+                hits.append({"token": token, "file_path": normalized_path, "line": line_no, "weight": round(weight, 3)})
+
+    ranked = sorted(score_map.items(), key=lambda item: (item[1], item[0]), reverse=True)
+    file_limit = max(int(settings.retrieval_identifier_file_limit), 1)
+    candidate_files = [path for path, _ in ranked[:file_limit]]
+    max_score = ranked[0][1] if ranked else 1.0
+    file_scores = {path: round(score / max(max_score, 0.001), 4) for path, score in ranked[:file_limit]}
+
+    payload = {
+        "enabled": True,
+        "identifiers": identifiers,
+        "candidate_files": candidate_files,
+        "file_scores": file_scores,
+        "hits": hits,
+    }
+    lexical_cache_put(cache_key, payload)
+    return payload
+
+
+def token_overlap_score(query_terms: set[str], source_terms: set[str]) -> float:
+    if not query_terms:
         return 0.0
-    file_path = str(metadata.get("file_path", "")).lower()
-    section_name = str(metadata.get("section_name", "")).lower()
-    source = f"{file_path}\n{section_name}\n{metadata_chunk_text(metadata)[:2500]}".lower()
-    source_terms = {token for token in WORD_PATTERN.findall(source) if len(token) >= 2}
+    return len(query_terms & source_terms) / max(len(query_terms), 1)
 
-    overlap = len(question_terms & source_terms)
-    term_coverage = (overlap / len(question_terms)) if question_terms else 0.0
 
-    id_bonus = 0.0
+def count_exact_identifier_hits(identifiers: list[str], source: str) -> int:
+    if not identifiers:
+        return 0
+    lowered = source.lower()
+    hits = 0
     for ident in identifiers:
-        if ident in file_path:
-            id_bonus = max(id_bonus, 0.20)
-        elif ident in section_name:
-            id_bonus = max(id_bonus, 0.15)
-        elif ident in source:
-            id_bonus = max(id_bonus, 0.10)
+        probe = ident.lower()
+        if not probe:
+            continue
+        if re.search(rf"(?<![a-zA-Z0-9_]){re.escape(probe)}(?![a-zA-Z0-9_])", lowered):
+            hits += 1
+    return hits
 
-    return min(1.0, term_coverage + id_bonus)
+
+def action_statement_score(text: str) -> float:
+    if not text:
+        return 0.0
+    count = len(FORTRAN_ACTION_PATTERN.findall(text))
+    return min(1.0, count / 6.0)
+
+
+def comment_density_penalty(text: str) -> float:
+    lines = [line for line in text.splitlines()]
+    if not lines:
+        return 0.0
+    blank_or_comment = 0
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            blank_or_comment += 1
+            continue
+        if stripped.startswith("!") or re.match(r"^[cC*]\b", stripped):
+            blank_or_comment += 1
+    ratio = blank_or_comment / max(len(lines), 1)
+    return min(1.0, ratio)
 
 
 def rerank_matches(question: str, matches: list, top_k: int) -> tuple[list[tuple[dict, float]], list[dict[str, Any]]]:
-    question_terms, identifiers = tokenize_question(question)
+    if not settings.retrieval_deterministic_rerank_enabled:
+        ranked = sorted(matches, key=match_score, reverse=True)
+        deduped: list[tuple[dict, float]] = []
+        debug_candidates: list[dict[str, Any]] = []
+        seen_ranges: set[tuple[str, int, int]] = set()
+        for rank, match in enumerate(ranked, start=1):
+            metadata = normalize_metadata(match)
+            file_path = str(metadata.get("file_path", "unknown"))
+            line_start = safe_int(metadata.get("line_start")) or safe_int(metadata.get("start_line")) or 1
+            line_end = safe_int(metadata.get("line_end")) or safe_int(metadata.get("end_line")) or line_start
+            key = (file_path, line_start, line_end)
+            if key in seen_ranges:
+                continue
+            seen_ranges.add(key)
+            semantic = normalize_semantic_score(match_score(match))
+            if len(deduped) < max(top_k, 1):
+                deduped.append((metadata, float(semantic)))
+            if len(debug_candidates) < max(DEBUG_CANDIDATE_LIMIT, max(top_k, 1)):
+                snippet = " ".join(metadata_chunk_text(metadata).split())[:260]
+                debug_candidates.append(
+                    {
+                        "file_path": file_path,
+                        "line_start": line_start,
+                        "line_end": line_end,
+                        "query_used": str(metadata.get("query_used", "")),
+                        "section_name": str(metadata.get("section_name", "")),
+                        "semantic_rank": rank,
+                        "rerank_rank": rank,
+                        "semantic_score": round(float(semantic), 4),
+                        "hybrid_score": round(float(semantic), 4),
+                        "token_overlap": 0.0,
+                        "exact_identifier_hits": 0,
+                        "symbol_module_score": 0.0,
+                        "action_score": 0.0,
+                        "comment_penalty": 0.0,
+                        "lexical_file_boost": 0.0,
+                        "snippet": snippet,
+                    }
+                )
+            if len(deduped) >= max(top_k, 1) and len(debug_candidates) >= max(DEBUG_CANDIDATE_LIMIT, max(top_k, 1)):
+                break
+        return deduped, debug_candidates
+
+    question_terms, _ = tokenize_question(question)
+    identifiers = extract_identifier_hints(question)
     focus_terms = extract_focus_terms(question)
     lexical_weight = min(max(settings.retrieval_lexical_weight, 0.0), 1.0)
+    semantic_weight = max(0.2, min(0.9, 1.0 - lexical_weight))
+    lexical_mix_weight = 1.0 - semantic_weight
 
-    rescored: list[tuple[float, float, float, dict, object]] = []
-    for match in matches:
+    rows: list[dict[str, Any]] = []
+    for ordinal, match in enumerate(matches, start=1):
         metadata = normalize_metadata(match)
+        chunk_text = metadata_chunk_text(metadata)
+        file_path = str(metadata.get("file_path", "unknown"))
+        section_name = str(metadata.get("section_name", ""))
+        symbol_name = str(metadata.get("symbol_name", "")).lower()
+        module_name = str(metadata.get("module_name", "")).lower()
+        source = f"{file_path}\n{section_name}\n{chunk_text}"
+        source_terms = {token for token in WORD_PATTERN.findall(source.lower()) if len(token) >= 2}
+
         semantic = normalize_semantic_score(match_score(match))
-        lexical = lexical_score(question_terms, identifiers, metadata)
-        hybrid = ((1.0 - lexical_weight) * semantic) + (lexical_weight * lexical)
-        source = (
-            f"{metadata.get('file_path', '')}\n"
-            f"{metadata.get('section_name', '')}\n"
-            f"{metadata_chunk_text(metadata)[:3000]}"
-        )
+        overlap = token_overlap_score(question_terms, source_terms)
+        exact_hits = count_exact_identifier_hits(identifiers, source)
+        exact_score = min(1.0, exact_hits / max(len(identifiers), 1)) if identifiers else 0.0
+        symbol_module_score = 0.0
+        if symbol_name and symbol_name in identifiers:
+            symbol_module_score = max(symbol_module_score, 1.0)
+        if module_name and module_name in identifiers:
+            symbol_module_score = max(symbol_module_score, 0.8)
+        if symbol_name and symbol_name in question_terms:
+            symbol_module_score = max(symbol_module_score, 0.6)
+        if module_name and module_name in question_terms:
+            symbol_module_score = max(symbol_module_score, 0.5)
+
+        action_score = action_statement_score(chunk_text)
+        comment_penalty = comment_density_penalty(chunk_text)
+        lexical_file_boost = min(1.0, max(0.0, float(metadata.get("_lexical_file_score", 0.0) or 0.0)))
+
+        hybrid = (semantic_weight * semantic) + (lexical_mix_weight * ((0.55 * overlap) + (0.45 * exact_score)))
+        hybrid += (0.08 * symbol_module_score) + (0.06 * action_score) + (0.06 * lexical_file_boost)
+        hybrid -= 0.08 * comment_penalty
+
         focus_hits = focus_term_match_count(focus_terms, source)
         if focus_terms:
             if focus_hits == 0:
                 hybrid *= 0.70
             else:
                 hybrid = min(1.0, hybrid + (0.10 * (focus_hits / len(focus_terms))))
-        rescored.append((hybrid, semantic, lexical, metadata, match))
+        hybrid = max(0.0, min(1.0, hybrid))
 
-    rescored.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+        rows.append(
+            {
+                "metadata": metadata,
+                "semantic_score": semantic,
+                "token_overlap": overlap,
+                "exact_hits": exact_hits,
+                "exact_score": exact_score,
+                "symbol_module_score": symbol_module_score,
+                "action_score": action_score,
+                "comment_penalty": comment_penalty,
+                "lexical_file_boost": lexical_file_boost,
+                "hybrid_score": hybrid,
+                "ordinal": ordinal,
+            }
+        )
+
+    semantic_sorted = sorted(rows, key=lambda item: item["semantic_score"], reverse=True)
+    for idx, row in enumerate(semantic_sorted, start=1):
+        row["semantic_rank"] = idx
+
+    reranked = sorted(
+        rows,
+        key=lambda item: (item["hybrid_score"], item["semantic_score"], item["exact_hits"]),
+        reverse=True,
+    )
 
     deduped: list[tuple[dict, float]] = []
     debug_candidates: list[dict[str, Any]] = []
     seen_ranges: set[tuple[str, int, int]] = set()
-    for hybrid, semantic, lexical, metadata, _ in rescored:
+    for rank, row in enumerate(reranked, start=1):
+        metadata = row["metadata"]
         file_path = str(metadata.get("file_path", "unknown"))
         line_start = safe_int(metadata.get("line_start")) or safe_int(metadata.get("start_line")) or 1
         line_end = safe_int(metadata.get("line_end")) or safe_int(metadata.get("end_line")) or line_start
@@ -1852,30 +2172,31 @@ def rerank_matches(question: str, matches: list, top_k: int) -> tuple[list[tuple
         if key in seen_ranges:
             continue
         seen_ranges.add(key)
-        deduped.append((metadata, hybrid))
-        if len(debug_candidates) < 24:
+        if len(deduped) < max(top_k, 1):
+            deduped.append((metadata, float(row["hybrid_score"])))
+        if len(debug_candidates) < max(DEBUG_CANDIDATE_LIMIT, max(top_k, 1)):
+            snippet = " ".join(metadata_chunk_text(metadata).split())[:260]
             debug_candidates.append(
                 {
                     "file_path": file_path,
                     "line_start": line_start,
                     "line_end": line_end,
-                    "hybrid_score": round(hybrid, 4),
-                    "semantic_score": round(semantic, 4),
-                    "lexical_score": round(lexical, 4),
                     "query_used": str(metadata.get("query_used", "")),
                     "section_name": str(metadata.get("section_name", "")),
-                    "focus_terms": focus_terms,
-                    "focus_term_hits": focus_term_match_count(
-                        focus_terms,
-                        (
-                            f"{file_path}\n"
-                            f"{metadata.get('section_name', '')}\n"
-                            f"{metadata_chunk_text(metadata)[:600]}"
-                        ),
-                    ),
+                    "semantic_rank": int(row.get("semantic_rank", rank)),
+                    "rerank_rank": rank,
+                    "semantic_score": round(float(row["semantic_score"]), 4),
+                    "hybrid_score": round(float(row["hybrid_score"]), 4),
+                    "token_overlap": round(float(row["token_overlap"]), 4),
+                    "exact_identifier_hits": int(row["exact_hits"]),
+                    "symbol_module_score": round(float(row["symbol_module_score"]), 4),
+                    "action_score": round(float(row["action_score"]), 4),
+                    "comment_penalty": round(float(row["comment_penalty"]), 4),
+                    "lexical_file_boost": round(float(row["lexical_file_boost"]), 4),
+                    "snippet": snippet,
                 }
             )
-        if len(deduped) >= top_k:
+        if len(deduped) >= max(top_k, 1) and len(debug_candidates) >= max(DEBUG_CANDIDATE_LIMIT, max(top_k, 1)):
             break
 
     min_score = min(max(settings.retrieval_min_hybrid_score, 0.0), 1.0)
@@ -2580,6 +2901,100 @@ def query_namespaces() -> list[str]:
     return namespaces
 
 
+def query_filter_cache_key(filter_payload: dict[str, Any] | None) -> str:
+    if not filter_payload:
+        return ""
+    try:
+        return json.dumps(filter_payload, sort_keys=True, separators=(",", ":"))
+    except Exception:
+        return str(filter_payload)
+
+
+def pinecone_query_cache_key(query_text: str, namespace: str, top_k: int, filter_payload: dict[str, Any] | None) -> str:
+    material = "\n".join(
+        [
+            settings.pinecone_index_name,
+            namespace,
+            str(top_k),
+            query_text.strip().lower(),
+            query_filter_cache_key(filter_payload),
+        ]
+    )
+    return hashlib.sha1(material.encode("utf-8")).hexdigest()
+
+
+def query_cache_get(key: str) -> list[dict[str, Any]] | None:
+    ttl = max(float(settings.retrieval_query_cache_ttl_seconds), 0.0)
+    if ttl <= 0:
+        return None
+    now = time.time()
+    with query_result_cache_lock:
+        row = query_result_cache.get(key)
+        if not isinstance(row, dict):
+            return None
+        expires_at = float(row.get("expires_at", 0.0) or 0.0)
+        if expires_at < now:
+            query_result_cache.pop(key, None)
+            return None
+        payload = row.get("payload")
+        if not isinstance(payload, list):
+            return None
+        return payload
+
+
+def query_cache_put(key: str, payload: list[dict[str, Any]]) -> None:
+    ttl = max(float(settings.retrieval_query_cache_ttl_seconds), 0.0)
+    if ttl <= 0:
+        return
+    now = time.time()
+    with query_result_cache_lock:
+        query_result_cache[key] = {"expires_at": now + ttl, "payload": payload}
+        max_entries = max(int(settings.retrieval_query_cache_max_entries), 64)
+        if len(query_result_cache) > max_entries:
+            stale = sorted(query_result_cache.items(), key=lambda item: float((item[1] or {}).get("expires_at", 0.0)))
+            for stale_key, _ in stale[: max(len(stale) - max_entries, 1)]:
+                query_result_cache.pop(stale_key, None)
+
+
+def normalize_cached_matches(matches: list[Any]) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for match in matches:
+        normalized.append(
+            {
+                "score": match_score(match),
+                "metadata": normalize_metadata(match),
+            }
+        )
+    return normalized
+
+
+def query_index_with_cache(
+    index: Any,
+    query_text: str,
+    question_vector: list[float],
+    candidate_top_k: int,
+    namespace: str,
+    pinecone_filter: dict[str, Any] | None,
+) -> tuple[list[dict[str, Any]], bool]:
+    key = pinecone_query_cache_key(query_text, namespace, candidate_top_k, pinecone_filter)
+    cached = query_cache_get(key)
+    if cached is not None:
+        return cached, True
+
+    query_kwargs: dict[str, Any] = {
+        "vector": question_vector,
+        "top_k": candidate_top_k,
+        "include_metadata": True,
+        "namespace": namespace,
+    }
+    if pinecone_filter:
+        query_kwargs["filter"] = pinecone_filter
+    results = call_with_retries("pinecone query", lambda: index.query(**query_kwargs))
+    query_matches = normalize_cached_matches(normalize_matches(results))
+    query_cache_put(key, query_matches)
+    return query_matches, False
+
+
 def build_pinecone_filter(
     language: str | None = None,
     source_type: str | None = None,
@@ -2644,12 +3059,13 @@ def retrieve_citations_and_chunks(
     source_type_filter: str | None = None,
     candidate_files: list[str] | None = None,
     repo_name: str | None = None,
+    lexical_file_scores: dict[str, float] | None = None,
 ) -> tuple[list[Citation], list[str], dict[str, Any]]:
     queries = retrieval_queries or [question]
     target_namespaces = namespaces or query_namespaces()
     candidate_top_k = min(
-        max(top_k * max(settings.retrieval_candidate_multiplier, 1), top_k),
-        max(settings.retrieval_max_candidates, top_k),
+        max(top_k * max(settings.retrieval_candidate_multiplier, 1), max(top_k, 20)),
+        max(settings.retrieval_max_candidates, max(top_k, 20)),
     )
     index = get_pinecone_index()
     index_dim: int | None = None
@@ -2664,6 +3080,11 @@ def retrieve_citations_and_chunks(
     normalized_candidate_files = dedupe_preserve_order(
         [path for path in (normalize_file_path(item) for item in (candidate_files or [])) if path]
     )
+    lexical_scores = {
+        str(normalize_file_path(path) or ""): max(0.0, min(1.0, float(score)))
+        for path, score in (lexical_file_scores or {}).items()
+        if normalize_file_path(path)
+    }
     pinecone_filter = build_pinecone_filter(
         language=language,
         source_type=source_type_filter,
@@ -2673,8 +3094,14 @@ def retrieve_citations_and_chunks(
 
     matches: list = []
     subquery_counts: list[dict[str, Any]] = []
+    embed_ms = 0.0
+    pinecone_ms = 0.0
+    cache_hits = 0
+    cache_misses = 0
     for query_text in queries:
+        embed_started = time.perf_counter()
         question_vector = embed_question(query_text)
+        embed_ms += (time.perf_counter() - embed_started) * 1000.0
         if not question_vector:
             subquery_counts.append({"query": query_text, "matches": 0})
             continue
@@ -2682,16 +3109,20 @@ def retrieve_citations_and_chunks(
 
         query_matches: list = []
         for namespace in target_namespaces:
-            query_kwargs: dict[str, Any] = {
-                "vector": question_vector,
-                "top_k": candidate_top_k,
-                "include_metadata": True,
-                "namespace": namespace,
-            }
-            if pinecone_filter:
-                query_kwargs["filter"] = pinecone_filter
-            results = call_with_retries("pinecone query", lambda: index.query(**query_kwargs))
-            query_matches = normalize_matches(results)
+            pinecone_started = time.perf_counter()
+            query_matches, from_cache = query_index_with_cache(
+                index=index,
+                query_text=query_text,
+                question_vector=question_vector,
+                candidate_top_k=candidate_top_k,
+                namespace=namespace,
+                pinecone_filter=pinecone_filter,
+            )
+            pinecone_ms += (time.perf_counter() - pinecone_started) * 1000.0
+            if from_cache:
+                cache_hits += 1
+            else:
+                cache_misses += 1
             if query_matches:
                 break
 
@@ -2704,6 +3135,9 @@ def retrieve_citations_and_chunks(
                 continue
             metadata["query_used"] = query_text
             metadata.setdefault("source_type", default_source_type)
+            file_path = normalize_file_path(metadata.get("file_path"))
+            if file_path and file_path in lexical_scores:
+                metadata["_lexical_file_score"] = lexical_scores[file_path]
             if not metadata_matches_filters(
                 metadata,
                 path_prefix=path_prefix,
@@ -2718,12 +3152,36 @@ def retrieve_citations_and_chunks(
         subquery_counts.append({"query": query_text, "matches": accepted_count})
 
     if not matches:
-        return [], [], {"candidates": [], "subqueries": subquery_counts}
+        return (
+            [],
+            [],
+            {
+                "candidates": [],
+                "subqueries": subquery_counts,
+                "timings_ms": {
+                    "embed": round(embed_ms, 2),
+                    "pinecone_query": round(pinecone_ms, 2),
+                    "rerank": 0.0,
+                },
+                "cache": {"hits": cache_hits, "misses": cache_misses},
+            },
+        )
 
+    rerank_started = time.perf_counter()
     reranked, debug_candidates = rerank_matches(question=question, matches=matches, top_k=top_k)
+    rerank_ms = (time.perf_counter() - rerank_started) * 1000.0
     citations = [Citation(**extract_citation(metadata, score)) for metadata, score in reranked]
     chunks = [metadata_chunk_text(metadata) for metadata, _ in reranked]
-    debug = {"candidates": debug_candidates, "subqueries": subquery_counts}
+    debug = {
+        "candidates": debug_candidates,
+        "subqueries": subquery_counts,
+        "timings_ms": {
+            "embed": round(embed_ms, 2),
+            "pinecone_query": round(pinecone_ms, 2),
+            "rerank": round(rerank_ms, 2),
+        },
+        "cache": {"hits": cache_hits, "misses": cache_misses},
+    }
     return citations, chunks, debug
 
 
@@ -2819,6 +3277,89 @@ def merge_citation_sets(
     return merged_citations, merged_chunks
 
 
+def should_include_header_context(question: str) -> bool:
+    lowered = question.lower()
+    return any(token in lowered for token in ("module", "imports", "use ", "dependency", "entry point", "entrypoint"))
+
+
+def expand_repo_citation_context(question: str, citation: Citation, chunk: str) -> tuple[Citation, str]:
+    file_path = str(citation.file_path or "")
+    if not file_path or citation.source_type != "repo":
+        return citation, chunk
+
+    lines = repo_file_lines(file_path)
+    if not lines:
+        return citation, chunk
+
+    line_start = max(1, int(citation.line_start))
+    line_end = max(line_start, int(citation.line_end))
+    neighbor = max(int(settings.retrieval_context_neighbor_lines), 0)
+    parent_max = max(int(settings.retrieval_context_parent_max_lines), 1)
+    header_lines = max(int(settings.retrieval_context_header_lines), 0)
+
+    parent = find_enclosing_definition(file_path, line_start)
+    expanded_start = max(1, line_start - neighbor)
+    expanded_end = min(len(lines), line_end + neighbor)
+    if parent:
+        parent_start = max(1, safe_int(parent.get("line_start")) or expanded_start)
+        parent_end = min(len(lines), safe_int(parent.get("line_end")) or expanded_end)
+        parent_span = parent_end - parent_start + 1
+        if parent_span <= parent_max:
+            expanded_start = parent_start
+            expanded_end = parent_end
+        else:
+            expanded_start = max(parent_start, expanded_start)
+            expanded_end = min(parent_end, expanded_end)
+
+    snippet_parts: list[str] = []
+    if should_include_header_context(question) and header_lines > 0 and expanded_start > 1:
+        header_end = min(header_lines, len(lines))
+        header_text = "\n".join(lines[:header_end]).strip()
+        if header_text:
+            snippet_parts.append(header_text)
+    body_text = file_snippet(file_path, expanded_start, expanded_end, pad_after=0).strip()
+    if body_text:
+        snippet_parts.append(body_text)
+    expanded_text = "\n\n".join(part for part in snippet_parts if part).strip() or (chunk or "")
+
+    return (
+        Citation(
+            file_path=file_path,
+            line_start=expanded_start,
+            line_end=expanded_end,
+            score=float(citation.score),
+            source_type=citation.source_type,
+            file_sha=citation.file_sha,
+            snippet=expanded_text[:550] if expanded_text else citation.snippet,
+        ),
+        expanded_text,
+    )
+
+
+def expand_context_for_citations(
+    question: str,
+    citations: list[Citation],
+    chunks: list[str],
+    limit: int,
+) -> tuple[list[Citation], list[str]]:
+    if not citations or not chunks:
+        return citations, chunks
+    max_items = max(limit, 1)
+    expanded_citations: list[Citation] = []
+    expanded_chunks: list[str] = []
+    for citation, chunk in zip(citations, chunks, strict=False):
+        if citation.source_type != "repo":
+            expanded_citations.append(citation)
+            expanded_chunks.append(chunk)
+        else:
+            next_citation, expanded_text = expand_repo_citation_context(question, citation, chunk)
+            expanded_citations.append(next_citation)
+            expanded_chunks.append(expanded_text)
+        if len(expanded_citations) >= max_items:
+            break
+    return expanded_citations, expanded_chunks
+
+
 def retrieve_with_optional_uploads(
     question: str,
     top_k: int,
@@ -2832,6 +3373,7 @@ def retrieve_with_optional_uploads(
     candidate_files: list[str] | None = None,
     repo_name: str | None = None,
 ) -> tuple[list[Citation], list[str], dict[str, Any]]:
+    started = time.perf_counter()
     normalized_mode = normalize_mode(mode)
     effective_top_k = max(top_k, 1)
     if normalized_mode == "search" and is_exhaustive_file_query(question):
@@ -2839,17 +3381,36 @@ def retrieve_with_optional_uploads(
 
     include_repo = scope in {"repo", "both"}
     include_uploads = scope in {"uploads", "both"}
+    rewrite_started = time.perf_counter()
     rewritten_query, subqueries = rewrite_and_decompose_query(question)
+    rewrite_ms = (time.perf_counter() - rewrite_started) * 1000.0
     retrieval_queries = [rewritten_query, *subqueries]
     index_citations: list[Citation] = []
     index_chunks: list[str] = []
     index_debug: dict[str, Any] = {"candidates": [], "subqueries": []}
+    lexical_index_citations: list[Citation] = []
+    lexical_index_chunks: list[str] = []
+    lexical_index_debug: dict[str, Any] = {"candidates": [], "subqueries": []}
     persistent_upload_citations: list[Citation] = []
     persistent_upload_chunks: list[str] = []
     persistent_upload_debug: dict[str, Any] = {"candidates": [], "subqueries": []}
     temp_upload_citations: list[Citation] = []
     temp_upload_chunks: list[str] = []
     temp_upload_debug: dict[str, Any] = {"candidates": [], "subqueries": []}
+    lexical_started = time.perf_counter()
+    lexical_enabled = include_repo and settings.retrieval_identifier_lexical_enabled
+    lexical_debug = (
+        lexical_candidate_files(question)
+        if lexical_enabled
+        else {"enabled": False, "identifiers": [], "candidate_files": [], "file_scores": {}, "hits": []}
+    )
+    lexical_ms = (time.perf_counter() - lexical_started) * 1000.0
+    lexical_files = [path for path in (normalize_file_path(item) for item in lexical_debug.get("candidate_files", []) or []) if path]
+    lexical_scores = lexical_debug.get("file_scores", {}) if isinstance(lexical_debug, dict) else {}
+    provided_candidates = [path for path in (normalize_file_path(item) for item in (candidate_files or [])) if path]
+    primary_candidate_files = dedupe_preserve_order(
+        [*provided_candidates, *(lexical_files if provided_candidates else [])]
+    )
 
     if include_repo:
         try:
@@ -2862,9 +3423,25 @@ def retrieve_with_optional_uploads(
                 path_prefix=path_prefix,
                 language=language,
                 source_type_filter=source_type_filter,
-                candidate_files=candidate_files,
+                candidate_files=primary_candidate_files,
                 repo_name=repo_name,
+                lexical_file_scores=lexical_scores,
             )
+            # For identifier-heavy queries, run a focused lexical pass and merge with a small bonus.
+            if lexical_enabled and lexical_files and not provided_candidates:
+                lexical_index_citations, lexical_index_chunks, lexical_index_debug = retrieve_citations_and_chunks(
+                    question=rewritten_query,
+                    top_k=effective_top_k,
+                    retrieval_queries=retrieval_queries,
+                    namespaces=query_namespaces(),
+                    default_source_type="repo",
+                    path_prefix=path_prefix,
+                    language=language,
+                    source_type_filter=source_type_filter,
+                    candidate_files=lexical_files,
+                    repo_name=repo_name,
+                    lexical_file_scores=lexical_scores,
+                )
         except HTTPException as exc:
             logger.warning("Indexed retrieval unavailable: %s", exc.detail)
         except Exception as exc:
@@ -2882,7 +3459,7 @@ def retrieve_with_optional_uploads(
                 path_prefix=path_prefix,
                 language=language,
                 source_type_filter=source_type_filter,
-                candidate_files=candidate_files,
+                candidate_files=provided_candidates,
                 repo_name=repo_name,
             )
         except HTTPException as exc:
@@ -2899,13 +3476,15 @@ def retrieve_with_optional_uploads(
                 path_prefix=path_prefix,
                 language=language,
                 source_type_filter=source_type_filter,
-                candidate_files=candidate_files,
+                candidate_files=provided_candidates,
                 repo_name=repo_name,
             )
 
     sets_to_merge: list[tuple[list[Citation], list[str], float]] = []
     if include_repo:
         sets_to_merge.append((index_citations, index_chunks, 0.0))
+        if lexical_index_citations:
+            sets_to_merge.append((lexical_index_citations, lexical_index_chunks, 0.06))
     if include_uploads:
         sets_to_merge.append((persistent_upload_citations, persistent_upload_chunks, UPLOAD_SOURCE_BONUS))
         sets_to_merge.append((temp_upload_citations, temp_upload_chunks, UPLOAD_PRIORITY_BONUS))
@@ -2924,6 +3503,12 @@ def retrieve_with_optional_uploads(
     elif focus_guardrail.get("required_terms"):
         focus_guardrail["action"] = "retain_exact_term_matches_found"
 
+    context_started = time.perf_counter()
+    if settings.retrieval_context_expansion_enabled:
+        citations, chunks = expand_context_for_citations(question, citations, chunks, limit=effective_top_k)
+        citations, chunks = dedupe_citation_pairs(citations, chunks, limit=effective_top_k)
+    context_ms = (time.perf_counter() - context_started) * 1000.0
+
     upload_debug = {
         "persistent": persistent_upload_debug,
         "temporary": temp_upload_debug,
@@ -2940,15 +3525,29 @@ def retrieve_with_optional_uploads(
         "rewritten_query": rewritten_query,
         "subqueries": subqueries,
         "index": index_debug,
+        "index_lexical": lexical_index_debug,
         "uploads": upload_debug,
+        "lexical_candidates": lexical_debug,
+        "feature_flags": {
+            "identifier_lexical_enabled": bool(settings.retrieval_identifier_lexical_enabled),
+            "deterministic_rerank_enabled": bool(settings.retrieval_deterministic_rerank_enabled),
+            "context_expansion_enabled": bool(settings.retrieval_context_expansion_enabled),
+        },
         "intent_router": intent_debug,
         "focus_guardrail": focus_guardrail,
         "retrieval_top_k": effective_top_k,
+        "timings_ms": {
+            "rewrite": round(rewrite_ms, 2),
+            "lexical": round(lexical_ms, 2),
+            "context_assembly": round(context_ms, 2),
+            "total": round((time.perf_counter() - started) * 1000.0, 2),
+        },
         "filters": {
             "path_prefix": path_prefix,
             "language": language,
             "source_type": source_type_filter,
-            "candidate_files_count": len(candidate_files or []),
+            "candidate_files_count": len(provided_candidates),
+            "lexical_candidate_files_count": len(lexical_files),
             "repo": repo_name,
         },
     }
@@ -3261,8 +3860,11 @@ def build_debug_payload(
         "subqueries": retrieval_debug.get("subqueries", []),
         "retrieval": {
             "index": retrieval_debug.get("index", {}),
+            "index_lexical": retrieval_debug.get("index_lexical", {}),
             "uploads": retrieval_debug.get("uploads", {}),
+            "lexical_candidates": retrieval_debug.get("lexical_candidates", {}),
         },
+        "feature_flags": retrieval_debug.get("feature_flags", {}),
         "final_context_preview": context[:3000],
         "context_token_estimate": token_count(context),
     }

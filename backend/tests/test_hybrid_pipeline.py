@@ -58,6 +58,11 @@ class HybridPipelineTests(unittest.TestCase):
         self.assertTrue(any("file_path" in clause and "$in" in clause["file_path"] for clause in clauses))
         self.assertTrue(any(clause.get("repo") == {"$eq": "National-Seismic-Hazard-Maps"} for clause in clauses))
 
+    def test_infer_hybrid_target_prefers_called_symbol(self) -> None:
+        question = "What calls GailTable, and what downstream routines does it impact?"
+        target = main.infer_hybrid_target(question)
+        self.assertEqual(str(target).lower(), "gailtable")
+
 
 if __name__ == "__main__":
     unittest.main()

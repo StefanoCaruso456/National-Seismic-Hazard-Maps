@@ -1407,6 +1407,7 @@ function renderHybridArchitecturePanel(panel, graphPayload) {
   const processes = Array.isArray(graph.processes) ? graph.processes : [];
   const entrypoints = Array.isArray(graph.entrypoints) ? graph.entrypoints : [];
   const candidateFiles = Array.isArray(graph.candidate_files) ? graph.candidate_files : [];
+  const errors = Array.isArray(graph.errors) ? graph.errors : [];
 
   const lines = [];
   lines.push(`Repo: ${String(graph.repo || "n/a")}`);
@@ -1418,6 +1419,9 @@ function renderHybridArchitecturePanel(panel, graphPayload) {
     lines.push(`Candidate files (${candidateFiles.length}): ${candidateFiles.slice(0, 8).join(", ")}${candidateFiles.length > 8 ? " ..." : ""}`);
   } else {
     lines.push("Candidate files: none (fallback retrieval used)");
+  }
+  if (errors.length) {
+    lines.push(`Graph errors: ${errors.slice(0, 3).join(" | ")}`);
   }
 
   const impact = graph.impact && typeof graph.impact === "object" ? graph.impact : {};

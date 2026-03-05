@@ -241,6 +241,27 @@ class HybridPipelineTests(unittest.TestCase):
             main.run_gitnexus_graph = original_run_gitnexus_graph  # type: ignore[assignment]
             main.retrieve_with_optional_uploads = original_retrieve  # type: ignore[assignment]
 
+    def test_compose_hybrid_answer_reports_graph_not_indexed(self) -> None:
+        answer = main.compose_hybrid_answer(
+            question="Show call chain for hazard flow",
+            graph={
+                "repo": "nshmp-main",
+                "errors": ["gitnexus_repo_not_indexed:nshmp-main"],
+                "processes": [],
+                "entrypoints": [],
+                "candidate_files": [],
+                "impact": {},
+                "hybrid_debug": {
+                    "fallback_reason": "graph_not_indexed",
+                    "graph_metadata": {"repo_id": "nshmp-main", "commit_hash": "abc1234"},
+                },
+            },
+            evidence_rows=[],
+            used_fallback=True,
+        )
+        self.assertIn("Graph not indexed for repo nshmp-main at commit abc1234", answer)
+        self.assertIn("npx -y gitnexus@latest analyze", answer)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1653,12 +1653,17 @@ function renderHybridGraphCanvas(panel, graphPayload) {
   panel.appendChild(wrap);
 
   const GraphFactory = window.ForceGraph3D;
-  if (typeof GraphFactory !== "function") {
+  const fallbackToSnapshot = (message) => {
+    viewport.innerHTML = "";
     const canvas = document.createElement("canvas");
     canvas.className = "hybrid-graph-canvas";
     viewport.appendChild(canvas);
     drawHybridGraphSnapshot(canvas, model);
-    details.textContent = "3D graph library unavailable. Showing static snapshot fallback.";
+    details.textContent = message;
+  };
+
+  if (typeof GraphFactory !== "function") {
+    fallbackToSnapshot("3D graph library unavailable. Showing static snapshot fallback.");
     return;
   }
 
@@ -1675,55 +1680,97 @@ function renderHybridGraphCanvas(panel, graphPayload) {
     })),
   };
 
-  const graph3d = GraphFactory({
-    controlType: "orbit",
-    rendererConfig: { antialias: true, alpha: true },
-  })(viewport)
-    .backgroundColor("rgba(0,0,0,0)")
-    .graphData(graphData)
-    .nodeColor((node) => hybridNodeKindColor(String(node.kind || "default")))
-    .nodeLabel((node) => hybridGraphNodeLabel(node))
-    .nodeVal((node) => Number(node.val || 2))
-    .linkColor(() => HYBRID_GRAPH_COLORS.edge)
-    .linkOpacity(0.42)
-    .linkWidth((link) => (String(link.kind || "").startsWith("impact_") ? 1.8 : 1.15))
-    .onNodeHover((node) => {
-      viewport.style.cursor = node ? "pointer" : "grab";
-    })
-    .onNodeClick((node) => {
-      const kind = String(node?.kind || "node");
-      const label = String(node?.label || node?.id || "node");
-      const path = String(node?.path || "");
-      details.textContent = path ? `${kind}: ${label} (${path})` : `${kind}: ${label}`;
-      openGraphNodeSource(node);
-    })
-    .onLinkClick((link) => {
-      const source = typeof link?.source === "object" ? link.source?.label || link.source?.id : link?.source;
-      const target = typeof link?.target === "object" ? link.target?.label || link.target?.id : link?.target;
-      details.textContent = `edge: ${String(link?.kind || "related")} • ${source} -> ${target}`;
+  const mountGraph = () => {
+    let graph3d;
+    try {
+      graph3d = GraphFactory({
+        controlType: "orbit",
+        rendererConfig: { antialias: true, alpha: true },
+      })(viewport)
+        .backgroundColor("rgba(0,0,0,0)")
+        .graphData(graphData)
+        .nodeColor((node) => hybridNodeKindColor(String(node.kind || "default")))
+        .nodeLabel((node) => hybridGraphNodeLabel(node))
+        .nodeVal((node) => Number(node.val || 2))
+        .linkColor(() => HYBRID_GRAPH_COLORS.edge)
+        .linkOpacity(0.42)
+        .linkWidth((link) => (String(link.kind || "").startsWith("impact_") ? 1.8 : 1.15))
+        .onNodeHover((node) => {
+          viewport.style.cursor = node ? "pointer" : "grab";
+        })
+        .onNodeClick((node) => {
+          const kind = String(node?.kind || "node");
+          const label = String(node?.label || node?.id || "node");
+          const path = String(node?.path || "");
+          details.textContent = path ? `${kind}: ${label} (${path})` : `${kind}: ${label}`;
+          openGraphNodeSource(node);
+        })
+        .onLinkClick((link) => {
+          const source = typeof link?.source === "object" ? link.source?.label || link.source?.id : link?.source;
+          const target = typeof link?.target === "object" ? link.target?.label || link.target?.id : link?.target;
+          details.textContent = `edge: ${String(link?.kind || "related")} • ${source} -> ${target}`;
+        });
+    } catch (_err) {
+      fallbackToSnapshot("3D graph failed to initialize. Showing static snapshot fallback.");
+      return;
+    }
+
+    const applySize = () => {
+      const width = Math.max(300, viewport.clientWidth || 0);
+      const height = Math.max(240, viewport.clientHeight || 0);
+      try {
+        graph3d.width(width).height(height);
+      } catch (_err) {
+        // Ignore sizing errors from force-graph internals.
+      }
+    };
+
+    applySize();
+
+    try {
+      graph3d.d3Force("charge").strength(-95);
+      graph3d.d3VelocityDecay(0.32);
+    } catch (_err) {
+      // Ignore if force engine internals differ.
+    }
+
+    const controls = graph3d.controls?.();
+    if (controls) {
+      controls.enableDamping = true;
+      controls.dampingFactor = 0.14;
+      controls.rotateSpeed = 0.7;
+      controls.zoomSpeed = 0.8;
+    }
+
+    if (typeof ResizeObserver === "function") {
+      const observer = new ResizeObserver(() => applySize());
+      observer.observe(viewport);
+    }
+
+    requestAnimationFrame(() => {
+      applySize();
+      try {
+        graph3d.zoomToFit(900, 60);
+      } catch (_err) {
+        // Ignore initial layout timing errors.
+      }
     });
 
-  try {
-    graph3d.d3Force("charge").strength(-95);
-    graph3d.d3VelocityDecay(0.32);
-  } catch (_err) {
-    // Ignore if force engine internals differ.
-  }
-
-  const controls = graph3d.controls?.();
-  if (controls) {
-    controls.enableDamping = true;
-    controls.dampingFactor = 0.14;
-    controls.rotateSpeed = 0.7;
-    controls.zoomSpeed = 0.8;
-  }
+    window.setTimeout(() => {
+      const canvasEl = viewport.querySelector("canvas");
+      const rendered = Boolean(canvasEl && canvasEl.width > 0 && canvasEl.height > 0);
+      if (!rendered) {
+        fallbackToSnapshot("3D graph canvas was not ready. Showing static snapshot fallback.");
+      }
+    }, 900);
+  };
 
   requestAnimationFrame(() => {
-    try {
-      graph3d.zoomToFit(900, 60);
-    } catch (_err) {
-      // Ignore initial layout timing errors.
+    if (document.body.contains(viewport)) {
+      mountGraph();
+      return;
     }
+    window.setTimeout(mountGraph, 0);
   });
 }
 

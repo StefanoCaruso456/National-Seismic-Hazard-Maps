@@ -29,6 +29,20 @@ from app.ingest import (
     discover_fortran_files,
     token_count,
 )
+from app.router import (
+    PLAN_GRAPH_ONLY,
+    PLAN_GRAPH_PLUS_KEYWORD_PLUS_VECTOR,
+    PLAN_GRAPH_PLUS_VECTOR,
+    PLAN_KEYWORD_ONLY,
+    PLAN_KEYWORD_PLUS_VECTOR,
+    PLAN_VECTOR_ONLY,
+    ROUTER_PINECONE_TOP_K,
+    detect_route_signals,
+    escalated_plan,
+    low_confidence_reason,
+    route_debug_template,
+    select_retrieval_plan,
+)
 
 logger = logging.getLogger("legacylens.api")
 IDENTIFIER_PATTERN = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]{2,}")
@@ -3060,13 +3074,17 @@ def retrieve_citations_and_chunks(
     candidate_files: list[str] | None = None,
     repo_name: str | None = None,
     lexical_file_scores: dict[str, float] | None = None,
+    candidate_top_k_override: int | None = None,
 ) -> tuple[list[Citation], list[str], dict[str, Any]]:
     queries = retrieval_queries or [question]
     target_namespaces = namespaces or query_namespaces()
-    candidate_top_k = min(
-        max(top_k * max(settings.retrieval_candidate_multiplier, 1), max(top_k, 20)),
-        max(settings.retrieval_max_candidates, max(top_k, 20)),
-    )
+    if candidate_top_k_override is not None:
+        candidate_top_k = max(int(candidate_top_k_override), 1)
+    else:
+        candidate_top_k = min(
+            max(top_k * max(settings.retrieval_candidate_multiplier, 1), max(top_k, 20)),
+            max(settings.retrieval_max_candidates, max(top_k, 20)),
+        )
     index = get_pinecone_index()
     index_dim: int | None = None
     if settings.enforce_embedding_dimension:
@@ -3372,6 +3390,8 @@ def retrieve_with_optional_uploads(
     source_type_filter: str | None = None,
     candidate_files: list[str] | None = None,
     repo_name: str | None = None,
+    disable_internal_lexical: bool = False,
+    candidate_top_k_override: int | None = None,
 ) -> tuple[list[Citation], list[str], dict[str, Any]]:
     started = time.perf_counter()
     normalized_mode = normalize_mode(mode)
@@ -3398,7 +3418,7 @@ def retrieve_with_optional_uploads(
     temp_upload_chunks: list[str] = []
     temp_upload_debug: dict[str, Any] = {"candidates": [], "subqueries": []}
     lexical_started = time.perf_counter()
-    lexical_enabled = include_repo and settings.retrieval_identifier_lexical_enabled
+    lexical_enabled = include_repo and settings.retrieval_identifier_lexical_enabled and not disable_internal_lexical
     lexical_debug = (
         lexical_candidate_files(question)
         if lexical_enabled
@@ -3426,6 +3446,7 @@ def retrieve_with_optional_uploads(
                 candidate_files=primary_candidate_files,
                 repo_name=repo_name,
                 lexical_file_scores=lexical_scores,
+                candidate_top_k_override=candidate_top_k_override,
             )
             # For identifier-heavy queries, run a focused lexical pass and merge with a small bonus.
             if lexical_enabled and lexical_files and not provided_candidates:
@@ -3441,6 +3462,7 @@ def retrieve_with_optional_uploads(
                     candidate_files=lexical_files,
                     repo_name=repo_name,
                     lexical_file_scores=lexical_scores,
+                    candidate_top_k_override=candidate_top_k_override,
                 )
         except HTTPException as exc:
             logger.warning("Indexed retrieval unavailable: %s", exc.detail)
@@ -3461,6 +3483,7 @@ def retrieve_with_optional_uploads(
                 source_type_filter=source_type_filter,
                 candidate_files=provided_candidates,
                 repo_name=repo_name,
+                candidate_top_k_override=candidate_top_k_override,
             )
         except HTTPException as exc:
             logger.warning("Attachment retrieval unavailable: %s", exc.detail)
@@ -3552,6 +3575,160 @@ def retrieve_with_optional_uploads(
         },
     }
     return citations, chunks, debug
+
+
+def _normalized_candidate_paths(paths: list[str] | None) -> list[str]:
+    return dedupe_preserve_order([path for path in (normalize_file_path(item) for item in (paths or [])) if path])
+
+
+def run_routed_retrieval_plan(
+    question: str,
+    mode: str,
+    top_k: int,
+    scope: str,
+    project_id: str,
+    path_prefix: str | None = None,
+    language: str | None = None,
+    source_type_filter: str | None = None,
+) -> tuple[list[Citation], list[str], dict[str, Any], dict[str, Any], dict[str, Any], str]:
+    selected_plan = select_retrieval_plan(question=question, mode=mode)
+    signals = detect_route_signals(question)
+    route_debug = route_debug_template(route=selected_plan, signals=signals)
+    route_debug["initial_route"] = selected_plan
+
+    final_top_k = min(max(int(top_k), 1), 5)
+    target_repo = default_gitnexus_repo()
+    graph_payload: dict[str, Any] = {}
+    graph_files: list[str] = []
+    keyword_files: list[str] = []
+    retrieval_debug: dict[str, Any] = {"subqueries": [], "candidates": []}
+    citations: list[Citation] = []
+    chunks: list[str] = []
+
+    graph_done = False
+    keyword_done = False
+
+    def step_graph() -> None:
+        nonlocal graph_payload, graph_files, graph_done
+        if graph_done:
+            return
+        started = time.perf_counter()
+        graph_payload = run_gitnexus_graph(question, repo_name=target_repo)
+        graph_files = _normalized_candidate_paths(graph_payload.get("candidate_files", []) if isinstance(graph_payload, dict) else [])
+        processes = graph_payload.get("processes", []) if isinstance(graph_payload, dict) else []
+        entrypoints = graph_payload.get("entrypoints", []) if isinstance(graph_payload, dict) else []
+        route_debug["steps"].append(
+            {
+                "name": "graph",
+                "ms": round((time.perf_counter() - started) * 1000.0, 2),
+                "candidates": {
+                    "files": len(graph_files),
+                    "symbols": len(entrypoints) + (len(processes) if isinstance(processes, list) else 0),
+                },
+            }
+        )
+        graph_done = True
+
+    def step_keyword() -> None:
+        nonlocal keyword_files, keyword_done
+        if keyword_done:
+            return
+        started = time.perf_counter()
+        lexical_payload = lexical_candidate_files(question)
+        keyword_files = _normalized_candidate_paths(
+            lexical_payload.get("candidate_files", []) if isinstance(lexical_payload, dict) else []
+        )
+        hits = lexical_payload.get("hits", []) if isinstance(lexical_payload, dict) else []
+        route_debug["steps"].append(
+            {
+                "name": "keyword",
+                "ms": round((time.perf_counter() - started) * 1000.0, 2),
+                "candidates": {"files": len(keyword_files), "symbols": len(hits) if isinstance(hits, list) else 0},
+            }
+        )
+        keyword_done = True
+
+    def step_vector(candidate_files: list[str] | None) -> tuple[list[Citation], list[str], dict[str, Any]]:
+        started = time.perf_counter()
+        local_citations, local_chunks, local_debug = retrieve_with_optional_uploads(
+            question=question,
+            top_k=final_top_k,
+            uploaded_files=[],
+            scope=scope,
+            project_id=project_id,
+            mode="chat",
+            path_prefix=path_prefix,
+            language=language,
+            source_type_filter=source_type_filter,
+            candidate_files=candidate_files,
+            repo_name=target_repo if candidate_files else None,
+            disable_internal_lexical=True,
+            candidate_top_k_override=ROUTER_PINECONE_TOP_K,
+        )
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        index_debug = (local_debug.get("index", {}) if isinstance(local_debug, dict) else {}) or {}
+        index_timing = (index_debug.get("timings_ms", {}) if isinstance(index_debug, dict) else {}) or {}
+        pinecone_ms = float(index_timing.get("pinecone_query") or 0.0)
+        rerank_ms = float(index_timing.get("rerank") or 0.0)
+
+        route_debug["steps"].append(
+            {
+                "name": "pinecone",
+                "ms": round(pinecone_ms if pinecone_ms > 0 else elapsed_ms, 2),
+                "top_k": ROUTER_PINECONE_TOP_K,
+                "filtered": bool(candidate_files),
+            }
+        )
+        route_debug["steps"].append(
+            {
+                "name": "rerank",
+                "ms": round(max(rerank_ms, 0.0), 2),
+                "kept": len(local_citations),
+            }
+        )
+        return local_citations, local_chunks, local_debug
+
+    if selected_plan == PLAN_GRAPH_ONLY:
+        step_graph()
+        return citations, chunks, retrieval_debug, graph_payload, route_debug, selected_plan
+
+    if selected_plan in {PLAN_GRAPH_PLUS_VECTOR, PLAN_GRAPH_PLUS_KEYWORD_PLUS_VECTOR}:
+        step_graph()
+    if selected_plan in {PLAN_KEYWORD_ONLY, PLAN_KEYWORD_PLUS_VECTOR, PLAN_GRAPH_PLUS_KEYWORD_PLUS_VECTOR}:
+        step_keyword()
+
+    candidate_files: list[str] = []
+    if selected_plan == PLAN_GRAPH_PLUS_VECTOR:
+        candidate_files = graph_files
+    elif selected_plan == PLAN_KEYWORD_PLUS_VECTOR:
+        candidate_files = keyword_files
+    elif selected_plan == PLAN_GRAPH_PLUS_KEYWORD_PLUS_VECTOR:
+        candidate_files = _normalized_candidate_paths([*graph_files, *keyword_files])
+
+    citations, chunks, retrieval_debug = step_vector(candidate_files or None)
+
+    low_conf_reason = low_confidence_reason(citations)
+    next_plan = escalated_plan(current_plan=selected_plan, did_escalate=False) if low_conf_reason else None
+    if next_plan:
+        route_debug["escalation"] = {"did_escalate": True, "reason": low_conf_reason}
+        selected_plan = next_plan
+        route_debug["route"] = selected_plan
+
+        if selected_plan == PLAN_KEYWORD_PLUS_VECTOR:
+            step_keyword()
+            escalation_candidates = keyword_files
+        elif selected_plan == PLAN_GRAPH_PLUS_KEYWORD_PLUS_VECTOR:
+            step_graph()
+            step_keyword()
+            escalation_candidates = _normalized_candidate_paths([*graph_files, *keyword_files])
+        else:
+            escalation_candidates = []
+
+        citations, chunks, retrieval_debug = step_vector(escalation_candidates or None)
+    else:
+        route_debug["escalation"] = {"did_escalate": False, "reason": None}
+
+    return citations, chunks, retrieval_debug, graph_payload, route_debug, selected_plan
 
 
 def compute_evidence_strength(
@@ -3982,134 +4159,11 @@ def query(payload: QueryRequest) -> QueryResponse:
         payload.language,
         payload.source_type,
     )
-
-    if normalized_mode in {"hybrid", "graph"}:
-        repo_name = default_gitnexus_repo()
-        graph_payload = run_gitnexus_graph(payload.question, repo_name=repo_name)
-        raw_candidate_files = graph_payload.get("candidate_files", [])
-        candidate_files = [
-            path
-            for path in (
-                normalize_file_path(item) for item in (raw_candidate_files if isinstance(raw_candidate_files, list) else [])
-            )
-            if path
-        ]
-        candidate_files = dedupe_preserve_order(candidate_files)
-
-        if normalized_mode == "graph":
-            answer = compose_hybrid_answer(
-                question=payload.question,
-                graph=graph_payload,
-                evidence_rows=[],
-                used_fallback=False,
-            )
-            debug_payload: dict[str, Any] = {}
-            if payload.debug:
-                debug_payload = {
-                    "graph": graph_payload,
-                    "latency_ms": round((time.perf_counter() - started) * 1000.0, 2),
-                }
-            return QueryResponse(
-                answer=answer,
-                citations=[],
-                graph=graph_payload,
-                evidence=[],
-                evidence_strength={
-                    "label": "Low",
-                    "score": 0.0,
-                    "reason": "Graph-only mode does not retrieve Pinecone evidence.",
-                    "metrics": {"mode": "graph"},
-                },
-                debug=debug_payload,
-            )
-
-        top_k = max(payload.top_k, max(settings.hybrid_top_k_default, 1))
-        citations: list[Citation] = []
-        chunks: list[str] = []
-        retrieval_debug: dict[str, Any] = {"subqueries": [], "candidates": []}
-        used_fallback = False
-
-        if candidate_files:
-            try:
-                citations, chunks, retrieval_debug = retrieve_with_optional_uploads(
-                    question=payload.question,
-                    top_k=top_k,
-                    uploaded_files=[],
-                    mode="chat",
-                    scope="repo",
-                    project_id=normalized_project_id,
-                    path_prefix=path_prefix,
-                    language=language,
-                    source_type_filter=source_type_filter,
-                    candidate_files=candidate_files,
-                    repo_name=repo_name,
-                )
-            except HTTPException:
-                raise
-            except Exception as exc:
-                logger.warning("Hybrid filtered retrieval failed: %s", exc)
-                citations, chunks, retrieval_debug = [], [], {"subqueries": [], "candidates": []}
-
-        if not candidate_files or not citations:
-            used_fallback = True
-            try:
-                citations, chunks, retrieval_debug = retrieve_with_optional_uploads(
-                    question=payload.question,
-                    top_k=top_k,
-                    uploaded_files=[],
-                    mode="chat",
-                    scope=normalized_scope,
-                    project_id=normalized_project_id,
-                    path_prefix=path_prefix,
-                    language=language,
-                    source_type_filter=source_type_filter,
-                )
-            except HTTPException:
-                raise
-            except Exception as exc:
-                raise HTTPException(status_code=502, detail=f"Hybrid fallback retrieval failed: {exc}") from exc
-
-        evidence = compute_evidence_strength(
-            payload.question,
-            citations,
-            retrieval_debug,
-            mode="chat",
-            mode_metrics={},
-        )
-        evidence_rows = build_hybrid_evidence_rows(citations, chunks, limit=8)
-        answer = compose_hybrid_answer(
-            question=payload.question,
-            graph=graph_payload,
-            evidence_rows=evidence_rows,
-            used_fallback=used_fallback,
-        )
-
-        debug_payload: dict[str, Any] = {}
-        if payload.debug:
-            context = build_context(citations, chunks) if citations else ""
-            debug_payload = build_debug_payload(
-                retrieval_debug=retrieval_debug,
-                context=context,
-                latency_ms=(time.perf_counter() - started) * 1000.0,
-            )
-            debug_payload["graph"] = graph_payload
-            debug_payload["hybrid_fallback"] = used_fallback
-
-        return QueryResponse(
-            answer=answer,
-            citations=citations,
-            graph=graph_payload,
-            evidence=evidence_rows,
-            evidence_strength=evidence,
-            debug=debug_payload,
-        )
-
     try:
-        citations, chunks, retrieval_debug = retrieve_with_optional_uploads(
+        citations, chunks, retrieval_debug, graph_payload, route_debug, routed_plan = run_routed_retrieval_plan(
             question=payload.question,
-            top_k=payload.top_k,
-            uploaded_files=[],
             mode=normalized_mode,
+            top_k=payload.top_k,
             scope=normalized_scope,
             project_id=normalized_project_id,
             path_prefix=path_prefix,
@@ -4119,7 +4173,33 @@ def query(payload: QueryRequest) -> QueryResponse:
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Vector retrieval failed: {exc}") from exc
+        raise HTTPException(status_code=502, detail=f"Routed retrieval failed: {exc}") from exc
+
+    debug_payload: dict[str, Any] = {"route_debug": route_debug}
+
+    if routed_plan == PLAN_GRAPH_ONLY:
+        answer = compose_hybrid_answer(
+            question=payload.question,
+            graph=graph_payload,
+            evidence_rows=[],
+            used_fallback=False,
+        )
+        if payload.debug:
+            debug_payload["latency_ms"] = round((time.perf_counter() - started) * 1000.0, 2)
+            debug_payload["graph"] = graph_payload
+        return QueryResponse(
+            answer=answer,
+            citations=[],
+            graph=graph_payload,
+            evidence=[],
+            evidence_strength={
+                "label": "Low",
+                "score": 0.0,
+                "reason": "Graph-only mode does not retrieve Pinecone evidence.",
+                "metrics": {"mode": "graph"},
+            },
+            debug=debug_payload,
+        )
 
     evidence = compute_evidence_strength(
         payload.question,
@@ -4128,21 +4208,50 @@ def query(payload: QueryRequest) -> QueryResponse:
         mode=payload.mode,
         mode_metrics={},
     )
-    if not citations:
-        suggestions = suggest_next_investigation(payload.question, citations)
-        missing_terms = missing_focus_terms_from_debug(retrieval_debug)
-        context = ""
-        debug_payload: dict[str, Any] = {}
+    evidence_rows = build_hybrid_evidence_rows(citations, chunks, limit=8)
+
+    if normalized_mode == "hybrid":
+        answer = compose_hybrid_answer(
+            question=payload.question,
+            graph=graph_payload,
+            evidence_rows=evidence_rows,
+            used_fallback=bool(route_debug.get("escalation", {}).get("did_escalate")),
+        )
         if payload.debug:
-            debug_payload = build_debug_payload(
+            context = build_context(citations, chunks) if citations else ""
+            verbose_debug = build_debug_payload(
                 retrieval_debug=retrieval_debug,
                 context=context,
                 latency_ms=(time.perf_counter() - started) * 1000.0,
             )
+            verbose_debug["graph"] = graph_payload
+            verbose_debug["route_debug"] = route_debug
+            debug_payload = verbose_debug
+        return QueryResponse(
+            answer=answer,
+            citations=citations,
+            graph=graph_payload,
+            evidence=evidence_rows,
+            evidence_strength=evidence,
+            debug=debug_payload,
+        )
+
+    if not citations:
+        suggestions = suggest_next_investigation(payload.question, citations)
+        missing_terms = missing_focus_terms_from_debug(retrieval_debug)
+        context = ""
+        if payload.debug:
+            verbose_debug = build_debug_payload(
+                retrieval_debug=retrieval_debug,
+                context=context,
+                latency_ms=(time.perf_counter() - started) * 1000.0,
+            )
+            verbose_debug["route_debug"] = route_debug
+            debug_payload = verbose_debug
         return QueryResponse(
             answer=insufficient_evidence_answer(payload.question, suggestions, missing_terms=missing_terms),
             citations=[],
-            graph={},
+            graph=graph_payload,
             evidence=[],
             evidence_strength=evidence,
             debug=debug_payload,
@@ -4153,17 +4262,18 @@ def query(payload: QueryRequest) -> QueryResponse:
         suggestions = suggest_next_investigation(payload.question, citations)
         missing_terms = missing_focus_terms_from_debug(retrieval_debug)
         response_citations = [] if missing_terms else citations
-        debug_payload: dict[str, Any] = {}
         if payload.debug:
-            debug_payload = build_debug_payload(
+            verbose_debug = build_debug_payload(
                 retrieval_debug=retrieval_debug,
                 context=context,
                 latency_ms=(time.perf_counter() - started) * 1000.0,
             )
+            verbose_debug["route_debug"] = route_debug
+            debug_payload = verbose_debug
         return QueryResponse(
             answer=insufficient_evidence_answer(payload.question, suggestions, missing_terms=missing_terms),
             citations=response_citations,
-            graph={},
+            graph=graph_payload,
             evidence=build_hybrid_evidence_rows(response_citations, chunks, limit=8),
             evidence_strength=evidence,
             debug=debug_payload,
@@ -4178,18 +4288,19 @@ def query(payload: QueryRequest) -> QueryResponse:
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"LLM generation failed: {exc}") from exc
 
-    debug_payload: dict[str, Any] = {}
     if payload.debug:
-        debug_payload = build_debug_payload(
+        verbose_debug = build_debug_payload(
             retrieval_debug=retrieval_debug,
             context=context,
             latency_ms=(time.perf_counter() - started) * 1000.0,
         )
+        verbose_debug["route_debug"] = route_debug
+        debug_payload = verbose_debug
     return QueryResponse(
         answer=answer,
         citations=citations,
-        graph={},
-        evidence=build_hybrid_evidence_rows(citations, chunks, limit=8),
+        graph=graph_payload,
+        evidence=evidence_rows,
         evidence_strength=evidence,
         debug=debug_payload,
     )

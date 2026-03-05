@@ -5,6 +5,7 @@ import time
 import hashlib
 import io
 import json
+import os
 import subprocess
 import threading
 from collections import defaultdict
@@ -140,6 +141,7 @@ IDENTIFIER_STOPWORDS = {
     "error",
 }
 DEBUG_CANDIDATE_LIMIT = 64
+GRAPH_PROCESS_PRIORITY_THRESHOLD = 0.20
 
 UPLOAD_MAX_FILES = 8
 UPLOAD_MAX_FILE_BYTES = 1_500_000
@@ -558,7 +560,93 @@ def default_gitnexus_repo() -> str:
     configured = (settings.gitnexus_default_repo or "").strip()
     if configured:
         return configured
-    return repo_root_path().name
+    inferred = repo_root_path().name.strip()
+    if inferred:
+        return inferred
+    namespace_hint = str(settings.pinecone_namespace or "").split(":", 1)[0].strip()
+    if namespace_hint:
+        return namespace_hint
+    return "unknown-repo"
+
+
+@lru_cache(maxsize=1)
+def repo_commit_short() -> str | None:
+    for key in ("RAILWAY_GIT_COMMIT_SHA", "GIT_COMMIT", "SOURCE_COMMIT"):
+        value = str(os.environ.get(key, "")).strip()
+        if value:
+            return value[:12]
+    root = repo_root_path()
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=1.2,
+            check=False,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    commit = (proc.stdout or "").strip()
+    return commit or None
+
+
+def _repo_name_from_row(row: dict[str, Any]) -> str | None:
+    for key in ("repo", "name", "id", "repo_id", "slug"):
+        value = row.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _repo_metric_from_row(row: dict[str, Any], keys: tuple[str, ...]) -> int | None:
+    for key in keys:
+        value = row.get(key)
+        parsed = safe_int(value)
+        if parsed is not None and parsed >= 0:
+            return parsed
+    return None
+
+
+def _repo_index_details(
+    selected_repo: str,
+    list_repos_result: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    rows = list_repos_result if isinstance(list_repos_result, list) else []
+    names: list[str] = []
+    repo_row: dict[str, Any] | None = None
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = _repo_name_from_row(row)
+        if not name:
+            continue
+        names.append(name)
+        if name == selected_repo and repo_row is None:
+            repo_row = row
+    names = dedupe_preserve_order(names)
+
+    build_timestamp = None
+    node_count = None
+    edge_count = None
+    if isinstance(repo_row, dict):
+        for key in ("built_at", "build_timestamp", "updated_at", "created_at"):
+            value = repo_row.get(key)
+            if isinstance(value, str) and value.strip():
+                build_timestamp = value.strip()
+                break
+        node_count = _repo_metric_from_row(repo_row, ("nodes", "node_count", "symbols"))
+        edge_count = _repo_metric_from_row(repo_row, ("edges", "edge_count", "relationships"))
+
+    return {
+        "repo_id": selected_repo,
+        "available_repos": names[:40],
+        "index_present": bool(selected_repo and selected_repo in names) if names else None,
+        "build_timestamp": build_timestamp,
+        "node_count": node_count,
+        "edge_count": edge_count,
+    }
 
 
 def get_gitnexus_client() -> GitNexusClient:
@@ -659,9 +747,11 @@ def graph_entrypoints(query_result: dict[str, Any]) -> list[str]:
 
 
 def run_gitnexus_graph(question: str, repo_name: str | None = None) -> dict[str, Any]:
+    normalized_question = " ".join(str(question or "").split())
     selected_repo = (repo_name or default_gitnexus_repo()).strip()
     graph: dict[str, Any] = {
         "repo": selected_repo,
+        "query": normalized_question,
         "processes": [],
         "entrypoints": [],
         "impact": {},
@@ -669,15 +759,37 @@ def run_gitnexus_graph(question: str, repo_name: str | None = None) -> dict[str,
         "candidate_file_ranking": [],
         "target_symbol": None,
         "errors": [],
+        "raw_counts": {"processes": 0, "nodes": 0, "edges": 0, "files": 0},
+        "score": {"best": 0.0, "threshold": GRAPH_PROCESS_PRIORITY_THRESHOLD, "passed": False},
+        "index": {
+            "repo_id": selected_repo,
+            "commit_hash": repo_commit_short(),
+            "available_repos": [],
+            "index_present": None,
+            "build_timestamp": None,
+            "node_count": None,
+            "edge_count": None,
+        },
     }
+
+    if not selected_repo or selected_repo == "unknown-repo":
+        graph["errors"].append("gitnexus_repo_unresolved")
     if not settings.gitnexus_enabled:
-        graph["errors"] = ["gitnexus_disabled"]
+        graph["errors"].append("gitnexus_disabled")
+        graph["index"]["index_present"] = False
         return graph
 
     try:
         client = get_gitnexus_client()
+        repo_rows = client.list_repos()
+        index_info = _repo_index_details(selected_repo, repo_rows)
+        index_info["commit_hash"] = repo_commit_short()
+        graph["index"] = index_info
+        if index_info.get("index_present") is False:
+            graph["errors"].append(f"gitnexus_repo_not_indexed:{selected_repo}")
+
         query_result = client.query(
-            query=question,
+            query=normalized_question,
             repo=selected_repo,
             limit=8,
             max_symbols=20,
@@ -686,7 +798,7 @@ def run_gitnexus_graph(question: str, repo_name: str | None = None) -> dict[str,
         graph["processes"] = list(query_result.get("processes", [])) if isinstance(query_result, dict) else []
         graph["entrypoints"] = graph_entrypoints(query_result if isinstance(query_result, dict) else {})
 
-        target = infer_hybrid_target(question)
+        target = infer_hybrid_target(normalized_question)
         graph["target_symbol"] = target
 
         context_result: dict[str, Any] = {}
@@ -725,10 +837,67 @@ def run_gitnexus_graph(question: str, repo_name: str | None = None) -> dict[str,
         )
         graph["candidate_files"] = candidate_files
         graph["candidate_file_ranking"] = candidate_ranking
+
+        process_symbols = query_result.get("process_symbols", []) if isinstance(query_result, dict) else []
+        definitions = query_result.get("definitions", []) if isinstance(query_result, dict) else []
+
+        def _context_ref_count(payload: dict[str, Any], section: str) -> int:
+            raw = payload.get(section, {})
+            if not isinstance(raw, dict):
+                return 0
+            total = 0
+            for values in raw.values():
+                if isinstance(values, list):
+                    total += sum(1 for row in values if isinstance(row, dict))
+            return total
+
+        def _impact_ref_count(payload: dict[str, Any]) -> int:
+            by_depth = payload.get("byDepth", {})
+            if not isinstance(by_depth, dict):
+                return 0
+            total = 0
+            for values in by_depth.values():
+                if isinstance(values, list):
+                    total += sum(1 for row in values if isinstance(row, dict))
+            return total
+
+        incoming_count = _context_ref_count(context_result if isinstance(context_result, dict) else {}, "incoming")
+        outgoing_count = _context_ref_count(context_result if isinstance(context_result, dict) else {}, "outgoing")
+        impact_count = _impact_ref_count(merged_impact)
+        node_count = (
+            (len(process_symbols) if isinstance(process_symbols, list) else 0)
+            + (len(definitions) if isinstance(definitions, list) else 0)
+            + (1 if isinstance((context_result or {}).get("symbol"), dict) else 0)
+            + incoming_count
+            + outgoing_count
+        )
+        edge_count = incoming_count + outgoing_count + impact_count
+        graph["raw_counts"] = {
+            "processes": len(graph["processes"]) if isinstance(graph["processes"], list) else 0,
+            "nodes": max(node_count, 0),
+            "edges": max(edge_count, 0),
+            "files": len(candidate_files),
+        }
+
+        best_priority = 0.0
+        if isinstance(graph["processes"], list):
+            for process in graph["processes"]:
+                if not isinstance(process, dict):
+                    continue
+                try:
+                    best_priority = max(best_priority, float(process.get("priority", 0.0) or 0.0))
+                except (TypeError, ValueError):
+                    continue
+        passed = bool(best_priority >= GRAPH_PROCESS_PRIORITY_THRESHOLD or candidate_files)
+        graph["score"] = {
+            "best": round(best_priority, 4),
+            "threshold": GRAPH_PROCESS_PRIORITY_THRESHOLD,
+            "passed": passed,
+        }
     except (GitNexusClientError, HTTPException) as exc:
-        graph["errors"] = [str(exc)]
+        graph["errors"].append(str(exc))
     except Exception as exc:
-        graph["errors"] = [f"gitnexus_unavailable: {exc}"]
+        graph["errors"].append(f"gitnexus_unavailable: {exc}")
 
     return graph
 
@@ -1958,6 +2127,7 @@ def lexical_candidate_files(question: str) -> dict[str, Any]:
             "candidate_files": [],
             "file_scores": {},
             "hits": [],
+            "errors": [],
         }
 
     identifiers = extract_identifier_hints(question)
@@ -1967,6 +2137,7 @@ def lexical_candidate_files(question: str) -> dict[str, Any]:
         "candidate_files": [],
         "file_scores": {},
         "hits": [],
+        "errors": [],
     }
     if not identifiers:
         return payload
@@ -1979,11 +2150,12 @@ def lexical_candidate_files(question: str) -> dict[str, Any]:
     root = repo_root_path()
     score_map: dict[str, float] = {}
     hits: list[dict[str, Any]] = []
+    errors: list[str] = []
     globs = ["*.f", "*.for", "*.f90", "*.f95", "*.f03", "*.f08", "*.inc", "*.sh", "*.py", "*.txt", "*.conf", "*.cfg"]
 
     for token in identifiers:
         token_pattern = rf"\b{re.escape(token)}\b" if re.fullmatch(r"[a-zA-Z0-9_]+", token) else re.escape(token)
-        args = ["rg", "--no-heading", "--line-number", "--color", "never", "-S", "-m", "120", "-e", token_pattern]
+        args = ["rg", "--no-heading", "--line-number", "--color", "never", "-S", "-i", "-m", "120", "-e", token_pattern]
         for glob in globs:
             args.extend(["-g", glob])
         args.append(".")
@@ -1996,7 +2168,11 @@ def lexical_candidate_files(question: str) -> dict[str, Any]:
                 check=False,
                 timeout=1.5,
             )
-        except Exception:
+        except FileNotFoundError:
+            errors.append("rg_not_available")
+            break
+        except Exception as exc:
+            errors.append(f"rg_error:{exc.__class__.__name__}")
             continue
         if proc.returncode not in {0, 1}:
             continue
@@ -2033,6 +2209,7 @@ def lexical_candidate_files(question: str) -> dict[str, Any]:
         "candidate_files": candidate_files,
         "file_scores": file_scores,
         "hits": hits,
+        "errors": dedupe_preserve_order(errors)[:3],
     }
     lexical_cache_put(cache_key, payload)
     return payload
@@ -2288,7 +2465,14 @@ def build_context(citations: list[Citation], chunks: list[str]) -> str:
 
 
 def repo_root_path() -> Path:
-    return Path(__file__).resolve().parents[2]
+    resolved = Path(__file__).resolve()
+    candidate = resolved.parents[2]
+    # In container builds, app code may live at /app/app/main.py where parents[2] is "/".
+    if str(candidate) == candidate.root or not candidate.name:
+        fallback = resolved.parents[1]
+        if fallback.name:
+            return fallback
+    return candidate
 
 
 def read_repo_text(path: Path) -> str:
@@ -3606,6 +3790,83 @@ def _normalized_candidate_paths(paths: list[str] | None) -> list[str]:
     return dedupe_preserve_order([path for path in (normalize_file_path(item) for item in (paths or [])) if path])
 
 
+def classify_graph_fallback_reason(
+    graph_payload: dict[str, Any],
+    signals: dict[str, Any],
+    low_conf_reason: str | None,
+) -> str:
+    errors = [str(item).lower().strip() for item in (graph_payload.get("errors", []) or []) if str(item).strip()]
+    if not settings.gitnexus_enabled:
+        return "graph_disabled"
+    if any("repo_unresolved" in item for item in errors):
+        return "graph_repo_unknown"
+    if any("repo_not_indexed" in item for item in errors):
+        return "graph_not_indexed"
+    if any("gitnexus_unavailable" in item for item in errors) or any("no such file or directory: 'npx'" in item for item in errors):
+        return "graph_runtime_unavailable"
+    if low_conf_reason == "graph_no_candidates":
+        return "graph_no_candidate_files"
+    if low_conf_reason:
+        return f"retrieval_{low_conf_reason}"
+    raw_counts = graph_payload.get("raw_counts", {}) if isinstance(graph_payload, dict) else {}
+    processes = safe_int(raw_counts.get("processes")) or 0
+    files = safe_int(raw_counts.get("files")) or 0
+    if bool(signals.get("structure_intent")) and processes == 0 and files == 0:
+        return "graph_no_matches"
+    return ""
+
+
+def build_hybrid_debug_payload(
+    question: str,
+    graph_payload: dict[str, Any],
+    fallback_reason: str,
+    candidate_files_count: int,
+    citations: list[Citation],
+) -> dict[str, Any]:
+    graph_index = graph_payload.get("index", {}) if isinstance(graph_payload, dict) else {}
+    raw_counts = graph_payload.get("raw_counts", {}) if isinstance(graph_payload, dict) else {}
+    graph_score = graph_payload.get("score", {}) if isinstance(graph_payload, dict) else {}
+
+    index_present_value = graph_index.get("index_present")
+    if isinstance(index_present_value, bool):
+        graph_index_present = index_present_value
+    else:
+        graph_index_present = bool((safe_int(raw_counts.get("nodes")) or 0) > 0 or (safe_int(raw_counts.get("edges")) or 0) > 0)
+
+    best_score = float(graph_score.get("best") or 0.0)
+    threshold = float(graph_score.get("threshold") or GRAPH_PROCESS_PRIORITY_THRESHOLD)
+    passed = bool(graph_score.get("passed")) if isinstance(graph_score, dict) else False
+
+    return {
+        "graph_enabled": bool(settings.gitnexus_enabled),
+        "graph_index_present": graph_index_present,
+        "graph_query": str(graph_payload.get("query") or question),
+        "graph_query_type": "natural_language",
+        "graph_hits": {
+            "processes": safe_int(raw_counts.get("processes")) or 0,
+            "nodes": safe_int(raw_counts.get("nodes")) or 0,
+            "edges": safe_int(raw_counts.get("edges")) or 0,
+            "files": safe_int(raw_counts.get("files")) or 0,
+        },
+        "graph_score": {
+            "best": round(best_score, 4),
+            "threshold": round(threshold, 4),
+            "passed": bool(passed),
+        },
+        "fallback_reason": fallback_reason,
+        "candidate_files_count": max(int(candidate_files_count), 0),
+        "evidence_files_count": len({citation.file_path for citation in citations}),
+        "graph_repo": str(graph_payload.get("repo") or ""),
+        "graph_metadata": {
+            "repo_id": graph_index.get("repo_id"),
+            "commit_hash": graph_index.get("commit_hash"),
+            "build_timestamp": graph_index.get("build_timestamp"),
+            "node_count": graph_index.get("node_count"),
+            "edge_count": graph_index.get("edge_count"),
+        },
+    }
+
+
 def run_routed_retrieval_plan(
     question: str,
     mode: str,
@@ -3616,7 +3877,8 @@ def run_routed_retrieval_plan(
     language: str | None = None,
     source_type_filter: str | None = None,
 ) -> tuple[list[Citation], list[str], dict[str, Any], dict[str, Any], dict[str, Any], str]:
-    selected_plan = select_retrieval_plan(question=question, mode=mode)
+    normalized_question = " ".join(str(question or "").split())
+    selected_plan = select_retrieval_plan(question=normalized_question, mode=mode)
     signals = detect_route_signals(question)
     route_debug = route_debug_template(route=selected_plan, signals=signals)
     route_debug["initial_route"] = selected_plan
@@ -3629,6 +3891,8 @@ def run_routed_retrieval_plan(
     retrieval_debug: dict[str, Any] = {"subqueries": [], "candidates": []}
     citations: list[Citation] = []
     chunks: list[str] = []
+    selected_candidate_files: list[str] = []
+    low_conf_reason: str | None = None
 
     graph_done = False
     keyword_done = False
@@ -3638,7 +3902,7 @@ def run_routed_retrieval_plan(
         if graph_done:
             return
         started = time.perf_counter()
-        graph_payload = run_gitnexus_graph(question, repo_name=target_repo)
+        graph_payload = run_gitnexus_graph(normalized_question, repo_name=target_repo)
         graph_files = _normalized_candidate_paths(graph_payload.get("candidate_files", []) if isinstance(graph_payload, dict) else [])
         processes = graph_payload.get("processes", []) if isinstance(graph_payload, dict) else []
         entrypoints = graph_payload.get("entrypoints", []) if isinstance(graph_payload, dict) else []
@@ -3663,24 +3927,28 @@ def run_routed_retrieval_plan(
         if keyword_done:
             return
         started = time.perf_counter()
-        lexical_payload = lexical_candidate_files(question)
+        lexical_payload = lexical_candidate_files(normalized_question)
         keyword_files = _normalized_candidate_paths(
             lexical_payload.get("candidate_files", []) if isinstance(lexical_payload, dict) else []
         )
         hits = lexical_payload.get("hits", []) if isinstance(lexical_payload, dict) else []
-        route_debug["steps"].append(
-            {
-                "name": "keyword",
-                "ms": round((time.perf_counter() - started) * 1000.0, 2),
-                "candidates": {"files": len(keyword_files), "symbols": len(hits) if isinstance(hits, list) else 0},
-            }
-        )
+        lexical_errors = lexical_payload.get("errors", []) if isinstance(lexical_payload, dict) else []
+        keyword_step: dict[str, Any] = {
+            "name": "keyword",
+            "ms": round((time.perf_counter() - started) * 1000.0, 2),
+            "candidates": {"files": len(keyword_files), "symbols": len(hits) if isinstance(hits, list) else 0},
+        }
+        if isinstance(lexical_errors, list):
+            condensed_errors = [str(item).strip() for item in lexical_errors if str(item).strip()]
+            if condensed_errors:
+                keyword_step["errors"] = condensed_errors[:3]
+        route_debug["steps"].append(keyword_step)
         keyword_done = True
 
     def step_vector(candidate_files: list[str] | None) -> tuple[list[Citation], list[str], dict[str, Any]]:
         started = time.perf_counter()
         local_citations, local_chunks, local_debug = retrieve_with_optional_uploads(
-            question=question,
+            question=normalized_question,
             top_k=final_top_k,
             uploaded_files=[],
             scope=scope,
@@ -3719,6 +3987,17 @@ def run_routed_retrieval_plan(
 
     if selected_plan == PLAN_GRAPH_ONLY:
         step_graph()
+        fallback_reason = classify_graph_fallback_reason(graph_payload, signals, low_conf_reason=None)
+        hybrid_debug = build_hybrid_debug_payload(
+            question=normalized_question,
+            graph_payload=graph_payload,
+            fallback_reason=fallback_reason,
+            candidate_files_count=0,
+            citations=[],
+        )
+        route_debug["hybrid_debug"] = hybrid_debug
+        graph_payload["hybrid_debug"] = hybrid_debug
+        logger.info("hybrid_debug=%s", json.dumps(hybrid_debug, sort_keys=True))
         return citations, chunks, retrieval_debug, graph_payload, route_debug, selected_plan
 
     if selected_plan in {PLAN_GRAPH_PLUS_VECTOR, PLAN_GRAPH_PLUS_KEYWORD_PLUS_VECTOR}:
@@ -3734,6 +4013,7 @@ def run_routed_retrieval_plan(
     elif selected_plan == PLAN_GRAPH_PLUS_KEYWORD_PLUS_VECTOR:
         candidate_files = _normalized_candidate_paths([*graph_files, *keyword_files])
 
+    selected_candidate_files = list(candidate_files)
     citations, chunks, retrieval_debug = step_vector(candidate_files or None)
 
     low_conf_reason = low_confidence_reason(citations)
@@ -3759,9 +4039,23 @@ def run_routed_retrieval_plan(
         else:
             escalation_candidates = []
 
+        selected_candidate_files = list(escalation_candidates)
         citations, chunks, retrieval_debug = step_vector(escalation_candidates or None)
     else:
         route_debug["escalation"] = {"did_escalate": False, "reason": None}
+
+    fallback_reason = classify_graph_fallback_reason(graph_payload, signals, low_conf_reason)
+    hybrid_debug = build_hybrid_debug_payload(
+        question=normalized_question,
+        graph_payload=graph_payload,
+        fallback_reason=fallback_reason,
+        candidate_files_count=len(selected_candidate_files),
+        citations=citations,
+    )
+    route_debug["hybrid_debug"] = hybrid_debug
+    if isinstance(graph_payload, dict):
+        graph_payload["hybrid_debug"] = hybrid_debug
+    logger.info("hybrid_debug=%s", json.dumps(hybrid_debug, sort_keys=True))
 
     return citations, chunks, retrieval_debug, graph_payload, route_debug, selected_plan
 
@@ -3997,6 +4291,12 @@ def compose_hybrid_answer(
     used_fallback: bool,
 ) -> str:
     lines: list[str] = []
+    hybrid_debug = graph.get("hybrid_debug", {}) if isinstance(graph, dict) else {}
+    fallback_reason = str(hybrid_debug.get("fallback_reason") or "")
+    graph_meta = hybrid_debug.get("graph_metadata", {}) if isinstance(hybrid_debug, dict) else {}
+    repo_id = str(graph_meta.get("repo_id") or graph.get("repo") or "unknown-repo")
+    commit_hash = str(graph_meta.get("commit_hash") or "unknown")
+
     lines.append("I. System Map (graph)")
     processes = graph.get("processes", []) if isinstance(graph, dict) else []
     if isinstance(processes, list) and processes:
@@ -4018,6 +4318,15 @@ def compose_hybrid_answer(
         condensed_errors = [str(item).strip() for item in graph_errors if str(item).strip()]
         if condensed_errors:
             lines.append(f"- Graph errors: {'; '.join(condensed_errors[:3])}")
+    if fallback_reason == "graph_not_indexed":
+        lines.append(
+            f"- Graph not indexed for repo {repo_id} at commit {commit_hash}. "
+            "Run `npx -y gitnexus@latest analyze` in the repo and restart the service."
+        )
+    elif fallback_reason == "graph_runtime_unavailable":
+        lines.append("- Graph runtime unavailable in this deployment (missing `npx` and/or GitNexus MCP runtime).")
+    elif fallback_reason == "graph_repo_unknown":
+        lines.append("- Graph repo id is unresolved. Set `GITNEXUS_DEFAULT_REPO` to a valid indexed repo.")
 
     entrypoints = graph.get("entrypoints", []) if isinstance(graph, dict) else []
     if isinstance(entrypoints, list) and entrypoints:
@@ -4062,7 +4371,7 @@ def compose_hybrid_answer(
     else:
         lines.append("- Refine the target symbol/file name and rerun Hybrid mode.")
     if not candidate_files:
-        lines.append("- Graph candidate files were empty; broaden query terms or run a direct graph query first.")
+        lines.append("- Graph candidate files were empty; inspect `hybrid_debug.fallback_reason` and graph diagnostics.")
         if isinstance(graph_errors, list) and any(str(item).strip() for item in graph_errors):
             lines.append("- Graph engine reported an error; verify GitNexus runtime/index availability for this deployment.")
     else:
@@ -4218,7 +4527,10 @@ def query(payload: QueryRequest) -> QueryResponse:
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Routed retrieval failed: {exc}") from exc
 
-    debug_payload: dict[str, Any] = {"route_debug": route_debug}
+    debug_payload: dict[str, Any] = {
+        "route_debug": route_debug,
+        "hybrid_debug": route_debug.get("hybrid_debug", {}),
+    }
 
     if routed_plan == PLAN_GRAPH_ONLY:
         answer = compose_hybrid_answer(
@@ -4269,6 +4581,7 @@ def query(payload: QueryRequest) -> QueryResponse:
             )
             verbose_debug["graph"] = graph_payload
             verbose_debug["route_debug"] = route_debug
+            verbose_debug["hybrid_debug"] = route_debug.get("hybrid_debug", {})
             debug_payload = verbose_debug
         return QueryResponse(
             answer=answer,
@@ -4290,6 +4603,7 @@ def query(payload: QueryRequest) -> QueryResponse:
                 latency_ms=(time.perf_counter() - started) * 1000.0,
             )
             verbose_debug["route_debug"] = route_debug
+            verbose_debug["hybrid_debug"] = route_debug.get("hybrid_debug", {})
             debug_payload = verbose_debug
         return QueryResponse(
             answer=insufficient_evidence_answer(payload.question, suggestions, missing_terms=missing_terms),
@@ -4312,6 +4626,7 @@ def query(payload: QueryRequest) -> QueryResponse:
                 latency_ms=(time.perf_counter() - started) * 1000.0,
             )
             verbose_debug["route_debug"] = route_debug
+            verbose_debug["hybrid_debug"] = route_debug.get("hybrid_debug", {})
             debug_payload = verbose_debug
         return QueryResponse(
             answer=insufficient_evidence_answer(payload.question, suggestions, missing_terms=missing_terms),
@@ -4338,6 +4653,7 @@ def query(payload: QueryRequest) -> QueryResponse:
             latency_ms=(time.perf_counter() - started) * 1000.0,
         )
         verbose_debug["route_debug"] = route_debug
+        verbose_debug["hybrid_debug"] = route_debug.get("hybrid_debug", {})
         debug_payload = verbose_debug
     return QueryResponse(
         answer=answer,

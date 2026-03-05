@@ -52,6 +52,18 @@ Every `/api/query` response includes `debug.route_debug` with:
 - `budgets`
 - `steps` (timings + candidates)
 - `escalation`
+- `hybrid_debug` (graph diagnostics)
+
+`debug.hybrid_debug` and `debug.route_debug.hybrid_debug` include:
+- `graph_enabled`
+- `graph_index_present`
+- `graph_query`
+- `graph_hits` (`processes`, `nodes`, `edges`, `files`)
+- `graph_score` (`best`, `threshold`, `passed`)
+- `fallback_reason`
+- `candidate_files_count`
+- `evidence_files_count`
+- `graph_metadata` (`repo_id`, `commit_hash`, `build_timestamp`, `node_count`, `edge_count`)
 
 ## Extension Points
 - Add new intent phrases in `STRUCTURE_HINTS`

@@ -119,6 +119,50 @@ class HybridPipelineTests(unittest.TestCase):
             main.settings.gitnexus_default_repo = original_default_repo
             main.settings.pinecone_namespace = original_namespace
 
+    def test_default_gitnexus_repo_prefers_namespace_over_generic_config(self) -> None:
+        original_default_repo = main.settings.gitnexus_default_repo
+        original_namespace = main.settings.pinecone_namespace
+        try:
+            main.settings.gitnexus_default_repo = "app"
+            main.settings.pinecone_namespace = "nshmp-main:v1"
+            self.assertEqual(main.default_gitnexus_repo(), "nshmp-main")
+        finally:
+            main.settings.gitnexus_default_repo = original_default_repo
+            main.settings.pinecone_namespace = original_namespace
+
+    def test_resolve_gitnexus_repo_name_prefers_namespace_when_generic_selected(self) -> None:
+        original_namespace = main.settings.pinecone_namespace
+        try:
+            main.settings.pinecone_namespace = "nshmp-main:v1"
+            resolved = main.resolve_gitnexus_repo_name("app", ["app", "nshmp-main"])
+            self.assertEqual(resolved, "nshmp-main")
+        finally:
+            main.settings.pinecone_namespace = original_namespace
+
+    def test_build_hybrid_graph_canvas_contains_nodes_and_edges(self) -> None:
+        payload = main.build_hybrid_graph_canvas(
+            question="What calls GailTable?",
+            query_result={
+                "processes": [{"id": "p1", "summary": "Main -> GailTable", "priority": 0.9}],
+                "process_symbols": [{"id": "GailTable", "process_id": "p1", "filePath": "src/deaggGRID.f"}],
+                "definitions": [{"id": "GailTable", "filePath": "src/deaggGRID.f"}],
+            },
+            context_result={"symbol": {"id": "GailTable", "filePath": "src/deaggGRID.f"}},
+            impact_result={"byDepth": {"1": [{"id": "hazall", "filePath": "src/hazallXL.v5.f"}]}},
+            candidate_ranking=[{"file_path": "src/deaggGRID.f", "score": 3.1}],
+        )
+        self.assertTrue(payload.get("nodes"))
+        self.assertTrue(payload.get("edges"))
+
+    def test_gitnexus_bootstrap_clone_url_injects_token(self) -> None:
+        original_token = main.settings.gitnexus_bootstrap_git_token
+        try:
+            main.settings.gitnexus_bootstrap_git_token = "abc123"
+            clone_url = main.gitnexus_bootstrap_clone_url("https://github.com/org/private-repo")
+            self.assertIn("x-access-token:abc123@", clone_url)
+        finally:
+            main.settings.gitnexus_bootstrap_git_token = original_token
+
     def test_run_routed_hybrid_includes_graph_debug_when_graph_hits_exist(self) -> None:
         original_run_gitnexus_graph = main.run_gitnexus_graph
         original_retrieve = main.retrieve_with_optional_uploads

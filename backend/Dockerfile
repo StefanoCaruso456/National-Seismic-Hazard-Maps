@@ -5,7 +5,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PATH="/app/.venv/bin:${PATH}"
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends nodejs npm ripgrep \
+    && apt-get install -y --no-install-recommends git nodejs npm ripgrep \
     && npm install -g gitnexus@latest \
     && rm -rf /var/lib/apt/lists/*
 

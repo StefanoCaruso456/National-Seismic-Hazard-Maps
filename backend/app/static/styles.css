@@ -567,6 +567,33 @@ body {
   padding: 8px;
 }
 
+.hybrid-graph-wrap {
+  display: grid;
+  gap: 6px;
+  border: 1px solid rgba(95, 137, 149, 0.2);
+  border-radius: 10px;
+  padding: 8px;
+  background: rgba(255, 255, 255, 0.52);
+}
+
+.hybrid-graph-canvas {
+  width: 100%;
+  min-height: 280px;
+  display: block;
+  border-radius: 8px;
+  background:
+    radial-gradient(circle at 15% 15%, rgba(212, 87, 87, 0.08), transparent 40%),
+    radial-gradient(circle at 90% 10%, rgba(63, 125, 149, 0.08), transparent 38%),
+    linear-gradient(160deg, rgba(245, 250, 252, 0.9), rgba(236, 244, 247, 0.82));
+}
+
+.hybrid-graph-legend {
+  font-size: 11px;
+  letter-spacing: 0.01em;
+  color: var(--ink-soft);
+  word-spacing: 10px;
+}
+
 .hybrid-panel-empty {
   margin: 0;
   font-size: 12px;

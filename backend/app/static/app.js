@@ -1397,6 +1397,218 @@ function normalizeDiagramText(text) {
   return next || raw;
 }
 
+const HYBRID_GRAPH_COLORS = {
+  query: "#d45757",
+  process: "#3f7d95",
+  symbol: "#6472c9",
+  entrypoint: "#8c5fb5",
+  file: "#2f9f84",
+  impact: "#e48f3b",
+  default: "#7a8a99",
+  edge: "rgba(70, 92, 105, 0.35)",
+};
+
+function buildHybridGraphModel(graphPayload) {
+  const graph = graphPayload && typeof graphPayload === "object" ? graphPayload : {};
+  const canvas = graph.canvas && typeof graph.canvas === "object" ? graph.canvas : {};
+  const rawNodes = Array.isArray(canvas.nodes) ? canvas.nodes : [];
+  const rawEdges = Array.isArray(canvas.edges) ? canvas.edges : [];
+
+  const nodes = [];
+  const edges = [];
+  const seenNodes = new Set();
+  const seenEdges = new Set();
+
+  const addNode = (id, label, kind = "default", size = 1, path = "") => {
+    const nodeId = String(id || "").trim();
+    if (!nodeId || seenNodes.has(nodeId)) return;
+    seenNodes.add(nodeId);
+    nodes.push({
+      id: nodeId,
+      label: String(label || nodeId).slice(0, 90),
+      kind: String(kind || "default"),
+      size: Math.max(Number(size) || 1, 0.5),
+      path: String(path || ""),
+    });
+  };
+
+  const addEdge = (source, target, kind = "edge") => {
+    const src = String(source || "").trim();
+    const dst = String(target || "").trim();
+    if (!src || !dst) return;
+    const edgeKey = `${src}|${dst}|${kind}`;
+    if (seenEdges.has(edgeKey)) return;
+    seenEdges.add(edgeKey);
+    edges.push({ source: src, target: dst, kind: String(kind || "edge") });
+  };
+
+  if (rawNodes.length) {
+    rawNodes.forEach((node) => {
+      if (!node || typeof node !== "object") return;
+      addNode(node.id, node.label, node.kind, node.size, node.path);
+    });
+    rawEdges.forEach((edge) => {
+      if (!edge || typeof edge !== "object") return;
+      addEdge(edge.source, edge.target, edge.kind);
+    });
+  }
+
+  if (!nodes.length) {
+    const queryId = "query:hybrid";
+    addNode(queryId, "Hybrid Query", "query", 1.5);
+    const processes = Array.isArray(graph.processes) ? graph.processes : [];
+    processes.slice(0, 12).forEach((process, idx) => {
+      const label = String(process?.summary || process?.id || `Process ${idx + 1}`);
+      const nodeId = `process:${idx}:${label.toLowerCase().replace(/[^a-z0-9_]+/g, "_")}`;
+      addNode(nodeId, label, "process", 1.1);
+      addEdge(queryId, nodeId, "process");
+    });
+    const entrypoints = Array.isArray(graph.entrypoints) ? graph.entrypoints : [];
+    entrypoints.slice(0, 10).forEach((entry, idx) => {
+      const label = String(entry || `Entrypoint ${idx + 1}`);
+      const nodeId = `entry:${idx}:${label.toLowerCase().replace(/[^a-z0-9_]+/g, "_")}`;
+      addNode(nodeId, label, "entrypoint", 1.0);
+      addEdge(queryId, nodeId, "entrypoint");
+    });
+    const candidateFiles = Array.isArray(graph.candidate_files) ? graph.candidate_files : [];
+    candidateFiles.slice(0, 18).forEach((file, idx) => {
+      const path = String(file || "").trim();
+      if (!path) return;
+      const fileName = path.split("/").pop() || path;
+      const nodeId = `file:${idx}:${path.toLowerCase().replace(/[^a-z0-9_./-]+/g, "_")}`;
+      addNode(nodeId, fileName, "file", 0.95, path);
+      addEdge(queryId, nodeId, "candidate");
+    });
+  }
+
+  return { nodes: nodes.slice(0, 120), edges: edges.slice(0, 220) };
+}
+
+function drawHybridGraphCanvas(canvas, model) {
+  if (!canvas || !model || !Array.isArray(model.nodes) || !model.nodes.length) return;
+  const host = canvas.parentElement;
+  const width = Math.max(300, Math.min(900, (host?.clientWidth || 640) - 6));
+  const height = 300;
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.floor(width * dpr);
+  canvas.height = Math.floor(height * dpr);
+  canvas.style.width = `${width}px`;
+  canvas.style.height = `${height}px`;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, width, height);
+
+  const nodesById = new Map(model.nodes.map((node) => [node.id, node]));
+  const queryNode = model.nodes.find((node) => node.kind === "query") || model.nodes[0];
+  const centerX = width * 0.5;
+  const centerY = height * 0.5;
+  const positions = new Map();
+
+  model.nodes.forEach((node) => {
+    if (node.id === queryNode.id) {
+      positions.set(node.id, { x: centerX, y: centerY });
+    }
+  });
+
+  const orderedKinds = ["process", "symbol", "entrypoint", "impact", "file", "default"];
+  const ringRadius = {
+    process: Math.min(width, height) * 0.2,
+    symbol: Math.min(width, height) * 0.3,
+    entrypoint: Math.min(width, height) * 0.37,
+    impact: Math.min(width, height) * 0.43,
+    file: Math.min(width, height) * 0.48,
+    default: Math.min(width, height) * 0.52,
+  };
+  const grouped = {};
+  orderedKinds.forEach((kind) => { grouped[kind] = []; });
+  model.nodes.forEach((node) => {
+    if (node.id === queryNode.id) return;
+    const kind = orderedKinds.includes(node.kind) ? node.kind : "default";
+    grouped[kind].push(node);
+  });
+
+  let angleOffset = -Math.PI / 2;
+  orderedKinds.forEach((kind) => {
+    const group = grouped[kind];
+    if (!group.length) return;
+    const radius = ringRadius[kind];
+    group.forEach((node, idx) => {
+      const angle = angleOffset + ((Math.PI * 2 * idx) / group.length);
+      positions.set(node.id, {
+        x: centerX + Math.cos(angle) * radius,
+        y: centerY + Math.sin(angle) * radius,
+      });
+    });
+    angleOffset += 0.18;
+  });
+
+  ctx.strokeStyle = HYBRID_GRAPH_COLORS.edge;
+  ctx.lineWidth = 1;
+  model.edges.forEach((edge) => {
+    const source = positions.get(edge.source);
+    const target = positions.get(edge.target);
+    if (!source || !target) return;
+    ctx.beginPath();
+    ctx.moveTo(source.x, source.y);
+    ctx.lineTo(target.x, target.y);
+    ctx.stroke();
+  });
+
+  const maxLabels = model.nodes.length > 40 ? 24 : 999;
+  let labelsShown = 0;
+  model.nodes.forEach((node) => {
+    const pos = positions.get(node.id);
+    if (!pos) return;
+    const color = HYBRID_GRAPH_COLORS[node.kind] || HYBRID_GRAPH_COLORS.default;
+    const radius = node.id === queryNode.id ? 10 : Math.max(4, Math.min(9, 3 + node.size * 2.2));
+    ctx.beginPath();
+    ctx.fillStyle = color;
+    ctx.globalAlpha = node.id === queryNode.id ? 1 : 0.92;
+    ctx.arc(pos.x, pos.y, radius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = "rgba(255,255,255,0.5)";
+    ctx.lineWidth = 0.8;
+    ctx.stroke();
+
+    if (labelsShown >= maxLabels) return;
+    if (node.kind === "file" && model.nodes.length > 26) return;
+    labelsShown += 1;
+    ctx.fillStyle = "rgba(31, 46, 58, 0.86)";
+    ctx.font = "11px 'JetBrains Mono', 'IBM Plex Mono', monospace";
+    ctx.textBaseline = "middle";
+    ctx.fillText(String(node.label || "").slice(0, 30), pos.x + radius + 4, pos.y);
+  });
+}
+
+function renderHybridGraphCanvas(panel, graphPayload) {
+  const model = buildHybridGraphModel(graphPayload);
+  const wrap = document.createElement("div");
+  wrap.className = "hybrid-graph-wrap";
+
+  if (!model.nodes.length) {
+    const empty = document.createElement("p");
+    empty.className = "hybrid-panel-empty";
+    empty.textContent = "No graph nodes returned.";
+    wrap.appendChild(empty);
+    panel.appendChild(wrap);
+    return;
+  }
+
+  const canvas = document.createElement("canvas");
+  canvas.className = "hybrid-graph-canvas";
+  wrap.appendChild(canvas);
+
+  const legend = document.createElement("div");
+  legend.className = "hybrid-graph-legend";
+  legend.textContent = "query process symbol entrypoint impact file";
+  wrap.appendChild(legend);
+
+  panel.appendChild(wrap);
+  drawHybridGraphCanvas(canvas, model);
+}
+
 function renderHybridArchitecturePanel(panel, graphPayload) {
   panel.innerHTML = "";
   const title = document.createElement("h5");
@@ -1404,6 +1616,7 @@ function renderHybridArchitecturePanel(panel, graphPayload) {
   panel.appendChild(title);
 
   const graph = graphPayload && typeof graphPayload === "object" ? graphPayload : {};
+  renderHybridGraphCanvas(panel, graph);
   const processes = Array.isArray(graph.processes) ? graph.processes : [];
   const entrypoints = Array.isArray(graph.entrypoints) ? graph.entrypoints : [];
   const candidateFiles = Array.isArray(graph.candidate_files) ? graph.candidate_files : [];

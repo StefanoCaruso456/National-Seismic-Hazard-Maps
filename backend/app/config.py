@@ -40,6 +40,14 @@ class Settings(BaseSettings):
     gitnexus_mcp_command: str = "npx -y gitnexus@latest mcp"
     gitnexus_call_timeout_seconds: float = 30.0
     gitnexus_startup_timeout_seconds: float = 45.0
+    gitnexus_bootstrap_enabled: bool = False
+    gitnexus_bootstrap_repo_url: str | None = None
+    gitnexus_bootstrap_repo_path: str = "/tmp/nshmp-main"
+    gitnexus_bootstrap_repo_ref: str | None = None
+    gitnexus_bootstrap_git_token: str | None = None
+    gitnexus_analyze_command: str = "gitnexus analyze"
+    gitnexus_analyze_timeout_seconds: float = 180.0
+    repo_root_override: str | None = None
     rag_max_context_chunks: int = 6
     pinecone_fallback_namespace: str | None = None
     startup_smoke_mode: str = "off"

@@ -1,0 +1,5 @@
+[phases.setup]
+# Required for Hybrid retrieval primitives in production:
+# - npx -> GitNexus MCP launcher
+# - rg  -> deterministic lexical candidate generation
+nixPkgs = ["python311", "nodejs", "ripgrep"]

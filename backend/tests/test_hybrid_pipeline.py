@@ -94,6 +94,17 @@ class HybridPipelineTests(unittest.TestCase):
         )
         self.assertEqual(reason, "graph_runtime_unavailable")
 
+    def test_fallback_reason_reports_graph_not_indexed_from_runtime_error(self) -> None:
+        reason = main.classify_graph_fallback_reason(
+            graph_payload={
+                "errors": ["Error: No indexed repositories. Run: gitnexus analyze"],
+                "raw_counts": {"processes": 0, "nodes": 0, "edges": 0, "files": 0},
+            },
+            signals={"structure_intent": True},
+            low_conf_reason="graph_unavailable",
+        )
+        self.assertEqual(reason, "graph_not_indexed")
+
     def test_default_gitnexus_repo_never_empty(self) -> None:
         original_repo_root_path = main.repo_root_path
         original_default_repo = main.settings.gitnexus_default_repo

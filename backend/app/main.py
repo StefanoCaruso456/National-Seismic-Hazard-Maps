@@ -50,7 +50,7 @@ WORD_PATTERN = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]*")
 IDENTIFIER_HEAVY_PATTERN = re.compile(
     r"\b[A-Z][A-Z0-9_]{2,}\b|\b[a-z][A-Za-z0-9_]*[A-Z][A-Za-z0-9_]*\b|\b[A-Za-z_]*\d+[A-Za-z0-9_]*\b|\b[A-Za-z_]+_[A-Za-z0-9_]+\b|\b[A-Za-z][A-Za-z0-9_]*-[A-Za-z0-9_-]+\b"
 )
-CALL_TARGET_PATTERN = re.compile(r"\bcall\s+([a-zA-Z_][a-zA-Z0-9_]*)", re.IGNORECASE)
+CALL_TARGET_PATTERN = re.compile(r"\bcalls?\s+([a-zA-Z_][a-zA-Z0-9_]*)", re.IGNORECASE)
 FILE_TOKEN_PATTERN = re.compile(r"\b([a-zA-Z0-9_.-]+\.(?:f|for|f90|f95|f03|f08|inc|py|sh|txt|cfg|conf))\b", re.IGNORECASE)
 SAFE_UPLOAD_NAME_PATTERN = re.compile(r"[^a-zA-Z0-9._-]+")
 SAFE_PROJECT_ID_PATTERN = re.compile(r"[^a-zA-Z0-9._-]+")
@@ -118,6 +118,19 @@ IDENTIFIER_STOPWORDS = {
     "code",
     "file",
     "files",
+    "dependency",
+    "dependencies",
+    "impact",
+    "impacts",
+    "downstream",
+    "upstream",
+    "chain",
+    "calls",
+    "called",
+    "routine",
+    "routines",
+    "citation",
+    "citations",
     "function",
     "functions",
     "subroutine",
@@ -575,16 +588,28 @@ def close_gitnexus_client() -> None:
 
 
 def infer_hybrid_target(question: str) -> str | None:
+    for value in CALL_TARGET_PATTERN.findall(question):
+        normalized = normalize_focus_term(str(value))
+        lowered = normalized.lower()
+        if normalized and lowered not in IDENTIFIER_STOPWORDS:
+            return normalized
+
     focus_terms = extract_focus_terms(question)
     if focus_terms:
         return str(focus_terms[0]).strip()
+
+    identifier_hints = extract_identifier_hints(question)
+    for ident in identifier_hints:
+        lowered = str(ident).lower().strip()
+        if lowered and lowered not in IDENTIFIER_STOPWORDS:
+            return ident
 
     _, identifiers = tokenize_question(question)
     if not identifiers:
         return None
     ranked = sorted(identifiers, key=lambda item: (-len(item), item))
     for ident in ranked:
-        if ident in {"where", "which", "what", "files", "function", "subroutine"}:
+        if ident in IDENTIFIER_STOPWORDS:
             continue
         return ident
     return None
@@ -3617,16 +3642,20 @@ def run_routed_retrieval_plan(
         graph_files = _normalized_candidate_paths(graph_payload.get("candidate_files", []) if isinstance(graph_payload, dict) else [])
         processes = graph_payload.get("processes", []) if isinstance(graph_payload, dict) else []
         entrypoints = graph_payload.get("entrypoints", []) if isinstance(graph_payload, dict) else []
-        route_debug["steps"].append(
-            {
-                "name": "graph",
-                "ms": round((time.perf_counter() - started) * 1000.0, 2),
-                "candidates": {
-                    "files": len(graph_files),
-                    "symbols": len(entrypoints) + (len(processes) if isinstance(processes, list) else 0),
-                },
-            }
-        )
+        graph_errors = graph_payload.get("errors", []) if isinstance(graph_payload, dict) else []
+        graph_step: dict[str, Any] = {
+            "name": "graph",
+            "ms": round((time.perf_counter() - started) * 1000.0, 2),
+            "candidates": {
+                "files": len(graph_files),
+                "symbols": len(entrypoints) + (len(processes) if isinstance(processes, list) else 0),
+            },
+        }
+        if isinstance(graph_errors, list):
+            condensed_errors = [str(item).strip() for item in graph_errors if str(item).strip()]
+            if condensed_errors:
+                graph_step["errors"] = condensed_errors[:3]
+        route_debug["steps"].append(graph_step)
         graph_done = True
 
     def step_keyword() -> None:
@@ -3708,6 +3737,12 @@ def run_routed_retrieval_plan(
     citations, chunks, retrieval_debug = step_vector(candidate_files or None)
 
     low_conf_reason = low_confidence_reason(citations)
+    if not low_conf_reason and selected_plan in {PLAN_GRAPH_PLUS_VECTOR, PLAN_GRAPH_PLUS_KEYWORD_PLUS_VECTOR}:
+        graph_errors = graph_payload.get("errors", []) if isinstance(graph_payload, dict) else []
+        if isinstance(graph_errors, list) and any(str(item).strip() for item in graph_errors):
+            low_conf_reason = "graph_unavailable"
+        elif bool(signals.get("structure_intent")) and not graph_files:
+            low_conf_reason = "graph_no_candidates"
     next_plan = escalated_plan(current_plan=selected_plan, did_escalate=False) if low_conf_reason else None
     if next_plan:
         route_debug["escalation"] = {"did_escalate": True, "reason": low_conf_reason}
@@ -3978,6 +4013,12 @@ def compose_hybrid_answer(
     else:
         lines.append("- No process-level graph flow matched strongly for this question.")
 
+    graph_errors = graph.get("errors", []) if isinstance(graph, dict) else []
+    if isinstance(graph_errors, list):
+        condensed_errors = [str(item).strip() for item in graph_errors if str(item).strip()]
+        if condensed_errors:
+            lines.append(f"- Graph errors: {'; '.join(condensed_errors[:3])}")
+
     entrypoints = graph.get("entrypoints", []) if isinstance(graph, dict) else []
     if isinstance(entrypoints, list) and entrypoints:
         lines.append(f"- Entrypoints/signals: {', '.join(str(item) for item in entrypoints[:8])}")
@@ -4022,6 +4063,8 @@ def compose_hybrid_answer(
         lines.append("- Refine the target symbol/file name and rerun Hybrid mode.")
     if not candidate_files:
         lines.append("- Graph candidate files were empty; broaden query terms or run a direct graph query first.")
+        if isinstance(graph_errors, list) and any(str(item).strip() for item in graph_errors):
+            lines.append("- Graph engine reported an error; verify GitNexus runtime/index availability for this deployment.")
     else:
         lines.append("- If needed, run focused follow-up on one candidate file with mode=search for exhaustive references.")
     return "\n".join(lines)

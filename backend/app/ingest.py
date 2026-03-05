@@ -397,10 +397,15 @@ def ingest(args: argparse.Namespace) -> None:
             if not checked_index_dimension:
                 ensure_index_dimension_match(index_dim=index_dim, embedding_dim=embedding_dim)
                 checked_index_dimension = True
+            repo_name = repo_root.name
             metadata = {
                 "file_path": chunk.file_path,
                 "line_start": chunk.line_start,
                 "line_end": chunk.line_end,
+                # Alias fields used by some hybrid retrieval stacks.
+                "start_line": chunk.line_start,
+                "end_line": chunk.line_end,
+                "repo": repo_name,
                 "section_name": chunk.section_name,
                 "language": "fortran",
                 "source_type": "repo",

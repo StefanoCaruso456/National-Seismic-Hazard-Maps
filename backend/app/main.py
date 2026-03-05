@@ -19,6 +19,8 @@ from pinecone import Pinecone
 from pydantic import BaseModel, Field, ValidationError
 
 from app.config import settings
+from app.gitnexus_client import GitNexusClient, GitNexusClientError
+from app.hybrid import extract_ranked_candidate_files, normalize_file_path, should_run_impact
 from app.ingest import (
     FORTRAN_EXTENSIONS,
     chunk_fortran_file,
@@ -52,7 +54,7 @@ FORTRAN_LOOP_START_PATTERN = re.compile(
 FORTRAN_LOOP_END_PATTERN = re.compile(r"^\s*(?:end\s*do|enddo|\d+\s+continue)\b", re.IGNORECASE)
 FORTRAN_IO_PATTERN = re.compile(r"\b(open|read|write|inquire|rewind|backspace|close)\b", re.IGNORECASE)
 CONFIG_DIR_HINTS = ("conf/", "etc/", "scripts/", "makefile", "readme", "run_", "run.")
-MODE_VALUES = {"chat", "search", "patterns", "dependencies"}
+MODE_VALUES = {"chat", "search", "patterns", "dependencies", "hybrid", "graph"}
 FILTERABLE_LANGUAGES = {"fortran", "text", "pdf"}
 FILTERABLE_SOURCE_TYPES = {"repo", "upload", "temp-upload"}
 STARTUP_SMOKE_MODES = {"off", "warn", "strict"}
@@ -101,6 +103,8 @@ class Citation(BaseModel):
 class QueryResponse(BaseModel):
     answer: str
     citations: list[Citation] = Field(default_factory=list)
+    graph: dict[str, Any] = Field(default_factory=dict)
+    evidence: list[dict[str, Any]] = Field(default_factory=list)
     evidence_strength: dict[str, Any] = Field(default_factory=dict)
     debug: dict[str, Any] = Field(default_factory=dict)
 
@@ -182,6 +186,9 @@ class RetrievalInfoResponse(BaseModel):
     query_top_k_default: int = 5
     query_top_k_min: int = 1
     query_top_k_max: int = 20
+    hybrid_top_k_default: int = 12
+    hybrid_max_candidate_files: int = 50
+    gitnexus_enabled: bool = True
 
 
 class UploadFileRecord(BaseModel):
@@ -233,6 +240,7 @@ class UploadPinRequest(BaseModel):
 
 openai_client: OpenAI | None = None
 pinecone_client: Pinecone | None = None
+gitnexus_client: GitNexusClient | None = None
 startup_smoke_state: dict[str, Any] = {
     "mode": "off",
     "checked_at": None,
@@ -389,6 +397,11 @@ def startup_event() -> None:
     apply_startup_smoke_probe()
 
 
+@app.on_event("shutdown")
+def shutdown_event() -> None:
+    close_gitnexus_client()
+
+
 @app.get("/health")
 def health() -> dict:
     mode = str(startup_smoke_state.get("mode", "off"))
@@ -430,6 +443,9 @@ def retrieval_info() -> RetrievalInfoResponse:
         upload_chunk_overlap_tokens=UPLOAD_OVERLAP_TOKENS,
         repo_url=DEFAULT_REPO_URL,
         default_project_id=default_project,
+        hybrid_top_k_default=max(settings.hybrid_top_k_default, 1),
+        hybrid_max_candidate_files=max(settings.hybrid_max_candidate_files, 1),
+        gitnexus_enabled=bool(settings.gitnexus_enabled),
     )
 
 
@@ -451,6 +467,173 @@ def get_pinecone_index():
     if pinecone_client is None:
         pinecone_client = Pinecone(api_key=settings.pinecone_api_key)
     return pinecone_client.Index(settings.pinecone_index_name)
+
+
+def default_gitnexus_repo() -> str:
+    configured = (settings.gitnexus_default_repo or "").strip()
+    if configured:
+        return configured
+    return repo_root_path().name
+
+
+def get_gitnexus_client() -> GitNexusClient:
+    global gitnexus_client
+    if not settings.gitnexus_enabled:
+        raise HTTPException(status_code=503, detail="GitNexus is disabled by configuration")
+    if gitnexus_client is None:
+        gitnexus_client = GitNexusClient(
+            command=settings.gitnexus_mcp_command,
+            default_repo=default_gitnexus_repo(),
+            startup_timeout_seconds=settings.gitnexus_startup_timeout_seconds,
+            call_timeout_seconds=settings.gitnexus_call_timeout_seconds,
+        )
+    return gitnexus_client
+
+
+def close_gitnexus_client() -> None:
+    global gitnexus_client
+    if gitnexus_client is None:
+        return
+    try:
+        gitnexus_client.close()
+    except Exception:
+        pass
+    finally:
+        gitnexus_client = None
+
+
+def infer_hybrid_target(question: str) -> str | None:
+    focus_terms = extract_focus_terms(question)
+    if focus_terms:
+        return str(focus_terms[0]).strip()
+
+    _, identifiers = tokenize_question(question)
+    if not identifiers:
+        return None
+    ranked = sorted(identifiers, key=lambda item: (-len(item), item))
+    for ident in ranked:
+        if ident in {"where", "which", "what", "files", "function", "subroutine"}:
+            continue
+        return ident
+    return None
+
+
+def merge_impact_by_depth(
+    upstream: dict[str, Any] | None,
+    downstream: dict[str, Any] | None,
+) -> dict[str, Any]:
+    merged_rows: dict[str, list[dict[str, Any]]] = {}
+    for payload in (upstream, downstream):
+        if not isinstance(payload, dict):
+            continue
+        by_depth = payload.get("byDepth", {})
+        if not isinstance(by_depth, dict):
+            continue
+        for depth_key, values in by_depth.items():
+            if not isinstance(values, list):
+                continue
+            bucket = merged_rows.setdefault(str(depth_key), [])
+            for row in values:
+                if isinstance(row, dict):
+                    bucket.append(row)
+    target = None
+    if isinstance(upstream, dict):
+        target = upstream.get("target")
+    if target is None and isinstance(downstream, dict):
+        target = downstream.get("target")
+    return {"target": target, "byDepth": merged_rows}
+
+
+def graph_entrypoints(query_result: dict[str, Any]) -> list[str]:
+    processes = query_result.get("processes", []) if isinstance(query_result, dict) else []
+    if not isinstance(processes, list):
+        return []
+    labels: list[str] = []
+    for row in processes:
+        if not isinstance(row, dict):
+            continue
+        summary = str(row.get("summary") or row.get("id") or "").strip()
+        if not summary:
+            continue
+        labels.append(summary)
+        if len(labels) >= 8:
+            break
+    return dedupe_preserve_order(labels)
+
+
+def run_gitnexus_graph(question: str, repo_name: str | None = None) -> dict[str, Any]:
+    selected_repo = (repo_name or default_gitnexus_repo()).strip()
+    graph: dict[str, Any] = {
+        "repo": selected_repo,
+        "processes": [],
+        "entrypoints": [],
+        "impact": {},
+        "candidate_files": [],
+        "candidate_file_ranking": [],
+        "target_symbol": None,
+        "errors": [],
+    }
+    if not settings.gitnexus_enabled:
+        graph["errors"] = ["gitnexus_disabled"]
+        return graph
+
+    try:
+        client = get_gitnexus_client()
+        query_result = client.query(
+            query=question,
+            repo=selected_repo,
+            limit=8,
+            max_symbols=20,
+            include_content=False,
+        )
+        graph["processes"] = list(query_result.get("processes", [])) if isinstance(query_result, dict) else []
+        graph["entrypoints"] = graph_entrypoints(query_result if isinstance(query_result, dict) else {})
+
+        target = infer_hybrid_target(question)
+        graph["target_symbol"] = target
+
+        context_result: dict[str, Any] = {}
+        if target:
+            context_result = client.context(name=target, repo=selected_repo, include_content=False)
+            if isinstance(context_result, dict) and context_result.get("error"):
+                graph["errors"].append(str(context_result.get("error")))
+
+        upstream_impact: dict[str, Any] = {}
+        downstream_impact: dict[str, Any] = {}
+        if target and should_run_impact(question):
+            upstream_impact = client.impact(
+                target=target,
+                direction="upstream",
+                repo=selected_repo,
+                max_depth=3,
+                min_confidence=0.75,
+                include_tests=False,
+            )
+            downstream_impact = client.impact(
+                target=target,
+                direction="downstream",
+                repo=selected_repo,
+                max_depth=3,
+                min_confidence=0.75,
+                include_tests=False,
+            )
+        graph["impact"] = {"upstream": upstream_impact, "downstream": downstream_impact}
+
+        merged_impact = merge_impact_by_depth(upstream_impact, downstream_impact)
+        candidate_files, candidate_ranking = extract_ranked_candidate_files(
+            query_result=query_result if isinstance(query_result, dict) else {},
+            context_result=context_result if isinstance(context_result, dict) else {},
+            impact_result=merged_impact,
+            max_candidate_files=max(settings.hybrid_max_candidate_files, 1),
+        )
+        graph["candidate_files"] = candidate_files
+        graph["candidate_file_ranking"] = candidate_ranking
+    except (GitNexusClientError, HTTPException) as exc:
+        graph["errors"] = [str(exc)]
+    except Exception as exc:
+        graph["errors"] = [f"gitnexus_unavailable: {exc}"]
+
+    return graph
 
 
 def require_debug_mode() -> None:
@@ -574,7 +757,10 @@ def normalize_mode(value: str | None) -> str:
     mode = (value or "chat").strip().lower()
     if mode in MODE_VALUES:
         return mode
-    raise HTTPException(status_code=422, detail="mode must be one of: chat, search, patterns, dependencies")
+    raise HTTPException(
+        status_code=422,
+        detail="mode must be one of: chat, search, patterns, dependencies, graph, hybrid",
+    )
 
 
 def normalize_path_prefix(value: str | None) -> str | None:
@@ -2397,12 +2583,19 @@ def query_namespaces() -> list[str]:
 def build_pinecone_filter(
     language: str | None = None,
     source_type: str | None = None,
+    file_paths: list[str] | None = None,
+    repo: str | None = None,
 ) -> dict[str, Any] | None:
     clauses: list[dict[str, Any]] = []
     if language:
         clauses.append({"language": {"$eq": language}})
     if source_type:
         clauses.append({"source_type": {"$eq": source_type}})
+    normalized_paths = [path for path in (normalize_file_path(item) for item in (file_paths or [])) if path]
+    if normalized_paths:
+        clauses.append({"file_path": {"$in": dedupe_preserve_order(normalized_paths)}})
+    if repo:
+        clauses.append({"repo": {"$eq": repo}})
     if not clauses:
         return None
     if len(clauses) == 1:
@@ -2415,10 +2608,13 @@ def metadata_matches_filters(
     path_prefix: str | None = None,
     language: str | None = None,
     source_type: str | None = None,
+    candidate_files: list[str] | None = None,
+    repo_name: str | None = None,
 ) -> bool:
     file_path = str(metadata.get("file_path", "")).replace("\\", "/").lstrip("/")
     meta_language = str(metadata.get("language", "")).strip().lower()
     meta_source_type = str(metadata.get("source_type", "")).strip().lower()
+    meta_repo = str(metadata.get("repo", "")).strip()
 
     if path_prefix:
         normalized_prefix = path_prefix.replace("\\", "/").lstrip("/").lower()
@@ -2427,6 +2623,12 @@ def metadata_matches_filters(
     if language and meta_language != language:
         return False
     if source_type and meta_source_type != source_type:
+        return False
+    if candidate_files:
+        normalized_candidates = {item.lower() for item in candidate_files if item}
+        if file_path.lower() not in normalized_candidates:
+            return False
+    if repo_name and meta_repo and meta_repo != repo_name:
         return False
     return True
 
@@ -2440,6 +2642,8 @@ def retrieve_citations_and_chunks(
     path_prefix: str | None = None,
     language: str | None = None,
     source_type_filter: str | None = None,
+    candidate_files: list[str] | None = None,
+    repo_name: str | None = None,
 ) -> tuple[list[Citation], list[str], dict[str, Any]]:
     queries = retrieval_queries or [question]
     target_namespaces = namespaces or query_namespaces()
@@ -2457,7 +2661,15 @@ def retrieve_citations_and_chunks(
                 status_code=503,
                 detail=f"Failed to resolve Pinecone index dimension: {startup_smoke_error(exc)}",
             ) from exc
-    pinecone_filter = build_pinecone_filter(language=language, source_type=source_type_filter)
+    normalized_candidate_files = dedupe_preserve_order(
+        [path for path in (normalize_file_path(item) for item in (candidate_files or [])) if path]
+    )
+    pinecone_filter = build_pinecone_filter(
+        language=language,
+        source_type=source_type_filter,
+        file_paths=normalized_candidate_files,
+        repo=repo_name,
+    )
 
     matches: list = []
     subquery_counts: list[dict[str, Any]] = []
@@ -2497,6 +2709,8 @@ def retrieve_citations_and_chunks(
                 path_prefix=path_prefix,
                 language=language,
                 source_type=source_type_filter,
+                candidate_files=normalized_candidate_files,
+                repo_name=repo_name,
             ):
                 continue
             matches.append({"score": match_score(match), "metadata": metadata})
@@ -2521,6 +2735,8 @@ def retrieve_uploaded_citations_and_chunks(
     path_prefix: str | None = None,
     language: str | None = None,
     source_type_filter: str | None = None,
+    candidate_files: list[str] | None = None,
+    repo_name: str | None = None,
 ) -> tuple[list[Citation], list[str], dict[str, Any]]:
     if not uploaded_files:
         return [], [], {"candidates": [], "subqueries": []}
@@ -2529,6 +2745,9 @@ def retrieve_uploaded_citations_and_chunks(
     if not metadata_chunks:
         return [], [], {"candidates": [], "subqueries": []}
 
+    normalized_candidate_files = dedupe_preserve_order(
+        [path for path in (normalize_file_path(item) for item in (candidate_files or [])) if path]
+    )
     matches: list[dict] = []
     subquery_counts: list[dict[str, Any]] = []
     queries = retrieval_queries or [question]
@@ -2549,6 +2768,8 @@ def retrieve_uploaded_citations_and_chunks(
                     path_prefix=path_prefix,
                     language=language,
                     source_type=source_type_filter,
+                    candidate_files=normalized_candidate_files,
+                    repo_name=repo_name,
                 ):
                     continue
                 matches.append(
@@ -2608,6 +2829,8 @@ def retrieve_with_optional_uploads(
     path_prefix: str | None = None,
     language: str | None = None,
     source_type_filter: str | None = None,
+    candidate_files: list[str] | None = None,
+    repo_name: str | None = None,
 ) -> tuple[list[Citation], list[str], dict[str, Any]]:
     normalized_mode = normalize_mode(mode)
     effective_top_k = max(top_k, 1)
@@ -2639,6 +2862,8 @@ def retrieve_with_optional_uploads(
                 path_prefix=path_prefix,
                 language=language,
                 source_type_filter=source_type_filter,
+                candidate_files=candidate_files,
+                repo_name=repo_name,
             )
         except HTTPException as exc:
             logger.warning("Indexed retrieval unavailable: %s", exc.detail)
@@ -2657,6 +2882,8 @@ def retrieve_with_optional_uploads(
                 path_prefix=path_prefix,
                 language=language,
                 source_type_filter=source_type_filter,
+                candidate_files=candidate_files,
+                repo_name=repo_name,
             )
         except HTTPException as exc:
             logger.warning("Attachment retrieval unavailable: %s", exc.detail)
@@ -2672,6 +2899,8 @@ def retrieve_with_optional_uploads(
                 path_prefix=path_prefix,
                 language=language,
                 source_type_filter=source_type_filter,
+                candidate_files=candidate_files,
+                repo_name=repo_name,
             )
 
     sets_to_merge: list[tuple[list[Citation], list[str], float]] = []
@@ -2719,6 +2948,8 @@ def retrieve_with_optional_uploads(
             "path_prefix": path_prefix,
             "language": language,
             "source_type": source_type_filter,
+            "candidate_files_count": len(candidate_files or []),
+            "repo": repo_name,
         },
     }
     return citations, chunks, debug
@@ -2925,6 +3156,101 @@ def insufficient_evidence_answer(
     )
 
 
+def build_hybrid_evidence_rows(citations: list[Citation], chunks: list[str], limit: int = 8) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for idx, (citation, chunk) in enumerate(zip(citations, chunks, strict=False), start=1):
+        snippet = " ".join((chunk or citation.snippet or "").split())
+        summary = snippet[:220].strip()
+        if len(snippet) > 220:
+            summary = f"{summary}..."
+        rows.append(
+            {
+                "citation_index": idx,
+                "file_path": citation.file_path,
+                "line_start": citation.line_start,
+                "line_end": citation.line_end,
+                "score": round(float(citation.score), 4),
+                "source_type": citation.source_type,
+                "snippet": summary,
+            }
+        )
+        if len(rows) >= max(limit, 1):
+            break
+    return rows
+
+
+def compose_hybrid_answer(
+    question: str,
+    graph: dict[str, Any],
+    evidence_rows: list[dict[str, Any]],
+    used_fallback: bool,
+) -> str:
+    lines: list[str] = []
+    lines.append("I. System Map (graph)")
+    processes = graph.get("processes", []) if isinstance(graph, dict) else []
+    if isinstance(processes, list) and processes:
+        lines.append(f"- GitNexus identified {len(processes)} relevant process flow(s).")
+        for process in processes[:5]:
+            if not isinstance(process, dict):
+                continue
+            label = str(process.get("summary") or process.get("id") or "Unnamed process").strip()
+            priority = process.get("priority")
+            if priority is None:
+                lines.append(f"- {label}")
+            else:
+                lines.append(f"- {label} (priority {priority})")
+    else:
+        lines.append("- No process-level graph flow matched strongly for this question.")
+
+    entrypoints = graph.get("entrypoints", []) if isinstance(graph, dict) else []
+    if isinstance(entrypoints, list) and entrypoints:
+        lines.append(f"- Entrypoints/signals: {', '.join(str(item) for item in entrypoints[:8])}")
+
+    candidate_files = graph.get("candidate_files", []) if isinstance(graph, dict) else []
+    if isinstance(candidate_files, list) and candidate_files:
+        preview = ", ".join(str(item) for item in candidate_files[:8])
+        suffix = " ..." if len(candidate_files) > 8 else ""
+        lines.append(
+            f"- Candidate files constraining retrieval ({len(candidate_files)}): {preview}{suffix}"
+        )
+    if used_fallback:
+        lines.append("- Hybrid fallback applied: graph-constrained retrieval had no chunks, so standard Pinecone retrieval was used.")
+
+    impact = graph.get("impact", {}) if isinstance(graph, dict) else {}
+    if isinstance(impact, dict):
+        upstream = impact.get("upstream", {}) if isinstance(impact.get("upstream"), dict) else {}
+        downstream = impact.get("downstream", {}) if isinstance(impact.get("downstream"), dict) else {}
+        upstream_count = safe_int(upstream.get("impactedCount")) or 0
+        downstream_count = safe_int(downstream.get("impactedCount")) or 0
+        if upstream_count or downstream_count:
+            lines.append(
+                f"- Impact snapshot for target {graph.get('target_symbol') or 'n/a'}: upstream={upstream_count}, downstream={downstream_count}"
+            )
+
+    lines.append("")
+    lines.append("II. Evidence-backed explanation (with citations)")
+    if evidence_rows:
+        lines.append(f'- Evidence for "{question}":')
+        for row in evidence_rows[:8]:
+            lines.append(
+                f"- [{row.get('citation_index')}] {row.get('file_path')}:{row.get('line_start')}-{row.get('line_end')} {row.get('snippet')}"
+            )
+    else:
+        lines.append("- No Pinecone evidence was retrieved for this question.")
+
+    lines.append("")
+    lines.append("III. Next actions")
+    if evidence_rows:
+        lines.append("- Open the top cited chunks to confirm control/data-flow assumptions before making changes.")
+    else:
+        lines.append("- Refine the target symbol/file name and rerun Hybrid mode.")
+    if not candidate_files:
+        lines.append("- Graph candidate files were empty; broaden query terms or run a direct graph query first.")
+    else:
+        lines.append("- If needed, run focused follow-up on one candidate file with mode=search for exhaustive references.")
+    return "\n".join(lines)
+
+
 def build_debug_payload(
     retrieval_debug: dict[str, Any],
     context: str,
@@ -3046,19 +3372,144 @@ def search(payload: QueryRequest) -> SearchResponse:
 @app.post("/api/query", response_model=QueryResponse)
 def query(payload: QueryRequest) -> QueryResponse:
     started = time.perf_counter()
+    normalized_mode = normalize_mode(payload.mode)
+    normalized_scope = normalize_scope(payload.scope)
+    normalized_project_id = normalize_project_id(payload.project_id)
     path_prefix, language, source_type_filter = normalized_request_filters(
         payload.path_prefix,
         payload.language,
         payload.source_type,
     )
+
+    if normalized_mode in {"hybrid", "graph"}:
+        repo_name = default_gitnexus_repo()
+        graph_payload = run_gitnexus_graph(payload.question, repo_name=repo_name)
+        raw_candidate_files = graph_payload.get("candidate_files", [])
+        candidate_files = [
+            path
+            for path in (
+                normalize_file_path(item) for item in (raw_candidate_files if isinstance(raw_candidate_files, list) else [])
+            )
+            if path
+        ]
+        candidate_files = dedupe_preserve_order(candidate_files)
+
+        if normalized_mode == "graph":
+            answer = compose_hybrid_answer(
+                question=payload.question,
+                graph=graph_payload,
+                evidence_rows=[],
+                used_fallback=False,
+            )
+            debug_payload: dict[str, Any] = {}
+            if payload.debug:
+                debug_payload = {
+                    "graph": graph_payload,
+                    "latency_ms": round((time.perf_counter() - started) * 1000.0, 2),
+                }
+            return QueryResponse(
+                answer=answer,
+                citations=[],
+                graph=graph_payload,
+                evidence=[],
+                evidence_strength={
+                    "label": "Low",
+                    "score": 0.0,
+                    "reason": "Graph-only mode does not retrieve Pinecone evidence.",
+                    "metrics": {"mode": "graph"},
+                },
+                debug=debug_payload,
+            )
+
+        top_k = max(payload.top_k, max(settings.hybrid_top_k_default, 1))
+        citations: list[Citation] = []
+        chunks: list[str] = []
+        retrieval_debug: dict[str, Any] = {"subqueries": [], "candidates": []}
+        used_fallback = False
+
+        if candidate_files:
+            try:
+                citations, chunks, retrieval_debug = retrieve_with_optional_uploads(
+                    question=payload.question,
+                    top_k=top_k,
+                    uploaded_files=[],
+                    mode="chat",
+                    scope="repo",
+                    project_id=normalized_project_id,
+                    path_prefix=path_prefix,
+                    language=language,
+                    source_type_filter=source_type_filter,
+                    candidate_files=candidate_files,
+                    repo_name=repo_name,
+                )
+            except HTTPException:
+                raise
+            except Exception as exc:
+                logger.warning("Hybrid filtered retrieval failed: %s", exc)
+                citations, chunks, retrieval_debug = [], [], {"subqueries": [], "candidates": []}
+
+        if not candidate_files or not citations:
+            used_fallback = True
+            try:
+                citations, chunks, retrieval_debug = retrieve_with_optional_uploads(
+                    question=payload.question,
+                    top_k=top_k,
+                    uploaded_files=[],
+                    mode="chat",
+                    scope=normalized_scope,
+                    project_id=normalized_project_id,
+                    path_prefix=path_prefix,
+                    language=language,
+                    source_type_filter=source_type_filter,
+                )
+            except HTTPException:
+                raise
+            except Exception as exc:
+                raise HTTPException(status_code=502, detail=f"Hybrid fallback retrieval failed: {exc}") from exc
+
+        evidence = compute_evidence_strength(
+            payload.question,
+            citations,
+            retrieval_debug,
+            mode="chat",
+            mode_metrics={},
+        )
+        evidence_rows = build_hybrid_evidence_rows(citations, chunks, limit=8)
+        answer = compose_hybrid_answer(
+            question=payload.question,
+            graph=graph_payload,
+            evidence_rows=evidence_rows,
+            used_fallback=used_fallback,
+        )
+
+        debug_payload: dict[str, Any] = {}
+        if payload.debug:
+            context = build_context(citations, chunks) if citations else ""
+            debug_payload = build_debug_payload(
+                retrieval_debug=retrieval_debug,
+                context=context,
+                latency_ms=(time.perf_counter() - started) * 1000.0,
+            )
+            debug_payload["graph"] = graph_payload
+            debug_payload["hybrid_fallback"] = used_fallback
+
+        return QueryResponse(
+            answer=answer,
+            citations=citations,
+            graph=graph_payload,
+            evidence=evidence_rows,
+            evidence_strength=evidence,
+            debug=debug_payload,
+        )
+
     try:
         citations, chunks, retrieval_debug = retrieve_with_optional_uploads(
             question=payload.question,
             top_k=payload.top_k,
             uploaded_files=[],
-            mode=normalize_mode(payload.mode),
-            scope=normalize_scope(payload.scope),
-            project_id=normalize_project_id(payload.project_id),
+            mode=normalized_mode,
+            scope=normalized_scope,
+            project_id=normalized_project_id,
             path_prefix=path_prefix,
             language=language,
             source_type_filter=source_type_filter,
@@ -3089,6 +3540,8 @@ def query(payload: QueryRequest) -> QueryResponse:
         return QueryResponse(
             answer=insufficient_evidence_answer(payload.question, suggestions, missing_terms=missing_terms),
             citations=[],
+            graph={},
+            evidence=[],
             evidence_strength=evidence,
             debug=debug_payload,
         )
@@ -3108,6 +3561,8 @@ def query(payload: QueryRequest) -> QueryResponse:
         return QueryResponse(
             answer=insufficient_evidence_answer(payload.question, suggestions, missing_terms=missing_terms),
             citations=response_citations,
+            graph={},
+            evidence=build_hybrid_evidence_rows(response_citations, chunks, limit=8),
             evidence_strength=evidence,
             debug=debug_payload,
         )
@@ -3128,7 +3583,14 @@ def query(payload: QueryRequest) -> QueryResponse:
             context=context,
             latency_ms=(time.perf_counter() - started) * 1000.0,
         )
-    return QueryResponse(answer=answer, citations=citations, evidence_strength=evidence, debug=debug_payload)
+    return QueryResponse(
+        answer=answer,
+        citations=citations,
+        graph={},
+        evidence=build_hybrid_evidence_rows(citations, chunks, limit=8),
+        evidence_strength=evidence,
+        debug=debug_payload,
+    )
 
 
 @app.post("/api/uploads/ingest", response_model=UploadIngestResponse)
@@ -3319,6 +3781,10 @@ async def query_with_uploads(
     persist = parse_form_bool(persist_uploads)
     if persist and uploaded_files:
         upsert_attachment_chunks(project_id=payload.project_id, uploaded_files=uploaded_files)
+    normalized_mode = normalize_mode(payload.mode)
+    if normalized_mode in {"hybrid", "graph"}:
+        # Hybrid/graph paths are repo-structure-first and currently ignore transient uploads.
+        return query(payload)
     started = time.perf_counter()
 
     try:
@@ -3358,6 +3824,8 @@ async def query_with_uploads(
         return QueryResponse(
             answer=insufficient_evidence_answer(payload.question, suggestions, missing_terms=missing_terms),
             citations=[],
+            graph={},
+            evidence=[],
             evidence_strength=evidence,
             debug=debug_payload,
         )
@@ -3377,6 +3845,8 @@ async def query_with_uploads(
         return QueryResponse(
             answer=insufficient_evidence_answer(payload.question, suggestions, missing_terms=missing_terms),
             citations=response_citations,
+            graph={},
+            evidence=build_hybrid_evidence_rows(response_citations, chunks, limit=8),
             evidence_strength=evidence,
             debug=debug_payload,
         )
@@ -3397,4 +3867,11 @@ async def query_with_uploads(
             context=context,
             latency_ms=(time.perf_counter() - started) * 1000.0,
         )
-    return QueryResponse(answer=answer, citations=citations, evidence_strength=evidence, debug=debug_payload)
+    return QueryResponse(
+        answer=answer,
+        citations=citations,
+        graph={},
+        evidence=build_hybrid_evidence_rows(citations, chunks, limit=8),
+        evidence_strength=evidence,
+        debug=debug_payload,
+    )

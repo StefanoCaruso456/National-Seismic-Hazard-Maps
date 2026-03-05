@@ -73,7 +73,7 @@ Runtime debug endpoints are disabled by default. To enable them, set `APP_DEBUG=
 ## API endpoints
 
 - `POST /api/search` mode-aware retrieval (`search|patterns|dependencies`) with snippets + file/line citations
-- `POST /api/query` RAG answer generation using retrieved Pinecone context
+- `POST /api/query` answer generation (`chat|graph|hybrid`) with retrieved Pinecone context
 - `POST /api/search/upload` multipart search with temporary retrieval scope from attached files
 - `POST /api/query/upload` multipart RAG answer with attached-file chunking + retrieval
 - `POST /api/uploads/ingest` persist uploads into Pinecone attachment namespace (`attachments:<project_id>:v1`) with SHA-256 dedupe
@@ -85,7 +85,7 @@ Runtime debug endpoints are disabled by default. To enable them, set `APP_DEBUG=
 
 `/api/search` and `/api/query` accept `debug=true` in JSON to return retrieval traces.
 `/api/search/upload` and `/api/query/upload` accept multipart field `debug=true` for the same trace payload.
-`mode` can be `chat|search|patterns|dependencies` (mode-aware evidence + response formatting).
+`mode` can be `chat|search|patterns|dependencies|graph|hybrid` (mode-aware evidence + response formatting).
 `scope` can be `repo|uploads|both`; `project_id` selects attachment namespace scope.
 Optional retrieval filters: `path_prefix`, `language` (`fortran|text|pdf`), `source_type` (`repo|upload|temp-upload`).
 Upload persistence is opt-in via multipart field `persist_uploads=true` (default: not persisted).
@@ -104,6 +104,7 @@ The backend uses:
 - Attachment-aware retrieval across repo namespace + persistent upload namespace
 - Upload ingestion pipeline with SHA-256 dedupe and PDF/text extraction
 - Query rewrite/decomposition for implementation/workflow/config style questions
+- Hybrid mode: GitNexus MCP (`query/context/impact`) -> candidate files -> Pinecone constrained retrieval -> architecture-first answer with citations
 - Intent router for config-style queries (prioritizes `conf/`, `etc/`, `scripts/`, run scripts, Makefile)
 - Dependency graph extraction (CALL/USE/INCLUDE/COMMON) with definition resolution
 - Pattern extraction for Fortran loop/IO blocks with concrete code snippets
@@ -135,11 +136,33 @@ Required env vars:
 - `RETRIEVAL_FOCUS_TERM_GUARDRAIL_ENABLED` (default: `true`)
 - `RETRIEVAL_FOCUS_TERM_ABSENT_CAP` (default: `0.20`)
 - `RETRIEVAL_FOCUS_TERM_PARTIAL_COVERAGE_CAP` (default: `0.45`)
+- `HYBRID_TOP_K_DEFAULT` (default: `12`)
+- `HYBRID_MAX_CANDIDATE_FILES` (default: `50`)
+- `GITNEXUS_ENABLED` (default: `true`)
+- `GITNEXUS_BASE_URL` (default: `http://127.0.0.1:4000`; reserved for HTTP sidecar compatibility)
+- `GITNEXUS_DEFAULT_REPO` (optional; defaults to current repo folder name)
+- `GITNEXUS_MCP_COMMAND` (default: `npx -y gitnexus@latest mcp`)
+- `GITNEXUS_CALL_TIMEOUT_SECONDS` (default: `30`)
+- `GITNEXUS_STARTUP_TIMEOUT_SECONDS` (default: `45`)
 - `RAG_MAX_CONTEXT_CHUNKS` (default: `6`)
 - `PINECONE_FALLBACK_NAMESPACE` (optional; empty by default)
 - `STARTUP_SMOKE_MODE` (`off|warn|strict`, default: `off`)
 - `STARTUP_SMOKE_QUERY` (default: `startup health probe`)
 - `STARTUP_SMOKE_TOP_K` (default: `1`)
+
+## GitNexus (Hybrid mode) setup
+
+From repository root:
+
+```bash
+npx -y gitnexus@latest analyze .
+```
+
+MCP server command used by backend (configurable):
+
+```bash
+npx -y gitnexus@latest mcp
+```
 
 ## MVP hard-gate mapping
 

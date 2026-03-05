@@ -61,6 +61,13 @@ const MODE_CONFIG = {
     heroTitle: "What do you want to understand in this legacy codebase?",
     heroCopy: "Ask about entry points, file I/O, data flow, business rules, and dependencies.",
   },
+  hybrid: {
+    label: "Hybrid",
+    placeholder: "Architecture-first analysis with graph-constrained citations...",
+    heroTitle: "Fuse structure graph with line-level evidence",
+    heroCopy:
+      "Hybrid mode uses GitNexus process/context/impact signals to constrain Pinecone retrieval, then returns architecture-first evidence with citations.",
+  },
   search: {
     label: "Search",
     placeholder: "Search for files, routines, common blocks, or keywords...",
@@ -1208,6 +1215,8 @@ function defaultResultTypeForMode(mode, detail = null) {
     const diagramType = detail || state.activeDiagramType;
     return DIAGRAM_WORKFLOWS[diagramType]?.reportType || "Mermaid Diagram";
   }
+  if (mode === "hybrid") return "Hybrid Architecture + Evidence";
+  if (mode === "graph") return "Graph Architecture";
   if (mode === "dependencies") return "Dependency Graph";
   if (mode === "patterns") return "Pattern Examples";
   if (mode === "search") return "Ranked Chunks";
@@ -1388,6 +1397,73 @@ function normalizeDiagramText(text) {
   return next || raw;
 }
 
+function renderHybridArchitecturePanel(panel, graphPayload) {
+  panel.innerHTML = "";
+  const title = document.createElement("h5");
+  title.textContent = "Architecture Context";
+  panel.appendChild(title);
+
+  const graph = graphPayload && typeof graphPayload === "object" ? graphPayload : {};
+  const processes = Array.isArray(graph.processes) ? graph.processes : [];
+  const entrypoints = Array.isArray(graph.entrypoints) ? graph.entrypoints : [];
+  const candidateFiles = Array.isArray(graph.candidate_files) ? graph.candidate_files : [];
+
+  const lines = [];
+  lines.push(`Repo: ${String(graph.repo || "n/a")}`);
+  lines.push(`Processes: ${processes.length}`);
+  if (entrypoints.length) {
+    lines.push(`Entrypoints: ${entrypoints.slice(0, 6).join(", ")}`);
+  }
+  if (candidateFiles.length) {
+    lines.push(`Candidate files (${candidateFiles.length}): ${candidateFiles.slice(0, 8).join(", ")}${candidateFiles.length > 8 ? " ..." : ""}`);
+  } else {
+    lines.push("Candidate files: none (fallback retrieval used)");
+  }
+
+  const impact = graph.impact && typeof graph.impact === "object" ? graph.impact : {};
+  const upstream = impact.upstream && typeof impact.upstream === "object" ? impact.upstream : {};
+  const downstream = impact.downstream && typeof impact.downstream === "object" ? impact.downstream : {};
+  const upstreamCount = Number(upstream.impactedCount || 0);
+  const downstreamCount = Number(downstream.impactedCount || 0);
+  if (upstreamCount || downstreamCount) {
+    lines.push(`Impact: upstream=${upstreamCount}, downstream=${downstreamCount}`);
+  }
+
+  const body = document.createElement("pre");
+  body.className = "hybrid-panel-body";
+  body.textContent = lines.join("\n");
+  panel.appendChild(body);
+}
+
+function renderHybridEvidencePanel(panel, evidenceRows = []) {
+  panel.innerHTML = "";
+  const title = document.createElement("h5");
+  title.textContent = "Evidence & Citations";
+  panel.appendChild(title);
+
+  if (!Array.isArray(evidenceRows) || !evidenceRows.length) {
+    const empty = document.createElement("p");
+    empty.className = "hybrid-panel-empty";
+    empty.textContent = "No evidence rows returned.";
+    panel.appendChild(empty);
+    return;
+  }
+
+  const list = document.createElement("ul");
+  list.className = "hybrid-evidence-list";
+  for (const row of evidenceRows.slice(0, 8)) {
+    const item = document.createElement("li");
+    const idx = Number(row.citation_index || 0);
+    const file = String(row.file_path || "unknown");
+    const start = Number(row.line_start || 1);
+    const end = Number(row.line_end || start);
+    const snippet = String(row.snippet || "").trim();
+    item.textContent = `[${idx}] ${file}:${start}-${end}${snippet ? ` — ${snippet}` : ""}`;
+    list.appendChild(item);
+  }
+  panel.appendChild(list);
+}
+
 function isLikelyMermaidDiagram(text) {
   const normalized = normalizeDiagramText(text).trim().toLowerCase();
   return normalized.startsWith("flowchart ") || normalized.startsWith("graph ");
@@ -1437,6 +1513,22 @@ function addMessage(role, text, citations = [], meta = {}) {
         setStatus("Debug trace opened");
       });
       metaRow.appendChild(debugBtn);
+    }
+
+    if (meta.modeValue === "hybrid") {
+      const hybridPanels = document.createElement("div");
+      hybridPanels.className = "hybrid-panels";
+
+      const architecturePanel = document.createElement("section");
+      architecturePanel.className = "hybrid-panel architecture";
+      renderHybridArchitecturePanel(architecturePanel, meta.hybridGraph || {});
+
+      const evidencePanel = document.createElement("section");
+      evidencePanel.className = "hybrid-panel evidence";
+      renderHybridEvidencePanel(evidencePanel, meta.hybridEvidence || []);
+
+      hybridPanels.append(architecturePanel, evidencePanel);
+      bubbleWrap.appendChild(hybridPanels);
     }
   }
 
@@ -1687,6 +1779,41 @@ async function runModeQuery(mode, question, files = []) {
     });
   };
 
+  if (uiMode === "hybrid") {
+    const hybridDefaultTopK = Number(state.retrievalInfo?.hybrid_top_k_default || 12);
+    const requestTopK = Math.min(20, Math.max(state.topK, hybridDefaultTopK));
+    const data = hasUploads
+      ? await postMultipart("/api/query/upload", {
+          question,
+          topK: requestTopK,
+          files,
+          debug,
+          mode: apiMode,
+          scope,
+          projectId,
+          persistUploads,
+        })
+      : await postJson("/api/query", {
+          question,
+          top_k: requestTopK,
+          debug,
+          mode: apiMode,
+          scope,
+          project_id: projectId,
+        });
+
+    return {
+      text: data.answer || "No hybrid answer returned.",
+      citations: data.citations || [],
+      evidence: data.evidence_strength || {},
+      debug: data.debug || null,
+      resultType: defaultResultTypeForMode(uiMode),
+      followUps: [],
+      hybridGraph: data.graph || {},
+      hybridEvidence: data.evidence || [],
+    };
+  }
+
   if (uiMode === "chat" || uiMode === "audit") {
     const requestTopK = uiMode === "audit" ? Math.min(20, Math.max(state.topK, 8)) : state.topK;
     const data = hasUploads
@@ -1722,6 +1849,8 @@ async function runModeQuery(mode, question, files = []) {
         uiMode === "audit"
           ? auditFollowUps()
           : [],
+      hybridGraph: data.graph || {},
+      hybridEvidence: data.evidence || [],
     };
   }
 
@@ -1785,6 +1914,8 @@ Validation retry:
         uiMode === "diagrams" ? state.activeDiagramType : null,
       ),
       followUps: diagramFollowUpsForType(state.activeDiagramType),
+      hybridGraph: data.graph || {},
+      hybridEvidence: data.evidence || [],
     };
   }
 
@@ -1800,6 +1931,8 @@ Validation retry:
       debug: data.debug || null,
       resultType: data.result_type || defaultResultTypeForMode(uiMode),
       followUps: normalizeFollowUps(data.follow_ups || []),
+      hybridGraph: {},
+      hybridEvidence: [],
     };
   }
 
@@ -1814,6 +1947,8 @@ Validation retry:
       debug: data.debug || null,
       resultType: data.result_type || defaultResultTypeForMode(uiMode),
       followUps: normalizeFollowUps(data.follow_ups || []),
+      hybridGraph: {},
+      hybridEvidence: [],
     };
   }
 
@@ -1827,6 +1962,8 @@ Validation retry:
     debug: data.debug || null,
     resultType: data.result_type || defaultResultTypeForMode(uiMode),
     followUps: normalizeFollowUps(data.follow_ups || []),
+    hybridGraph: {},
+    hybridEvidence: [],
   };
 }
 
@@ -1900,6 +2037,8 @@ async function submitQuestion(options = {}) {
       modeValue: state.mode,
       resultType: result.resultType || defaultResultTypeForMode(state.mode),
       followUps: normalizeFollowUps(result.followUps || []),
+      hybridGraph: result.hybridGraph || {},
+      hybridEvidence: result.hybridEvidence || [],
       debugPayload: result.debug || null,
       elapsedMs,
       resultCount: result.citations.length,
@@ -2147,7 +2286,7 @@ exploreCapabilitiesLink.addEventListener("click", (event) => {
   event.preventDefault();
   closeSuggestionModal();
   setMode("chat");
-  input.value = "Show example questions I can ask in Chat, Search, Code Patterns, Dependencies, Diagrams, and Run Audit modes.";
+  input.value = "Show example questions I can ask in Chat, Hybrid, Search, Code Patterns, Dependencies, Diagrams, and Run Audit modes.";
   autoResize();
   setStatus("Capabilities example inserted");
 });

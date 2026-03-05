@@ -23,6 +23,14 @@ class Settings(BaseSettings):
     retrieval_focus_term_guardrail_enabled: bool = True
     retrieval_focus_term_absent_cap: float = 0.20
     retrieval_focus_term_partial_coverage_cap: float = 0.45
+    hybrid_top_k_default: int = 12
+    hybrid_max_candidate_files: int = 50
+    gitnexus_enabled: bool = True
+    gitnexus_base_url: str = "http://127.0.0.1:4000"
+    gitnexus_default_repo: str | None = None
+    gitnexus_mcp_command: str = "npx -y gitnexus@latest mcp"
+    gitnexus_call_timeout_seconds: float = 30.0
+    gitnexus_startup_timeout_seconds: float = 45.0
     rag_max_context_chunks: int = 6
     pinecone_fallback_namespace: str | None = None
     startup_smoke_mode: str = "off"

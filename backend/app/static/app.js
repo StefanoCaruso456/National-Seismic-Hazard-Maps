@@ -347,6 +347,16 @@ const PROMPT_MODE_CATEGORIES = [
     ],
   },
   {
+    key: "hybrid-starters",
+    title: "HYBRID STARTERS",
+    mode: "hybrid",
+    prompts: [
+      "What calls GailTable, and what downstream routines does it impact? Return upstream/downstream call chain with file:line citations only.",
+      "What is the entry point for deaggregation, and what execution path reaches GailTable? Include dependency edges and cited evidence.",
+      "Find files referencing ground motion model tables (AB06/AB08/Pz11), then summarize how they are loaded with exact file:line citations.",
+    ],
+  },
+  {
     key: "find-code",
     title: "FIND CODE",
     mode: "search",
@@ -983,17 +993,25 @@ function PromptCategory(category, onSelect) {
 function PromptSuggestionModal(modeCategories, onSelect, contextFile, options = {}) {
   promptModalBody.innerHTML = "";
   const filterKeys = Array.isArray(options.filterKeys) ? new Set(options.filterKeys) : null;
+  const preferredMode = String(options.preferredMode || "").trim();
 
   const normalizedCategories = modeCategories
     .filter((category) => !filterKeys || filterKeys.has(category.key))
     .map((category) => ({
       key: category.key,
       title: category.title,
+      mode: category.mode,
       prompts: category.prompts.slice(0, 3).map((text) => ({
         text,
         mode: category.mode,
       })),
-    }));
+    }))
+    .sort((left, right) => {
+      if (!preferredMode) return 0;
+      const leftPreferred = left.mode === preferredMode ? 1 : 0;
+      const rightPreferred = right.mode === preferredMode ? 1 : 0;
+      return rightPreferred - leftPreferred;
+    });
 
   normalizedCategories.forEach((category) => {
     promptModalBody.appendChild(PromptCategory(category, onSelect));
@@ -1018,7 +1036,10 @@ function openSuggestionModal(options = {}) {
   }
   closeSettings();
   const contextFile = deriveContextFile();
-  PromptSuggestionModal(PROMPT_MODE_CATEGORIES, onPromptSelected, contextFile, options);
+  PromptSuggestionModal(PROMPT_MODE_CATEGORIES, onPromptSelected, contextFile, {
+    preferredMode: state.mode,
+    ...options,
+  });
   state.suggestionModalOpen = true;
   suggestionOverlay.classList.remove("hidden");
   promptSuggestionModal.classList.remove("hidden");

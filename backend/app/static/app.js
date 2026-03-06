@@ -1847,6 +1847,17 @@ function renderHybridArchitecturePanel(panel, graphPayload, evidenceRows = [], d
   renderHybridGraphCanvas(panel, graph);
   const processes = Array.isArray(graph.processes) ? graph.processes : [];
   const entrypoints = Array.isArray(graph.entrypoints) ? graph.entrypoints : [];
+  const processFlowLabels = processes
+    .map((process) => String(process?.summary || process?.id || "").trim())
+    .filter(Boolean);
+  const normalizeSignal = (value) => String(value || "").trim().toLowerCase().replace(/\s+/g, " ");
+  const processFlowSet = new Set(processFlowLabels.map((label) => normalizeSignal(label)));
+  const distinctEntrypoints = entrypoints
+    .map((entry) => String(entry || "").trim())
+    .filter((entry) => {
+      const normalized = normalizeSignal(entry);
+      return Boolean(normalized) && !processFlowSet.has(normalized);
+    });
   const candidateFiles = Array.isArray(graph.candidate_files) ? graph.candidate_files : [];
   const errors = Array.isArray(graph.errors) ? graph.errors : [];
   const routeDebug = debugPayload && typeof debugPayload === "object" && debugPayload.route_debug
@@ -1937,7 +1948,9 @@ function renderHybridArchitecturePanel(panel, graphPayload, evidenceRows = [], d
   panel.appendChild(filesSection);
 
   const lines = [];
-  if (entrypoints.length) lines.push(`Entrypoints: ${entrypoints.slice(0, 6).join(", ")}`);
+  if (distinctEntrypoints.length) {
+    lines.push(`Entrypoints: ${distinctEntrypoints.slice(0, 6).join(", ")}`);
+  }
   if (graphMeta.commit_hash) lines.push(`Graph commit: ${String(graphMeta.commit_hash)}`);
   const impact = graph.impact && typeof graph.impact === "object" ? graph.impact : {};
   const upstream = impact.upstream && typeof impact.upstream === "object" ? impact.upstream : {};

@@ -1260,6 +1260,57 @@ function normalizeFollowUps(items) {
   return out;
 }
 
+function extractHybridNextBestQuery(text) {
+  const lines = String(text || "").split(/\r?\n/);
+  let inSection = false;
+  for (const line of lines) {
+    const trimmed = String(line || "").trim();
+    if (!inSection) {
+      if (trimmed.toLowerCase() === "next best query") {
+        inSection = true;
+      }
+      continue;
+    }
+    if (!trimmed) continue;
+    const suggestion = trimmed.replace(/^[-*]\s+/, "").trim();
+    if (!suggestion) continue;
+    return suggestion;
+  }
+  return "";
+}
+
+function renderHybridNextBestQueryAction(bubbleWrap, suggestion, modeValue) {
+  const normalized = String(suggestion || "").trim();
+  if (!normalized) return;
+
+  const row = document.createElement("div");
+  row.className = "followup-row";
+
+  const label = document.createElement("span");
+  label.className = "followup-label";
+  label.textContent = "Next Best Query:";
+  row.appendChild(label);
+
+  const runBtn = document.createElement("button");
+  runBtn.type = "button";
+  runBtn.className = "tiny-btn";
+  runBtn.textContent = "Copy + Run";
+  runBtn.title = normalized;
+  runBtn.addEventListener("click", async () => {
+    input.value = normalized;
+    autoResize();
+    await copyText(normalized, "Next Best Query copied");
+    submitQuestion({
+      modeOverride: modeValue || state.mode,
+      questionOverride: normalized,
+      displayOverride: normalized,
+    });
+  });
+  row.appendChild(runBtn);
+
+  bubbleWrap.appendChild(row);
+}
+
 function citationRange(item) {
   const file = item.file_path || "unknown";
   const start = item.line_start ?? "?";
@@ -2158,6 +2209,11 @@ function addMessage(role, text, citations = [], meta = {}) {
     }
 
     if (meta.modeValue === "hybrid") {
+      const nextBestQuery = extractHybridNextBestQuery(renderedText);
+      if (nextBestQuery) {
+        renderHybridNextBestQueryAction(bubbleWrap, nextBestQuery, meta.modeValue);
+      }
+
       const hybridPanels = document.createElement("div");
       hybridPanels.className = "hybrid-panels";
 

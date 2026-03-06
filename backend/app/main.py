@@ -5201,9 +5201,47 @@ def compose_hybrid_answer(
     graph_meta = hybrid_debug.get("graph_metadata", {}) if isinstance(hybrid_debug, dict) else {}
     repo_id = str(graph_meta.get("repo_id") or graph.get("repo") or "unknown-repo")
     commit_hash = str(graph_meta.get("commit_hash") or "unknown")
-
-    lines.append("I. System Map (graph)")
     processes = graph.get("processes", []) if isinstance(graph, dict) else []
+    entrypoints = graph.get("entrypoints", []) if isinstance(graph, dict) else []
+    candidate_files = graph.get("candidate_files", []) if isinstance(graph, dict) else []
+    graph_errors = graph.get("errors", []) if isinstance(graph, dict) else []
+
+    reliability = "Low"
+    if evidence_rows:
+        reliability = "High" if len(evidence_rows) >= 4 else "Medium"
+    elif isinstance(processes, list) and processes:
+        reliability = "Medium"
+
+    fallback_reason_notes = {
+        "graph_not_indexed": (
+            f"Graph not indexed for repo {repo_id} at commit {commit_hash}. "
+            "Run `npx -y gitnexus@latest analyze` in the repo and restart the service."
+        ),
+        "graph_runtime_unavailable": "Graph runtime unavailable in this deployment (missing `npx` and/or GitNexus MCP runtime).",
+        "graph_repo_unknown": "Graph repo id is unresolved. Set `GITNEXUS_DEFAULT_REPO` to a valid indexed repo.",
+        "graph_no_candidate_files": "Graph query returned no candidate files, so constrained retrieval could not run.",
+        "retrieval_no_matches": "Constrained Pinecone retrieval returned no chunks for this query.",
+        "retrieval_graph_unavailable": "Graph service reported errors, so retrieval relied on fallback behavior.",
+        "retrieval_low_confidence": "Retrieved chunks were low-confidence after reranking.",
+    }
+
+    lines.append("I. Retrieval Verdict")
+    lines.append(
+        f"- Graph coverage: {len(processes) if isinstance(processes, list) else 0} process flow(s), "
+        f"{len(candidate_files) if isinstance(candidate_files, list) else 0} candidate file(s), repo `{repo_id}`."
+    )
+    if evidence_rows:
+        lines.append(f"- Evidence coverage: {len(evidence_rows)} cited chunk(s) with file:line references.")
+    else:
+        lines.append("- Evidence coverage: no line-level Pinecone citations were returned.")
+    lines.append(f"- Reliability: {reliability}.")
+    if fallback_reason:
+        lines.append(f"- Retrieval diagnostic: {fallback_reason_notes.get(fallback_reason, fallback_reason)}")
+    if used_fallback:
+        lines.append("- Retrieval fallback executed (graph-constrained path did not produce usable evidence).")
+
+    lines.append("")
+    lines.append("II. Architecture Highlights (graph)")
     if isinstance(processes, list) and processes:
         lines.append(f"- GitNexus identified {len(processes)} relevant process flow(s).")
         for process in processes[:5]:
@@ -5216,36 +5254,21 @@ def compose_hybrid_answer(
             else:
                 lines.append(f"- {label} (priority {priority})")
     else:
-        lines.append("- No process-level graph flow matched strongly for this question.")
+        lines.append("- No process flow cleared the graph relevance threshold for this query.")
 
-    graph_errors = graph.get("errors", []) if isinstance(graph, dict) else []
     if isinstance(graph_errors, list):
         condensed_errors = [str(item).strip() for item in graph_errors if str(item).strip()]
         if condensed_errors:
             lines.append(f"- Graph errors: {'; '.join(condensed_errors[:3])}")
-    if fallback_reason == "graph_not_indexed":
-        lines.append(
-            f"- Graph not indexed for repo {repo_id} at commit {commit_hash}. "
-            "Run `npx -y gitnexus@latest analyze` in the repo and restart the service."
-        )
-    elif fallback_reason == "graph_runtime_unavailable":
-        lines.append("- Graph runtime unavailable in this deployment (missing `npx` and/or GitNexus MCP runtime).")
-    elif fallback_reason == "graph_repo_unknown":
-        lines.append("- Graph repo id is unresolved. Set `GITNEXUS_DEFAULT_REPO` to a valid indexed repo.")
-
-    entrypoints = graph.get("entrypoints", []) if isinstance(graph, dict) else []
     if isinstance(entrypoints, list) and entrypoints:
         lines.append(f"- Entrypoints/signals: {', '.join(str(item) for item in entrypoints[:8])}")
 
-    candidate_files = graph.get("candidate_files", []) if isinstance(graph, dict) else []
     if isinstance(candidate_files, list) and candidate_files:
         preview = ", ".join(str(item) for item in candidate_files[:8])
         suffix = " ..." if len(candidate_files) > 8 else ""
         lines.append(
             f"- Candidate files constraining retrieval ({len(candidate_files)}): {preview}{suffix}"
         )
-    if used_fallback:
-        lines.append("- Hybrid fallback applied: graph-constrained retrieval had no chunks, so standard Pinecone retrieval was used.")
 
     impact = graph.get("impact", {}) if isinstance(graph, dict) else {}
     if isinstance(impact, dict):
@@ -5259,7 +5282,7 @@ def compose_hybrid_answer(
             )
 
     lines.append("")
-    lines.append("II. Evidence-backed explanation (with citations)")
+    lines.append("III. Evidence-backed Findings (with citations)")
     if evidence_rows:
         lines.append(f'- Evidence for "{question}":')
         for row in evidence_rows[:8]:
@@ -5267,20 +5290,29 @@ def compose_hybrid_answer(
                 f"- [{row.get('citation_index')}] {row.get('file_path')}:{row.get('line_start')}-{row.get('line_end')} {row.get('snippet')}"
             )
     else:
-        lines.append("- No Pinecone evidence was retrieved for this question.")
+        lines.append("- No Pinecone evidence rows were returned for this question.")
+        lines.append("- Treat this result as architecture-only guidance until line-level citations are present.")
+        if isinstance(candidate_files, list) and candidate_files:
+            lines.append(
+                f"- Graph constrained retrieval to {len(candidate_files)} file(s); no chunks matched those files in Pinecone."
+            )
 
     lines.append("")
-    lines.append("III. Next actions")
+    lines.append("IV. Next Actions")
     if evidence_rows:
         lines.append("- Open the top cited chunks to confirm control/data-flow assumptions before making changes.")
     else:
-        lines.append("- Refine the target symbol/file name and rerun Hybrid mode.")
-    if not candidate_files:
+        target_symbol = str(graph.get("target_symbol") or "").strip()
+        if target_symbol:
+            lines.append(f"- Run a symbol-specific query: `Show callers of {target_symbol} with file:line citations`.")
+        else:
+            lines.append("- Run a symbol/file-specific query (routine name + file) to force line-level evidence retrieval.")
+    if not isinstance(candidate_files, list) or not candidate_files:
         lines.append("- Graph candidate files were empty; inspect `hybrid_debug.fallback_reason` and graph diagnostics.")
         if isinstance(graph_errors, list) and any(str(item).strip() for item in graph_errors):
             lines.append("- Graph engine reported an error; verify GitNexus runtime/index availability for this deployment.")
     else:
-        lines.append("- If needed, run focused follow-up on one candidate file with mode=search for exhaustive references.")
+        lines.append("- Run `mode=search` on one candidate file to validate Pinecone coverage for that path.")
     return "\n".join(lines)
 
 

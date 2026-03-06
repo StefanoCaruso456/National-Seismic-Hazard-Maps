@@ -1774,7 +1774,49 @@ function renderHybridGraphCanvas(panel, graphPayload) {
   });
 }
 
-function renderHybridArchitecturePanel(panel, graphPayload) {
+function formatHybridFallbackReason(reason, graphMeta = {}) {
+  const normalized = String(reason || "").trim().toLowerCase();
+  if (!normalized) return "";
+  const repoId = String(graphMeta.repo_id || "unknown-repo");
+  const commit = String(graphMeta.commit_hash || "unknown");
+  if (normalized === "graph_not_indexed") {
+    return `Graph index missing for ${repoId}@${commit}. Run: npx -y gitnexus@latest analyze`;
+  }
+  if (normalized === "graph_runtime_unavailable") {
+    return "GitNexus runtime unavailable in this deployment.";
+  }
+  if (normalized === "graph_repo_unknown") {
+    return "Graph repo id is unresolved. Set GITNEXUS_DEFAULT_REPO.";
+  }
+  if (normalized === "graph_no_candidate_files") {
+    return "Graph returned no candidate files for this query.";
+  }
+  if (normalized === "retrieval_no_matches") {
+    return "Pinecone returned no matches for the constrained retrieval pass.";
+  }
+  if (normalized === "retrieval_low_confidence") {
+    return "Retrieved chunks were low-confidence after reranking.";
+  }
+  return normalized.replace(/_/g, " ");
+}
+
+function createHybridMetric(label, value, tone = "neutral") {
+  const chip = document.createElement("div");
+  chip.className = `hybrid-metric ${tone}`;
+
+  const key = document.createElement("span");
+  key.className = "hybrid-metric-key";
+  key.textContent = label;
+
+  const val = document.createElement("span");
+  val.className = "hybrid-metric-value";
+  val.textContent = value;
+
+  chip.append(key, val);
+  return chip;
+}
+
+function renderHybridArchitecturePanel(panel, graphPayload, evidenceRows = [], debugPayload = null) {
   panel.innerHTML = "";
   const title = document.createElement("h5");
   title.textContent = "Architecture Context";
@@ -1786,35 +1828,96 @@ function renderHybridArchitecturePanel(panel, graphPayload) {
   const entrypoints = Array.isArray(graph.entrypoints) ? graph.entrypoints : [];
   const candidateFiles = Array.isArray(graph.candidate_files) ? graph.candidate_files : [];
   const errors = Array.isArray(graph.errors) ? graph.errors : [];
-  const hybridDebug = graph.hybrid_debug && typeof graph.hybrid_debug === "object" ? graph.hybrid_debug : {};
+  const routeDebug = debugPayload && typeof debugPayload === "object" && debugPayload.route_debug
+    ? debugPayload.route_debug
+    : {};
+  const hybridDebug = graph.hybrid_debug && typeof graph.hybrid_debug === "object"
+    ? graph.hybrid_debug
+    : (routeDebug.hybrid_debug && typeof routeDebug.hybrid_debug === "object" ? routeDebug.hybrid_debug : {});
   const graphMeta = hybridDebug.graph_metadata && typeof hybridDebug.graph_metadata === "object"
     ? hybridDebug.graph_metadata
     : {};
+  const evidenceCount = Array.isArray(evidenceRows) ? evidenceRows.length : 0;
+  const fallbackReason = String(hybridDebug.fallback_reason || "");
+  const quality = evidenceCount >= 3 ? "Actionable" : (processes.length > 0 || candidateFiles.length > 0 ? "Partial" : "Low");
+
+  const metrics = document.createElement("div");
+  metrics.className = "hybrid-metrics";
+  metrics.append(
+    createHybridMetric("Quality", quality, quality === "Actionable" ? "good" : (quality === "Partial" ? "warn" : "bad")),
+    createHybridMetric("Repo", String(graph.repo || "n/a")),
+    createHybridMetric("Processes", String(processes.length)),
+    createHybridMetric("Candidate files", String(candidateFiles.length)),
+    createHybridMetric("Evidence rows", String(evidenceCount), evidenceCount > 0 ? "good" : "bad"),
+  );
+  if (Object.prototype.hasOwnProperty.call(hybridDebug, "graph_index_present")) {
+    metrics.append(createHybridMetric("Graph index", String(Boolean(hybridDebug.graph_index_present))));
+  }
+  panel.appendChild(metrics);
+
+  const fallbackMessage = formatHybridFallbackReason(fallbackReason, graphMeta);
+  if (fallbackMessage || errors.length) {
+    const callout = document.createElement("div");
+    callout.className = "hybrid-callout warn";
+    const reasonLines = [];
+    if (fallbackMessage) reasonLines.push(`Diagnostic: ${fallbackMessage}`);
+    if (errors.length) reasonLines.push(`Graph errors: ${errors.slice(0, 2).join(" | ")}`);
+    callout.textContent = reasonLines.join("\n");
+    panel.appendChild(callout);
+  }
+
+  const flows = document.createElement("div");
+  flows.className = "hybrid-subsection";
+  const flowsTitle = document.createElement("h6");
+  flowsTitle.textContent = "Top Graph Flows";
+  flows.appendChild(flowsTitle);
+  if (processes.length) {
+    const list = document.createElement("ul");
+    list.className = "hybrid-list";
+    for (const process of processes.slice(0, 5)) {
+      if (!process || typeof process !== "object") continue;
+      const item = document.createElement("li");
+      const summary = String(process.summary || process.id || "Unnamed process");
+      const priority = Number(process.priority || 0);
+      item.textContent = Number.isFinite(priority) && priority > 0
+        ? `${summary} (priority ${priority.toFixed(3)})`
+        : summary;
+      list.appendChild(item);
+    }
+    flows.appendChild(list);
+  } else {
+    const empty = document.createElement("p");
+    empty.className = "hybrid-panel-empty";
+    empty.textContent = "No high-confidence process flow was returned for this query.";
+    flows.appendChild(empty);
+  }
+  panel.appendChild(flows);
+
+  const filesSection = document.createElement("div");
+  filesSection.className = "hybrid-subsection";
+  const filesTitle = document.createElement("h6");
+  filesTitle.textContent = "Candidate Scope";
+  filesSection.appendChild(filesTitle);
+  if (candidateFiles.length) {
+    const fileList = document.createElement("ul");
+    fileList.className = "hybrid-list";
+    for (const filePath of candidateFiles.slice(0, 8)) {
+      const item = document.createElement("li");
+      item.textContent = String(filePath);
+      fileList.appendChild(item);
+    }
+    filesSection.appendChild(fileList);
+  } else {
+    const empty = document.createElement("p");
+    empty.className = "hybrid-panel-empty";
+    empty.textContent = "No candidate files from graph. Retrieval likely used fallback.";
+    filesSection.appendChild(empty);
+  }
+  panel.appendChild(filesSection);
 
   const lines = [];
-  lines.push(`Repo: ${String(graph.repo || "n/a")}`);
-  lines.push(`Processes: ${processes.length}`);
-  if (entrypoints.length) {
-    lines.push(`Entrypoints: ${entrypoints.slice(0, 6).join(", ")}`);
-  }
-  if (candidateFiles.length) {
-    lines.push(`Candidate files (${candidateFiles.length}): ${candidateFiles.slice(0, 8).join(", ")}${candidateFiles.length > 8 ? " ..." : ""}`);
-  } else {
-    lines.push("Candidate files: none (fallback retrieval used)");
-  }
-  if (errors.length) {
-    lines.push(`Graph errors: ${errors.slice(0, 3).join(" | ")}`);
-  }
-  if (Object.prototype.hasOwnProperty.call(hybridDebug, "graph_index_present")) {
-    lines.push(`Graph index present: ${Boolean(hybridDebug.graph_index_present)}`);
-  }
-  if (hybridDebug.fallback_reason) {
-    lines.push(`Fallback reason: ${String(hybridDebug.fallback_reason)}`);
-  }
-  if (graphMeta.commit_hash) {
-    lines.push(`Graph commit: ${String(graphMeta.commit_hash)}`);
-  }
-
+  if (entrypoints.length) lines.push(`Entrypoints: ${entrypoints.slice(0, 6).join(", ")}`);
+  if (graphMeta.commit_hash) lines.push(`Graph commit: ${String(graphMeta.commit_hash)}`);
   const impact = graph.impact && typeof graph.impact === "object" ? graph.impact : {};
   const upstream = impact.upstream && typeof impact.upstream === "object" ? impact.upstream : {};
   const downstream = impact.downstream && typeof impact.downstream === "object" ? impact.downstream : {};
@@ -1823,38 +1926,98 @@ function renderHybridArchitecturePanel(panel, graphPayload) {
   if (upstreamCount || downstreamCount) {
     lines.push(`Impact: upstream=${upstreamCount}, downstream=${downstreamCount}`);
   }
-
-  const body = document.createElement("pre");
-  body.className = "hybrid-panel-body";
-  body.textContent = lines.join("\n");
-  panel.appendChild(body);
+  if (lines.length) {
+    const body = document.createElement("pre");
+    body.className = "hybrid-panel-body";
+    body.textContent = lines.join("\n");
+    panel.appendChild(body);
+  }
 }
 
-function renderHybridEvidencePanel(panel, evidenceRows = []) {
+function renderHybridEvidencePanel(panel, evidenceRows = [], graphPayload = {}, debugPayload = null) {
   panel.innerHTML = "";
   const title = document.createElement("h5");
   title.textContent = "Evidence & Citations";
   panel.appendChild(title);
 
+  const graph = graphPayload && typeof graphPayload === "object" ? graphPayload : {};
+  const routeDebug = debugPayload && typeof debugPayload === "object" && debugPayload.route_debug
+    ? debugPayload.route_debug
+    : {};
+  const hybridDebug = graph.hybrid_debug && typeof graph.hybrid_debug === "object"
+    ? graph.hybrid_debug
+    : (routeDebug.hybrid_debug && typeof routeDebug.hybrid_debug === "object" ? routeDebug.hybrid_debug : {});
+  const graphMeta = hybridDebug.graph_metadata && typeof hybridDebug.graph_metadata === "object"
+    ? hybridDebug.graph_metadata
+    : {};
+
   if (!Array.isArray(evidenceRows) || !evidenceRows.length) {
-    const empty = document.createElement("p");
-    empty.className = "hybrid-panel-empty";
-    empty.textContent = "No evidence rows returned.";
+    const empty = document.createElement("div");
+    empty.className = "hybrid-callout";
+    empty.textContent = "No line-level Pinecone evidence was returned.";
     panel.appendChild(empty);
+
+    const diagnostics = document.createElement("ul");
+    diagnostics.className = "hybrid-list diagnostics";
+    const fallbackReason = String(hybridDebug.fallback_reason || "");
+    if (fallbackReason) {
+      const item = document.createElement("li");
+      item.textContent = `Reason: ${formatHybridFallbackReason(fallbackReason, graphMeta)}`;
+      diagnostics.appendChild(item);
+    }
+    const steps = Array.isArray(routeDebug.steps) ? routeDebug.steps : [];
+    const pineconeStep = [...steps].reverse().find((step) => step && step.name === "pinecone");
+    if (pineconeStep) {
+      const item = document.createElement("li");
+      item.textContent = `Pinecone step: filtered=${Boolean(pineconeStep.filtered)}, top_k=${Number(pineconeStep.top_k || 0) || "n/a"}`;
+      diagnostics.appendChild(item);
+    }
+    const candidateCount = Number(hybridDebug.candidate_files_count || 0);
+    const evidenceFiles = Number(hybridDebug.evidence_files_count || 0);
+    const itemCounts = document.createElement("li");
+    itemCounts.textContent = `Counts: candidate_files=${candidateCount}, evidence_files=${evidenceFiles}`;
+    diagnostics.appendChild(itemCounts);
+
+    const testFilter = routeDebug.test_filter && typeof routeDebug.test_filter === "object"
+      ? routeDebug.test_filter
+      : {};
+    if (Object.keys(testFilter).length) {
+      const item = document.createElement("li");
+      item.textContent = `Test filter: include_tests=${Boolean(testFilter.include_tests)}, excluded=${Number(testFilter.excluded_test_candidates || 0)}`;
+      diagnostics.appendChild(item);
+    }
+
+    if (diagnostics.children.length) {
+      panel.appendChild(diagnostics);
+    }
+
+    const tips = document.createElement("ul");
+    tips.className = "hybrid-list";
+    const target = String(graph.target_symbol || "").trim();
+    if (target) {
+      const tip = document.createElement("li");
+      tip.textContent = `Try: "Show callers of ${target} with file:line citations."`;
+      tips.appendChild(tip);
+    }
+    const tip2 = document.createElement("li");
+    tip2.textContent = "Try Search mode on one candidate file to verify Pinecone coverage before synthesis.";
+    tips.appendChild(tip2);
+    panel.appendChild(tips);
     return;
   }
 
-  const list = document.createElement("ul");
-  list.className = "hybrid-evidence-list";
+  const list = document.createElement("div");
+  list.className = "citations hybrid-evidence-citations";
   for (const row of evidenceRows.slice(0, 8)) {
-    const item = document.createElement("li");
-    const idx = Number(row.citation_index || 0);
-    const file = String(row.file_path || "unknown");
-    const start = Number(row.line_start || 1);
-    const end = Number(row.line_end || start);
-    const snippet = String(row.snippet || "").trim();
-    item.textContent = `[${idx}] ${file}:${start}-${end}${snippet ? ` — ${snippet}` : ""}`;
-    list.appendChild(item);
+    const entry = {
+      file_path: String(row.file_path || "unknown"),
+      line_start: Number(row.line_start || 1),
+      line_end: Number(row.line_end || Number(row.line_start || 1)),
+      score: Number(row.score || 0),
+      source_type: String(row.source_type || "repo"),
+      snippet: String(row.snippet || ""),
+    };
+    renderCitation(list, entry, Number(row.citation_index || 0) || 1);
   }
   panel.appendChild(list);
 }
@@ -1916,11 +2079,21 @@ function addMessage(role, text, citations = [], meta = {}) {
 
       const architecturePanel = document.createElement("section");
       architecturePanel.className = "hybrid-panel architecture";
-      renderHybridArchitecturePanel(architecturePanel, meta.hybridGraph || {});
+      renderHybridArchitecturePanel(
+        architecturePanel,
+        meta.hybridGraph || {},
+        meta.hybridEvidence || [],
+        meta.debugPayload || null,
+      );
 
       const evidencePanel = document.createElement("section");
       evidencePanel.className = "hybrid-panel evidence";
-      renderHybridEvidencePanel(evidencePanel, meta.hybridEvidence || []);
+      renderHybridEvidencePanel(
+        evidencePanel,
+        meta.hybridEvidence || [],
+        meta.hybridGraph || {},
+        meta.debugPayload || null,
+      );
 
       hybridPanels.append(architecturePanel, evidencePanel);
       bubbleWrap.appendChild(hybridPanels);

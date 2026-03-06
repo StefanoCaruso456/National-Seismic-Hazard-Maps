@@ -2184,7 +2184,8 @@ function addMessage(role, text, citations = [], meta = {}) {
     }
   }
 
-  if (citations.length) {
+  const renderInlineCitations = !(role === "assistant" && meta.modeValue === "hybrid");
+  if (renderInlineCitations && citations.length) {
     citations.forEach((item, index) => renderCitation(citationsWrap, item, index + 1));
   } else {
     citationsWrap.remove();

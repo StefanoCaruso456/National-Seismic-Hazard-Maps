@@ -681,10 +681,39 @@ body {
 }
 
 .hybrid-graph-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 8px;
+  align-items: center;
+}
+
+.hybrid-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border-radius: 999px;
+  border: 1px solid rgba(95, 137, 149, 0.2);
+  background: rgba(255, 255, 255, 0.58);
+  padding: 2px 8px;
   font-size: 11px;
-  letter-spacing: 0.01em;
   color: var(--ink-soft);
-  word-spacing: 10px;
+}
+
+.hybrid-legend-swatch {
+  width: 9px;
+  height: 9px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.6);
+  flex: 0 0 9px;
+}
+
+.hybrid-legend-label {
+  color: var(--ink-soft);
+}
+
+.hybrid-legend-count {
+  font-weight: 700;
+  color: var(--ink);
 }
 
 .hybrid-panel-empty {

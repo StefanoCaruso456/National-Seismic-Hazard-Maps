@@ -1429,6 +1429,35 @@ const HYBRID_GRAPH_COLORS = {
   edge: "rgba(70, 92, 105, 0.35)",
 };
 
+const HYBRID_NODE_KIND_LABELS = {
+  query: "Query",
+  process: "Process",
+  symbol: "Symbol",
+  entrypoint: "Entrypoint",
+  impact: "Impact",
+  file: "File",
+  default: "Other",
+};
+
+function hybridNodeKindCounts(nodes) {
+  const counts = {
+    query: 0,
+    process: 0,
+    symbol: 0,
+    entrypoint: 0,
+    impact: 0,
+    file: 0,
+    default: 0,
+  };
+  if (!Array.isArray(nodes)) return counts;
+  for (const node of nodes) {
+    const rawKind = String(node?.kind || "default");
+    const kind = Object.prototype.hasOwnProperty.call(counts, rawKind) ? rawKind : "default";
+    counts[kind] += 1;
+  }
+  return counts;
+}
+
 function buildHybridGraphModel(graphPayload) {
   const graph = graphPayload && typeof graphPayload === "object" ? graphPayload : {};
   const canvas = graph.canvas && typeof graph.canvas === "object" ? graph.canvas : {};
@@ -1668,7 +1697,28 @@ function renderHybridGraphCanvas(panel, graphPayload) {
 
   const legend = document.createElement("div");
   legend.className = "hybrid-graph-legend";
-  legend.textContent = "query process symbol entrypoint impact file";
+  const kindCounts = hybridNodeKindCounts(model.nodes);
+  const legendOrder = ["query", "process", "symbol", "entrypoint", "impact", "file", "default"];
+  legendOrder.forEach((kind) => {
+    const item = document.createElement("div");
+    item.className = "hybrid-legend-item";
+
+    const swatch = document.createElement("span");
+    swatch.className = "hybrid-legend-swatch";
+    swatch.style.backgroundColor = hybridNodeKindColor(kind);
+    swatch.title = `${HYBRID_NODE_KIND_LABELS[kind]}`;
+
+    const label = document.createElement("span");
+    label.className = "hybrid-legend-label";
+    label.textContent = HYBRID_NODE_KIND_LABELS[kind];
+
+    const count = document.createElement("span");
+    count.className = "hybrid-legend-count";
+    count.textContent = String(kindCounts[kind] || 0);
+
+    item.append(swatch, label, count);
+    legend.appendChild(item);
+  });
 
   wrap.append(toolbar, viewport, details, legend);
   panel.appendChild(wrap);

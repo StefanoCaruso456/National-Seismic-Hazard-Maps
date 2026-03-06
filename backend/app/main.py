@@ -4739,6 +4739,17 @@ def run_routed_retrieval_plan(
         processes = graph_payload.get("processes", []) if isinstance(graph_payload, dict) else []
         entrypoints = graph_payload.get("entrypoints", []) if isinstance(graph_payload, dict) else []
         graph_errors = graph_payload.get("errors", []) if isinstance(graph_payload, dict) else []
+        lowered_errors = [str(item).lower() for item in graph_errors] if isinstance(graph_errors, list) else []
+        symbol_not_found = any("symbol" in item and "not found" in item for item in lowered_errors)
+        if symbol_not_found and str(graph_payload.get("target_symbol") or "").strip():
+            graph_files_all = []
+            graph_files = []
+            if isinstance(graph_payload, dict):
+                graph_payload["candidate_files"] = []
+                graph_payload["candidate_file_ranking"] = []
+                raw_counts = graph_payload.get("raw_counts")
+                if isinstance(raw_counts, dict):
+                    raw_counts["files"] = 0
         graph_step: dict[str, Any] = {
             "name": "graph",
             "ms": round((time.perf_counter() - started) * 1000.0, 2),
@@ -4885,6 +4896,18 @@ def run_routed_retrieval_plan(
     )
 
     low_conf_reason = low_confidence_reason(citations)
+    if low_conf_reason and candidate_files:
+        unconstrained_citations, unconstrained_chunks, unconstrained_debug = step_vector(
+            None,
+            include_tests_for_step=include_tests,
+            fallback_with_tests_flag=False,
+        )
+        if unconstrained_citations:
+            citations = unconstrained_citations
+            chunks = unconstrained_chunks
+            retrieval_debug = unconstrained_debug
+            selected_candidate_files = []
+            low_conf_reason = low_confidence_reason(citations)
     if not low_conf_reason and selected_plan in {PLAN_GRAPH_PLUS_VECTOR, PLAN_GRAPH_PLUS_KEYWORD_PLUS_VECTOR}:
         graph_errors = graph_payload.get("errors", []) if isinstance(graph_payload, dict) else []
         if isinstance(graph_errors, list) and any(str(item).strip() for item in graph_errors):
@@ -5202,15 +5225,11 @@ def compose_hybrid_answer(
     repo_id = str(graph_meta.get("repo_id") or graph.get("repo") or "unknown-repo")
     commit_hash = str(graph_meta.get("commit_hash") or "unknown")
     processes = graph.get("processes", []) if isinstance(graph, dict) else []
-    entrypoints = graph.get("entrypoints", []) if isinstance(graph, dict) else []
     candidate_files = graph.get("candidate_files", []) if isinstance(graph, dict) else []
     graph_errors = graph.get("errors", []) if isinstance(graph, dict) else []
-
-    reliability = "Low"
-    if evidence_rows:
-        reliability = "High" if len(evidence_rows) >= 4 else "Medium"
-    elif isinstance(processes, list) and processes:
-        reliability = "Medium"
+    process_count = len(processes) if isinstance(processes, list) else 0
+    candidate_count = len(candidate_files) if isinstance(candidate_files, list) else 0
+    target_symbol = str(graph.get("target_symbol") or "").strip()
 
     fallback_reason_notes = {
         "graph_not_indexed": (
@@ -5224,95 +5243,55 @@ def compose_hybrid_answer(
         "retrieval_graph_unavailable": "Graph service reported errors, so retrieval relied on fallback behavior.",
         "retrieval_low_confidence": "Retrieved chunks were low-confidence after reranking.",
     }
-
-    lines.append("I. Retrieval Verdict")
-    lines.append(
-        f"- Graph coverage: {len(processes) if isinstance(processes, list) else 0} process flow(s), "
-        f"{len(candidate_files) if isinstance(candidate_files, list) else 0} candidate file(s), repo `{repo_id}`."
-    )
+    lines.append("Summary")
     if evidence_rows:
-        lines.append(f"- Evidence coverage: {len(evidence_rows)} cited chunk(s) with file:line references.")
+        lines.append(
+            f"- Evidence-backed result: {len(evidence_rows)} line-level citation(s) returned for this question."
+        )
     else:
-        lines.append("- Evidence coverage: no line-level Pinecone citations were returned.")
-    lines.append(f"- Reliability: {reliability}.")
+        lines.append("- Architecture-only result: no line-level Pinecone citations were returned.")
+    lines.append(f"- Graph coverage: {process_count} process flow(s) in repo `{repo_id}`.")
     if fallback_reason:
         lines.append(f"- Retrieval diagnostic: {fallback_reason_notes.get(fallback_reason, fallback_reason)}")
     if used_fallback:
-        lines.append("- Retrieval fallback executed (graph-constrained path did not produce usable evidence).")
+        lines.append("- Retrieval fallback path was used.")
 
-    lines.append("")
-    lines.append("II. Architecture Highlights (graph)")
     if isinstance(processes, list) and processes:
-        lines.append(f"- GitNexus identified {len(processes)} relevant process flow(s).")
-        for process in processes[:5]:
+        top_processes: list[str] = []
+        for process in processes[:3]:
             if not isinstance(process, dict):
                 continue
             label = str(process.get("summary") or process.get("id") or "Unnamed process").strip()
-            priority = process.get("priority")
-            if priority is None:
-                lines.append(f"- {label}")
-            else:
-                lines.append(f"- {label} (priority {priority})")
-    else:
-        lines.append("- No process flow cleared the graph relevance threshold for this query.")
-
-    if isinstance(graph_errors, list):
-        condensed_errors = [str(item).strip() for item in graph_errors if str(item).strip()]
-        if condensed_errors:
-            lines.append(f"- Graph errors: {'; '.join(condensed_errors[:3])}")
-    if isinstance(entrypoints, list) and entrypoints:
-        lines.append(f"- Entrypoints/signals: {', '.join(str(item) for item in entrypoints[:8])}")
-
-    if isinstance(candidate_files, list) and candidate_files:
-        preview = ", ".join(str(item) for item in candidate_files[:8])
-        suffix = " ..." if len(candidate_files) > 8 else ""
-        lines.append(
-            f"- Candidate files constraining retrieval ({len(candidate_files)}): {preview}{suffix}"
-        )
-
-    impact = graph.get("impact", {}) if isinstance(graph, dict) else {}
-    if isinstance(impact, dict):
-        upstream = impact.get("upstream", {}) if isinstance(impact.get("upstream"), dict) else {}
-        downstream = impact.get("downstream", {}) if isinstance(impact.get("downstream"), dict) else {}
-        upstream_count = safe_int(upstream.get("impactedCount")) or 0
-        downstream_count = safe_int(downstream.get("impactedCount")) or 0
-        if upstream_count or downstream_count:
-            lines.append(
-                f"- Impact snapshot for target {graph.get('target_symbol') or 'n/a'}: upstream={upstream_count}, downstream={downstream_count}"
-            )
+            if label:
+                top_processes.append(label)
+        if top_processes:
+            lines.append(f"- Top graph signals: {', '.join(top_processes)}.")
 
     lines.append("")
-    lines.append("III. Evidence-backed Findings (with citations)")
     if evidence_rows:
-        lines.append(f'- Evidence for "{question}":')
-        for row in evidence_rows[:8]:
+        lines.append("Evidence Highlights")
+        for row in evidence_rows[:3]:
             lines.append(
-                f"- [{row.get('citation_index')}] {row.get('file_path')}:{row.get('line_start')}-{row.get('line_end')} {row.get('snippet')}"
+                f"- [{row.get('citation_index')}] {row.get('file_path')}:{row.get('line_start')}-{row.get('line_end')}"
             )
     else:
-        lines.append("- No Pinecone evidence rows were returned for this question.")
-        lines.append("- Treat this result as architecture-only guidance until line-level citations are present.")
-        if isinstance(candidate_files, list) and candidate_files:
-            lines.append(
-                f"- Graph constrained retrieval to {len(candidate_files)} file(s); no chunks matched those files in Pinecone."
-            )
-
-    lines.append("")
-    lines.append("IV. Next Actions")
-    if evidence_rows:
-        lines.append("- Open the top cited chunks to confirm control/data-flow assumptions before making changes.")
-    else:
-        target_symbol = str(graph.get("target_symbol") or "").strip()
+        lines.append("Why Evidence Is Missing")
+        lines.append(f"- Candidate file constraints: {candidate_count} file(s).")
         if target_symbol:
-            lines.append(f"- Run a symbol-specific query: `Show callers of {target_symbol} with file:line citations`.")
-        else:
-            lines.append("- Run a symbol/file-specific query (routine name + file) to force line-level evidence retrieval.")
-    if not isinstance(candidate_files, list) or not candidate_files:
-        lines.append("- Graph candidate files were empty; inspect `hybrid_debug.fallback_reason` and graph diagnostics.")
-        if isinstance(graph_errors, list) and any(str(item).strip() for item in graph_errors):
-            lines.append("- Graph engine reported an error; verify GitNexus runtime/index availability for this deployment.")
+            lines.append(f"- Graph target symbol: `{target_symbol}`.")
+        if isinstance(graph_errors, list):
+            condensed_errors = [str(item).strip() for item in graph_errors if str(item).strip()]
+            if condensed_errors:
+                lines.append(f"- Graph errors: {'; '.join(condensed_errors[:2])}")
+
+    lines.append("")
+    lines.append("Next Best Query")
+    if target_symbol:
+        lines.append(f"- Show callers of {target_symbol} with file:line citations.")
+    elif evidence_rows:
+        lines.append("- Explain the control/data flow using only citations [1]-[3].")
     else:
-        lines.append("- Run `mode=search` on one candidate file to validate Pinecone coverage for that path.")
+        lines.append("- Use Search mode on one candidate file to verify Pinecone coverage, then rerun Hybrid.")
     return "\n".join(lines)
 
 

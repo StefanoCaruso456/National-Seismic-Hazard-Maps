@@ -5,6 +5,10 @@ class Settings(BaseSettings):
     app_name: str = "LegacyLens API"
     app_env: str = "production"
     app_debug: bool = False
+    telemetry_enabled: bool = True
+    telemetry_database_url: str = ""
+    telemetry_db_path: str = ""
+    telemetry_recent_limit: int = 25
 
     openai_api_key: str | None = None
     pinecone_api_key: str | None = None
@@ -53,6 +57,13 @@ class Settings(BaseSettings):
     startup_smoke_mode: str = "off"
     startup_smoke_query: str = "startup health probe"
     startup_smoke_top_k: int = 1
+    pricing_pinecone_read_unit_per_million_usd: float = 16.0
+    pricing_pinecone_write_unit_per_million_usd: float = 0.0
+    pricing_llm_input_per_million_usd: float = 0.15
+    pricing_llm_cached_input_per_million_usd: float = 0.075
+    pricing_llm_output_per_million_usd: float = 0.60
+    pricing_embedding_input_per_million_usd: float = 0.02
+    pricing_rerank_input_per_million_usd: float = 0.0
 
     model_config = SettingsConfigDict(
         env_file=".env",

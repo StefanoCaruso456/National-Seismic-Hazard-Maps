@@ -1604,10 +1604,11 @@ function renderCitation(citationsWrap, item, index) {
   citationsWrap.appendChild(card);
 }
 
-function stripMarkdownBold(text) {
+function stripAssistantMarkdown(text) {
   return String(text || "")
     .replace(/\*\*([^*]+?)\*\*/g, "$1")
-    .replace(/\*\*/g, "");
+    .replace(/\*\*/g, "")
+    .replace(/^\s{0,3}#{1,6}\s+/gm, "");
 }
 
 function normalizeDiagramText(text) {
@@ -2379,7 +2380,7 @@ function addMessage(role, text, citations = [], meta = {}) {
   const bubbleWrap = node.querySelector(".bubble-wrap");
   const citationsWrap = node.querySelector(".citations");
   const metaRow = node.querySelector(".message-meta");
-  let renderedText = role === "assistant" ? stripMarkdownBold(text) : text;
+  let renderedText = role === "assistant" ? stripAssistantMarkdown(text) : text;
   if (role === "assistant" && meta.modeValue === "diagrams") {
     renderedText = normalizeDiagramText(renderedText);
   }

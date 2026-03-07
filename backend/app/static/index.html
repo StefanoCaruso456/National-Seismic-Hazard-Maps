@@ -103,8 +103,15 @@
         <section class="debug-panel hidden" id="debugPanel">
           <div class="debug-head">
             <strong>Debug Trace</strong>
-            <span id="debugStateLabel">off</span>
+            <div class="debug-head-actions">
+              <button class="tiny-btn" type="button" id="refreshTelemetryBtn">Refresh telemetry</button>
+              <span id="debugStateLabel">off</span>
+            </div>
           </div>
+          <section class="telemetry-admin" id="telemetryAdmin">
+            <div class="telemetry-summary-grid" id="telemetrySummaryGrid"></div>
+            <div class="telemetry-recent" id="telemetryRecent"></div>
+          </section>
           <pre id="debugContent">Debug trace will appear here when enabled.</pre>
         </section>
 

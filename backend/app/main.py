@@ -47,6 +47,15 @@ from app.router import (
     route_debug_template,
     select_retrieval_plan,
 )
+from app.telemetry import (
+    RagRequestTelemetry,
+    create_request_telemetry,
+    emit_telemetry_log,
+    get_telemetry_store,
+    parse_embedding_usage,
+    parse_openai_usage,
+    parse_pinecone_usage,
+)
 
 logger = logging.getLogger("legacylens.api")
 IDENTIFIER_PATTERN = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]{2,}")
@@ -190,6 +199,7 @@ class QueryRequest(BaseModel):
     question: str = Field(min_length=3, max_length=QUERY_MAX_CHARS)
     top_k: int = Field(default=5, ge=1, le=50)
     mode: str = Field(default="chat")
+    ui_mode: str | None = Field(default=None, max_length=40)
     scope: str = Field(default="both")
     project_id: str = Field(default="nshmp-main", min_length=1, max_length=80)
     path_prefix: str | None = Field(default=None, max_length=260)
@@ -215,6 +225,7 @@ class QueryResponse(BaseModel):
     evidence: list[dict[str, Any]] = Field(default_factory=list)
     evidence_strength: dict[str, Any] = Field(default_factory=dict)
     debug: dict[str, Any] = Field(default_factory=dict)
+    telemetry: dict[str, Any] = Field(default_factory=dict)
 
 
 class FileResult(BaseModel):
@@ -249,12 +260,32 @@ class SearchResponse(BaseModel):
     matches: list[Citation] = Field(default_factory=list)
     evidence_strength: dict[str, Any] = Field(default_factory=dict)
     debug: dict[str, Any] = Field(default_factory=dict)
+    telemetry: dict[str, Any] = Field(default_factory=dict)
     result_type: str = "Ranked Chunks"
     summary: str | None = None
     follow_ups: list[str] = Field(default_factory=list)
     file_results: list[FileResult] = Field(default_factory=list)
     graph_edges: list[DependencyEdge] = Field(default_factory=list)
     pattern_examples: list[PatternExample] = Field(default_factory=list)
+
+
+class TelemetrySummaryResponse(BaseModel):
+    request_count: int
+    avg_cost_usd_est: float
+    avg_latency_ms: float
+    p50_latency_ms: float
+    p95_latency_ms: float
+    p99_latency_ms: float
+    failure_rate: float
+    average_retrieved_chunks: float
+    average_selected_chunks: float
+    cost_by_mode: list[dict[str, Any]] = Field(default_factory=list)
+    cost_by_repo: list[dict[str, Any]] = Field(default_factory=list)
+    cost_by_model: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class TelemetryRequestsResponse(BaseModel):
+    requests: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class PineconeDebugResponse(BaseModel):
@@ -516,6 +547,11 @@ def enforce_startup_smoke_gate() -> None:
 
 @app.on_event("startup")
 def startup_event() -> None:
+    if settings.telemetry_enabled:
+        try:
+            get_telemetry_store()
+        except Exception as exc:
+            logger.warning("Telemetry store initialization failed: %s", exc)
     if settings.gitnexus_enabled and settings.gitnexus_bootstrap_enabled:
         try:
             ensure_gitnexus_bootstrap_index(force=False)
@@ -574,6 +610,34 @@ def retrieval_info() -> RetrievalInfoResponse:
         hybrid_max_candidate_files=max(settings.hybrid_max_candidate_files, 1),
         gitnexus_enabled=bool(settings.gitnexus_enabled),
     )
+
+
+@app.get("/api/telemetry/summary", response_model=TelemetrySummaryResponse)
+def telemetry_summary() -> TelemetrySummaryResponse:
+    if not settings.telemetry_enabled:
+        return TelemetrySummaryResponse(
+            request_count=0,
+            avg_cost_usd_est=0.0,
+            avg_latency_ms=0.0,
+            p50_latency_ms=0.0,
+            p95_latency_ms=0.0,
+            p99_latency_ms=0.0,
+            failure_rate=0.0,
+            average_retrieved_chunks=0.0,
+            average_selected_chunks=0.0,
+            cost_by_mode=[],
+            cost_by_repo=[],
+            cost_by_model=[],
+        )
+    return TelemetrySummaryResponse(**get_telemetry_store().summary())
+
+
+@app.get("/api/telemetry/requests", response_model=TelemetryRequestsResponse)
+def telemetry_requests(limit: int = 25) -> TelemetryRequestsResponse:
+    if not settings.telemetry_enabled:
+        return TelemetryRequestsResponse(requests=[])
+    safe_limit = max(1, min(int(limit or settings.telemetry_recent_limit), 200))
+    return TelemetryRequestsResponse(requests=get_telemetry_store().recent(safe_limit))
 
 
 def get_openai_client() -> OpenAI:
@@ -1837,6 +1901,7 @@ def validate_query_request(
     top_k: int,
     debug: bool = False,
     mode: str = "chat",
+    ui_mode: str | None = None,
     scope: str = "both",
     project_id: str | None = None,
     path_prefix: str | None = None,
@@ -1849,6 +1914,7 @@ def validate_query_request(
             top_k=top_k,
             debug=debug,
             mode=normalize_mode(mode),
+            ui_mode=str(ui_mode or "").strip().lower() or None,
             scope=normalize_scope(scope),
             project_id=normalize_project_id(project_id),
             path_prefix=normalize_path_prefix(path_prefix),
@@ -1870,10 +1936,12 @@ def embed_texts(
     texts: list[str],
     check_index_dimension: bool = False,
     index_dim: int | None = None,
+    telemetry: RagRequestTelemetry | None = None,
 ) -> list[list[float]]:
     if not texts:
         return []
     client = get_openai_client()
+    started = time.perf_counter()
     response = call_with_retries(
         "openai embeddings",
         lambda: client.embeddings.create(
@@ -1881,6 +1949,14 @@ def embed_texts(
             input=texts,
         ),
     )
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    if telemetry:
+        usage = parse_embedding_usage(response)
+        estimated_input_tokens = sum(token_count(text) for text in texts)
+        telemetry.record_embedding(
+            input_tokens=max(int(usage.get("input_tokens") or 0), estimated_input_tokens),
+            latency_ms=elapsed_ms,
+        )
     embeddings = [list(item.embedding) for item in response.data]
     if check_index_dimension and embeddings:
         ensure_embedding_dimension_matches_index(len(embeddings[0]), index_dim=index_dim)
@@ -2273,7 +2349,7 @@ def cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float:
 
 
 @lru_cache(maxsize=max(settings.embedding_cache_size, 1))
-def _cached_question_embedding(question: str) -> tuple[float, ...]:
+def _cached_question_embedding(question: str) -> tuple[tuple[float, ...], int]:
     client = get_openai_client()
     response = call_with_retries(
         "openai embeddings",
@@ -2282,14 +2358,31 @@ def _cached_question_embedding(question: str) -> tuple[float, ...]:
             input=question,
         ),
     )
-    return tuple(response.data[0].embedding)
+    usage = parse_embedding_usage(response)
+    input_tokens = max(int(usage.get("input_tokens") or 0), token_count(question))
+    return tuple(response.data[0].embedding), input_tokens
 
 
-def embed_question(question: str) -> list[float]:
+def embed_question(
+    question: str,
+    telemetry: RagRequestTelemetry | None = None,
+) -> tuple[list[float], dict[str, Any]]:
     normalized = question.strip()
     if not normalized:
-        return []
-    return list(_cached_question_embedding(normalized))
+        return [], {"from_cache": False, "latency_ms": 0.0, "input_tokens": 0}
+    cache_before = _cached_question_embedding.cache_info()
+    started = time.perf_counter()
+    embedding, input_tokens = _cached_question_embedding(normalized)
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    cache_after = _cached_question_embedding.cache_info()
+    from_cache = cache_after.hits > cache_before.hits
+    if telemetry and not from_cache:
+        telemetry.record_embedding(input_tokens=input_tokens, latency_ms=elapsed_ms)
+    return list(embedding), {
+        "from_cache": from_cache,
+        "latency_ms": 0.0 if from_cache else elapsed_ms,
+        "input_tokens": 0 if from_cache else input_tokens,
+    }
 
 
 def normalize_matches(query_response: object) -> list:
@@ -3833,11 +3926,11 @@ def query_index_with_cache(
     candidate_top_k: int,
     namespace: str,
     pinecone_filter: dict[str, Any] | None,
-) -> tuple[list[dict[str, Any]], bool]:
+) -> tuple[list[dict[str, Any]], bool, dict[str, float]]:
     key = pinecone_query_cache_key(query_text, namespace, candidate_top_k, pinecone_filter)
     cached = query_cache_get(key)
     if cached is not None:
-        return cached, True
+        return cached, True, {"read_units": 0.0, "write_units": 0.0, "query_count": 0.0, "latency_ms": 0.0}
 
     query_kwargs: dict[str, Any] = {
         "vector": question_vector,
@@ -3847,10 +3940,18 @@ def query_index_with_cache(
     }
     if pinecone_filter:
         query_kwargs["filter"] = pinecone_filter
+    started = time.perf_counter()
     results = call_with_retries("pinecone query", lambda: index.query(**query_kwargs))
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    usage = parse_pinecone_usage(results)
     query_matches = normalize_cached_matches(normalize_matches(results))
     query_cache_put(key, query_matches)
-    return query_matches, False
+    return query_matches, False, {
+        "read_units": float(usage.get("read_units") or 0.0),
+        "write_units": float(usage.get("write_units") or 0.0),
+        "query_count": 1.0,
+        "latency_ms": elapsed_ms,
+    }
 
 
 def build_pinecone_filter(
@@ -3923,6 +4024,7 @@ def retrieve_citations_and_chunks(
     lexical_file_scores: dict[str, float] | None = None,
     candidate_top_k_override: int | None = None,
     include_tests: bool = True,
+    telemetry: RagRequestTelemetry | None = None,
 ) -> tuple[list[Citation], list[str], dict[str, Any]]:
     queries = retrieval_queries or [question]
     target_namespaces = namespaces or query_namespaces()
@@ -3967,9 +4069,8 @@ def retrieve_citations_and_chunks(
     cache_misses = 0
     excluded_test_candidates = max(int(excluded_candidate_tests), 0)
     for query_text in queries:
-        embed_started = time.perf_counter()
-        question_vector = embed_question(query_text)
-        embed_ms += (time.perf_counter() - embed_started) * 1000.0
+        question_vector, embedding_debug = embed_question(query_text, telemetry=telemetry)
+        embed_ms += float(embedding_debug.get("latency_ms") or 0.0)
         if not question_vector:
             subquery_counts.append({"query": query_text, "matches": 0})
             continue
@@ -3977,8 +4078,7 @@ def retrieve_citations_and_chunks(
 
         query_matches: list = []
         for namespace in target_namespaces:
-            pinecone_started = time.perf_counter()
-            query_matches, from_cache = query_index_with_cache(
+            query_matches, from_cache, pinecone_usage = query_index_with_cache(
                 index=index,
                 query_text=query_text,
                 question_vector=question_vector,
@@ -3986,11 +4086,18 @@ def retrieve_citations_and_chunks(
                 namespace=namespace,
                 pinecone_filter=pinecone_filter,
             )
-            pinecone_ms += (time.perf_counter() - pinecone_started) * 1000.0
+            pinecone_ms += float(pinecone_usage.get("latency_ms") or 0.0)
             if from_cache:
                 cache_hits += 1
             else:
                 cache_misses += 1
+                if telemetry:
+                    telemetry.record_pinecone(
+                        read_units=float(pinecone_usage.get("read_units") or 0.0),
+                        write_units=float(pinecone_usage.get("write_units") or 0.0),
+                        query_count=int(pinecone_usage.get("query_count") or 0),
+                        latency_ms=float(pinecone_usage.get("latency_ms") or 0.0),
+                    )
             if query_matches:
                 break
 
@@ -4047,6 +4154,8 @@ def retrieve_citations_and_chunks(
     rerank_started = time.perf_counter()
     reranked, debug_candidates = rerank_matches(question=question, matches=matches, top_k=top_k)
     rerank_ms = (time.perf_counter() - rerank_started) * 1000.0
+    if telemetry:
+        telemetry.record_rerank(input_tokens=token_count(question), latency_ms=rerank_ms)
     citations = [Citation(**extract_citation(metadata, score)) for metadata, score in reranked]
     chunks = [metadata_chunk_text(metadata) for metadata, _ in reranked]
     final_test_candidates = sum(1 for citation in citations if is_test_file_path(citation.file_path))
@@ -4079,6 +4188,7 @@ def retrieve_uploaded_citations_and_chunks(
     candidate_files: list[str] | None = None,
     repo_name: str | None = None,
     include_tests: bool = True,
+    telemetry: RagRequestTelemetry | None = None,
 ) -> tuple[list[Citation], list[str], dict[str, Any]]:
     if not uploaded_files:
         return [], [], {"candidates": [], "subqueries": []}
@@ -4095,15 +4205,22 @@ def retrieve_uploaded_citations_and_chunks(
     subquery_counts: list[dict[str, Any]] = []
     excluded_test_candidates = max(int(excluded_candidate_tests), 0)
     queries = retrieval_queries or [question]
+    embed_ms = 0.0
     for query_text in queries:
-        question_vector = embed_question(query_text)
+        question_vector, embedding_debug = embed_question(query_text, telemetry=telemetry)
+        embed_ms += float(embedding_debug.get("latency_ms") or 0.0)
         if not question_vector:
             subquery_counts.append({"query": query_text, "matches": 0})
             continue
 
         count = 0
         for metadata_batch in batched(metadata_chunks, UPLOAD_EMBED_BATCH_SIZE):
-            embeddings = embed_texts([metadata_chunk_text(metadata) for metadata in metadata_batch])
+            batch_started = time.perf_counter()
+            embeddings = embed_texts(
+                [metadata_chunk_text(metadata) for metadata in metadata_batch],
+                telemetry=telemetry,
+            )
+            embed_ms += (time.perf_counter() - batch_started) * 1000.0
             for metadata, embedding in zip(metadata_batch, embeddings, strict=True):
                 scoped = metadata.copy()
                 scoped["query_used"] = query_text
@@ -4136,6 +4253,7 @@ def retrieve_uploaded_citations_and_chunks(
             {
                 "candidates": [],
                 "subqueries": subquery_counts,
+                "timings_ms": {"embed": round(embed_ms, 2), "rerank": 0.0},
                 "test_filter": {
                     "include_tests": bool(include_tests),
                     "excluded_test_candidates": excluded_test_candidates,
@@ -4144,13 +4262,18 @@ def retrieve_uploaded_citations_and_chunks(
             },
         )
 
+    rerank_started = time.perf_counter()
     reranked, debug_candidates = rerank_matches(question=question, matches=matches, top_k=top_k)
+    rerank_ms = (time.perf_counter() - rerank_started) * 1000.0
+    if telemetry:
+        telemetry.record_rerank(input_tokens=token_count(question), latency_ms=rerank_ms)
     citations = [Citation(**extract_citation(metadata, score)) for metadata, score in reranked]
     chunks = [metadata_chunk_text(metadata) for metadata, _ in reranked]
     final_test_candidates = sum(1 for citation in citations if is_test_file_path(citation.file_path))
     debug = {
         "candidates": debug_candidates,
         "subqueries": subquery_counts,
+        "timings_ms": {"embed": round(embed_ms, 2), "rerank": round(rerank_ms, 2)},
         "test_filter": {
             "include_tests": bool(include_tests),
             "excluded_test_candidates": excluded_test_candidates,
@@ -4288,6 +4411,7 @@ def retrieve_with_optional_uploads(
     include_tests: bool | None = None,
     test_intent_detected: bool | None = None,
     fallback_with_tests: bool = False,
+    telemetry: RagRequestTelemetry | None = None,
 ) -> tuple[list[Citation], list[str], dict[str, Any]]:
     started = time.perf_counter()
     normalized_mode = normalize_mode(mode)
@@ -4355,6 +4479,7 @@ def retrieve_with_optional_uploads(
                 lexical_file_scores=lexical_scores,
                 candidate_top_k_override=candidate_top_k_override,
                 include_tests=include_tests_effective,
+                telemetry=telemetry,
             )
             # For identifier-heavy queries, run a focused lexical pass and merge with a small bonus.
             if lexical_enabled and lexical_files and not provided_candidates:
@@ -4372,6 +4497,7 @@ def retrieve_with_optional_uploads(
                     lexical_file_scores=lexical_scores,
                     candidate_top_k_override=candidate_top_k_override,
                     include_tests=include_tests_effective,
+                    telemetry=telemetry,
                 )
         except HTTPException as exc:
             logger.warning("Indexed retrieval unavailable: %s", exc.detail)
@@ -4394,6 +4520,7 @@ def retrieve_with_optional_uploads(
                 repo_name=repo_name,
                 candidate_top_k_override=candidate_top_k_override,
                 include_tests=include_tests_effective,
+                telemetry=telemetry,
             )
         except HTTPException as exc:
             logger.warning("Attachment retrieval unavailable: %s", exc.detail)
@@ -4412,6 +4539,7 @@ def retrieve_with_optional_uploads(
                 candidate_files=provided_candidates,
                 repo_name=repo_name,
                 include_tests=include_tests_effective,
+                telemetry=telemetry,
             )
 
     sets_to_merge: list[tuple[list[Citation], list[str], float]] = []
@@ -4651,6 +4779,7 @@ def run_routed_retrieval_plan(
     path_prefix: str | None = None,
     language: str | None = None,
     source_type_filter: str | None = None,
+    telemetry: RagRequestTelemetry | None = None,
 ) -> tuple[list[Citation], list[str], dict[str, Any], dict[str, Any], dict[str, Any], str]:
     normalized_question = " ".join(str(question or "").split())
     base_plan = select_retrieval_plan(question=normalized_question, mode=mode)
@@ -4817,6 +4946,7 @@ def run_routed_retrieval_plan(
             include_tests=include_tests_for_step,
             test_intent_detected=test_intent_detected,
             fallback_with_tests=fallback_with_tests_flag,
+            telemetry=telemetry,
         )
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         index_debug = (local_debug.get("index", {}) if isinstance(local_debug, dict) else {}) or {}
@@ -4937,26 +5067,35 @@ def run_routed_retrieval_plan(
         route_debug["escalation"] = {"did_escalate": False, "reason": None}
 
     if (not include_tests) and low_conf_reason:
-        fallback_with_tests = True
         fallback_candidates = candidate_files_for_plan(selected_plan, include_tests_for_candidates=True)
         fallback_citations, fallback_chunks, fallback_debug = step_vector(
             fallback_candidates or None,
             include_tests_for_step=True,
             fallback_with_tests_flag=True,
         )
-        include_tests = True
-        if isinstance(graph_payload, dict):
-            graph_payload["candidate_files"] = list(fallback_candidates)
-            raw_counts = graph_payload.get("raw_counts")
-            if isinstance(raw_counts, dict):
-                raw_counts["files"] = len(fallback_candidates)
-        route_debug["escalation"] = {"did_escalate": True, "reason": f"tests_fallback:{low_conf_reason}"}
-        if fallback_citations:
-            citations = fallback_citations
-            chunks = fallback_chunks
-            retrieval_debug = fallback_debug
-            selected_candidate_files = list(fallback_candidates)
-        low_conf_reason = low_confidence_reason(citations)
+        fallback_final_test_candidates = sum(
+            1 for citation in fallback_citations if is_test_file_path(citation.file_path)
+        )
+        should_adopt_test_fallback = (
+            (not citations and bool(fallback_citations))
+            or fallback_final_test_candidates > 0
+            or len(fallback_citations) > len(citations)
+        )
+        if should_adopt_test_fallback:
+            fallback_with_tests = True
+            include_tests = True
+            if isinstance(graph_payload, dict):
+                graph_payload["candidate_files"] = list(fallback_candidates)
+                raw_counts = graph_payload.get("raw_counts")
+                if isinstance(raw_counts, dict):
+                    raw_counts["files"] = len(fallback_candidates)
+            route_debug["escalation"] = {"did_escalate": True, "reason": f"tests_fallback:{low_conf_reason}"}
+            if fallback_citations:
+                citations = fallback_citations
+                chunks = fallback_chunks
+                retrieval_debug = fallback_debug
+                selected_candidate_files = list(fallback_candidates)
+            low_conf_reason = low_confidence_reason(citations)
 
     final_test_candidates = sum(1 for citation in citations if is_test_file_path(citation.file_path))
 
@@ -5318,14 +5457,77 @@ def build_debug_payload(
     return payload
 
 
+def telemetry_mode_value(payload: QueryRequest) -> str:
+    raw = str(payload.ui_mode or payload.mode or "chat").strip().lower()
+    return raw or "chat"
+
+
+def extract_retrieval_counts(retrieval_debug: dict[str, Any], citations: list[Citation]) -> tuple[int, int, int]:
+    candidate_rows: list[dict[str, Any]] = []
+    for key in ("index", "index_lexical", "uploads"):
+        section = retrieval_debug.get(key, {}) if isinstance(retrieval_debug, dict) else {}
+        if not isinstance(section, dict):
+            continue
+        rows = section.get("candidates", [])
+        if isinstance(rows, list):
+            candidate_rows.extend(item for item in rows if isinstance(item, dict))
+    retrieved_file_count = len(
+        {
+            str(item.get("file_path", "")).strip()
+            for item in candidate_rows
+            if str(item.get("file_path", "")).strip()
+        }
+    )
+    retrieved_chunk_count = len(candidate_rows)
+    selected_chunk_count = len(citations)
+    if retrieved_file_count <= 0 and citations:
+        retrieved_file_count = len({citation.file_path for citation in citations if citation.file_path})
+    if retrieved_chunk_count <= 0 and citations:
+        retrieved_chunk_count = len(citations)
+    return retrieved_file_count, retrieved_chunk_count, selected_chunk_count
+
+
+def attach_retrieval_telemetry(
+    telemetry: RagRequestTelemetry,
+    retrieval_debug: dict[str, Any],
+    citations: list[Citation],
+) -> None:
+    if not telemetry:
+        return
+    retrieved_file_count, retrieved_chunk_count, selected_chunk_count = extract_retrieval_counts(
+        retrieval_debug,
+        citations,
+    )
+    telemetry.record_counts(
+        retrieved_file_count=retrieved_file_count,
+        retrieved_chunk_count=retrieved_chunk_count,
+        selected_chunk_count=selected_chunk_count,
+    )
+    telemetry.mark_retrieval_complete()
+
+
+def finalize_and_persist_telemetry(telemetry: RagRequestTelemetry) -> dict[str, Any]:
+    telemetry.finalize()
+    if settings.telemetry_enabled:
+        store = get_telemetry_store()
+        store.persist(telemetry)
+    logger.info("%s", emit_telemetry_log(telemetry))
+    return telemetry.to_response_dict()
+
+
 def is_weak_evidence(evidence: dict[str, Any]) -> bool:
     label = str(evidence.get("label", "")).lower()
     score = float(evidence.get("score", 0.0) or 0.0)
     return label == "low" or score < 0.42
 
 
-def generate_answer(question: str, context: str) -> str:
+def generate_answer(
+    question: str,
+    context: str,
+    telemetry: RagRequestTelemetry | None = None,
+) -> str:
     client = get_openai_client()
+    started = time.perf_counter()
     completion = call_with_retries(
         "openai chat completion",
         lambda: client.chat.completions.create(
@@ -5350,12 +5552,37 @@ def generate_answer(question: str, context: str) -> str:
             ],
         ),
     )
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    if telemetry:
+        usage = parse_openai_usage(getattr(completion, "usage", None))
+        telemetry.record_llm(
+            input_tokens=int(usage.get("prompt_tokens") or 0),
+            output_tokens=int(usage.get("completion_tokens") or 0),
+            cached_input_tokens=int(usage.get("cached_tokens") or 0),
+            latency_ms=elapsed_ms,
+            model_name=str(getattr(completion, "model", settings.openai_chat_model)),
+        )
     content = completion.choices[0].message.content
     return content.strip() if content else "No answer generated."
 
 
-@app.post("/api/search", response_model=SearchResponse)
-def search(payload: QueryRequest) -> SearchResponse:
+def build_request_telemetry(payload: QueryRequest) -> RagRequestTelemetry:
+    return create_request_telemetry(
+        user_query=payload.question,
+        repo_name=normalize_project_id(payload.project_id),
+        mode=telemetry_mode_value(payload),
+        top_k=payload.top_k,
+        model_name=settings.openai_chat_model,
+        embedding_model=settings.openai_embedding_model,
+        rerank_enabled=bool(settings.retrieval_deterministic_rerank_enabled),
+    )
+
+
+def execute_search_request(
+    payload: QueryRequest,
+    uploaded_files: list[dict[str, Any]] | None = None,
+) -> SearchResponse:
+    telemetry = build_request_telemetry(payload)
     started = time.perf_counter()
     path_prefix, language, source_type_filter = normalized_request_filters(
         payload.path_prefix,
@@ -5366,58 +5593,83 @@ def search(payload: QueryRequest) -> SearchResponse:
         citations, chunks, retrieval_debug = retrieve_with_optional_uploads(
             question=payload.question,
             top_k=payload.top_k,
-            uploaded_files=[],
+            uploaded_files=uploaded_files or [],
             mode=normalize_mode(payload.mode),
             scope=normalize_scope(payload.scope),
             project_id=normalize_project_id(payload.project_id),
             path_prefix=path_prefix,
             language=language,
             source_type_filter=source_type_filter,
+            telemetry=telemetry,
         )
-    except HTTPException:
+    except HTTPException as exc:
+        telemetry.mark_failure("retrieval", exc.detail)
+        finalize_and_persist_telemetry(telemetry)
         raise
     except Exception as exc:
+        telemetry.mark_failure("retrieval", exc)
+        finalize_and_persist_telemetry(telemetry)
         raise HTTPException(status_code=502, detail=f"Vector search failed: {exc}") from exc
 
-    analysis = apply_mode_analysis(
-        mode=payload.mode,
-        question=payload.question,
-        citations=citations,
-        chunks=chunks,
-    )
-    citations = analysis["citations"]
-    chunks = analysis["chunks"]
-    mode_metrics = analysis.get("mode_metrics", {})
-    evidence = compute_evidence_strength(
-        payload.question,
-        citations,
-        retrieval_debug,
-        mode=payload.mode,
-        mode_metrics=mode_metrics,
-    )
-    debug_payload: dict[str, Any] = {}
-    if payload.debug:
-        context = build_context(citations, chunks)
-        debug_payload = build_debug_payload(
-            retrieval_debug=retrieval_debug,
-            context=context,
-            latency_ms=(time.perf_counter() - started) * 1000.0,
+    try:
+        postprocess_started = time.perf_counter()
+        analysis = apply_mode_analysis(
+            mode=payload.mode,
+            question=payload.question,
+            citations=citations,
+            chunks=chunks,
         )
-    return SearchResponse(
-        matches=citations,
-        evidence_strength=evidence,
-        debug=debug_payload,
-        result_type=str(analysis.get("result_type", "Ranked Chunks")),
-        summary=analysis.get("summary"),
-        follow_ups=list(analysis.get("follow_ups", [])),
-        file_results=list(analysis.get("file_results", [])),
-        graph_edges=list(analysis.get("graph_edges", [])),
-        pattern_examples=list(analysis.get("pattern_examples", [])),
-    )
+        citations = analysis["citations"]
+        chunks = analysis["chunks"]
+        attach_retrieval_telemetry(telemetry, retrieval_debug, citations)
+        mode_metrics = analysis.get("mode_metrics", {})
+        evidence = compute_evidence_strength(
+            payload.question,
+            citations,
+            retrieval_debug,
+            mode=payload.mode,
+            mode_metrics=mode_metrics,
+        )
+        debug_payload: dict[str, Any] = {}
+        if payload.debug:
+            context = build_context(citations, chunks)
+            debug_payload = build_debug_payload(
+                retrieval_debug=retrieval_debug,
+                context=context,
+                latency_ms=(time.perf_counter() - started) * 1000.0,
+            )
+        telemetry.record_postprocess((time.perf_counter() - postprocess_started) * 1000.0)
+        telemetry.mark_success(str(analysis.get("summary") or ""))
+        response_telemetry = finalize_and_persist_telemetry(telemetry)
+        if payload.debug:
+            debug_payload["telemetry"] = response_telemetry
+        return SearchResponse(
+            matches=citations,
+            evidence_strength=evidence,
+            debug=debug_payload,
+            telemetry=response_telemetry,
+            result_type=str(analysis.get("result_type", "Ranked Chunks")),
+            summary=analysis.get("summary"),
+            follow_ups=list(analysis.get("follow_ups", [])),
+            file_results=list(analysis.get("file_results", [])),
+            graph_edges=list(analysis.get("graph_edges", [])),
+            pattern_examples=list(analysis.get("pattern_examples", [])),
+        )
+    except HTTPException as exc:
+        telemetry.mark_failure("postprocess", exc.detail)
+        finalize_and_persist_telemetry(telemetry)
+        raise
+    except Exception as exc:
+        telemetry.mark_failure("postprocess", exc)
+        finalize_and_persist_telemetry(telemetry)
+        raise HTTPException(status_code=500, detail=f"Search response postprocess failed: {exc}") from exc
 
 
-@app.post("/api/query", response_model=QueryResponse)
-def query(payload: QueryRequest) -> QueryResponse:
+def execute_query_request(
+    payload: QueryRequest,
+    uploaded_files: list[dict[str, Any]] | None = None,
+) -> QueryResponse:
+    telemetry = build_request_telemetry(payload)
     started = time.perf_counter()
     normalized_mode = normalize_mode(payload.mode)
     normalized_scope = normalize_scope(payload.scope)
@@ -5427,78 +5679,203 @@ def query(payload: QueryRequest) -> QueryResponse:
         payload.language,
         payload.source_type,
     )
+    uploaded_files = uploaded_files or []
+
     try:
-        citations, chunks, retrieval_debug, graph_payload, route_debug, routed_plan = run_routed_retrieval_plan(
-            question=payload.question,
-            mode=normalized_mode,
-            top_k=payload.top_k,
-            scope=normalized_scope,
-            project_id=normalized_project_id,
-            path_prefix=path_prefix,
-            language=language,
-            source_type_filter=source_type_filter,
-        )
-    except HTTPException:
+        if uploaded_files and normalized_mode not in {"hybrid", "graph"}:
+            citations, chunks, retrieval_debug = retrieve_with_optional_uploads(
+                question=payload.question,
+                top_k=payload.top_k,
+                uploaded_files=uploaded_files,
+                mode=payload.mode,
+                scope=payload.scope,
+                project_id=payload.project_id,
+                path_prefix=payload.path_prefix,
+                language=payload.language,
+                source_type_filter=payload.source_type,
+                telemetry=telemetry,
+            )
+            graph_payload: dict[str, Any] = {}
+            route_debug: dict[str, Any] = {"route": "direct", "steps": [], "hybrid_debug": {}}
+            routed_plan = PLAN_VECTOR_ONLY
+        else:
+            citations, chunks, retrieval_debug, graph_payload, route_debug, routed_plan = run_routed_retrieval_plan(
+                question=payload.question,
+                mode=normalized_mode,
+                top_k=payload.top_k,
+                scope=normalized_scope,
+                project_id=normalized_project_id,
+                path_prefix=path_prefix,
+                language=language,
+                source_type_filter=source_type_filter,
+                telemetry=telemetry,
+            )
+    except HTTPException as exc:
+        telemetry.mark_failure("retrieval", exc.detail)
+        finalize_and_persist_telemetry(telemetry)
         raise
     except Exception as exc:
+        telemetry.mark_failure("retrieval", exc)
+        finalize_and_persist_telemetry(telemetry)
         raise HTTPException(status_code=502, detail=f"Routed retrieval failed: {exc}") from exc
+
+    if graph_payload.get("repo"):
+        telemetry.repo_name = str(graph_payload.get("repo"))
 
     debug_payload: dict[str, Any] = {
         "route_debug": route_debug,
         "hybrid_debug": route_debug.get("hybrid_debug", {}),
     }
 
-    if routed_plan == PLAN_GRAPH_ONLY:
-        answer = compose_hybrid_answer(
-            question=payload.question,
-            graph=graph_payload,
-            evidence_rows=[],
-            used_fallback=False,
+    try:
+        postprocess_started = time.perf_counter()
+        evidence = compute_evidence_strength(
+            payload.question,
+            citations,
+            retrieval_debug,
+            mode=payload.mode,
+            mode_metrics={},
         )
-        if payload.debug:
-            debug_payload["latency_ms"] = round((time.perf_counter() - started) * 1000.0, 2)
-            debug_payload["graph"] = graph_payload
-        return QueryResponse(
-            answer=answer,
-            citations=[],
-            graph=graph_payload,
-            evidence=[],
-            evidence_strength={
-                "label": "Low",
-                "score": 0.0,
-                "reason": "Graph-only mode does not retrieve Pinecone evidence.",
-                "metrics": {"mode": "graph"},
-            },
-            debug=debug_payload,
-        )
+        evidence_rows = build_hybrid_evidence_rows(citations, chunks, limit=8)
+        attach_retrieval_telemetry(telemetry, retrieval_debug, citations)
 
-    evidence = compute_evidence_strength(
-        payload.question,
-        citations,
-        retrieval_debug,
-        mode=payload.mode,
-        mode_metrics={},
-    )
-    evidence_rows = build_hybrid_evidence_rows(citations, chunks, limit=8)
+        if routed_plan == PLAN_GRAPH_ONLY:
+            answer = compose_hybrid_answer(
+                question=payload.question,
+                graph=graph_payload,
+                evidence_rows=[],
+                used_fallback=False,
+            )
+            if payload.debug:
+                debug_payload["latency_ms"] = round((time.perf_counter() - started) * 1000.0, 2)
+                debug_payload["graph"] = graph_payload
+            telemetry.record_postprocess((time.perf_counter() - postprocess_started) * 1000.0)
+            telemetry.mark_success(answer)
+            response_telemetry = finalize_and_persist_telemetry(telemetry)
+            if payload.debug:
+                debug_payload["telemetry"] = response_telemetry
+            return QueryResponse(
+                answer=answer,
+                citations=[],
+                graph=graph_payload,
+                evidence=[],
+                evidence_strength={
+                    "label": "Low",
+                    "score": 0.0,
+                    "reason": "Graph-only mode does not retrieve Pinecone evidence.",
+                    "metrics": {"mode": "graph"},
+                },
+                debug=debug_payload,
+                telemetry=response_telemetry,
+            )
 
-    if normalized_mode == "hybrid":
-        answer = compose_hybrid_answer(
-            question=payload.question,
-            graph=graph_payload,
-            evidence_rows=evidence_rows,
-            used_fallback=bool(route_debug.get("escalation", {}).get("did_escalate")),
-        )
+        if normalized_mode == "hybrid":
+            answer = compose_hybrid_answer(
+                question=payload.question,
+                graph=graph_payload,
+                evidence_rows=evidence_rows,
+                used_fallback=bool(route_debug.get("escalation", {}).get("did_escalate")),
+            )
+            if payload.debug:
+                context = build_context(citations, chunks) if citations else ""
+                verbose_debug = build_debug_payload(
+                    retrieval_debug=retrieval_debug,
+                    context=context,
+                    latency_ms=(time.perf_counter() - started) * 1000.0,
+                )
+                verbose_debug["graph"] = graph_payload
+                verbose_debug["route_debug"] = route_debug
+                verbose_debug["hybrid_debug"] = route_debug.get("hybrid_debug", {})
+                debug_payload = verbose_debug
+            telemetry.record_postprocess((time.perf_counter() - postprocess_started) * 1000.0)
+            telemetry.mark_success(answer)
+            response_telemetry = finalize_and_persist_telemetry(telemetry)
+            if payload.debug:
+                debug_payload["telemetry"] = response_telemetry
+            return QueryResponse(
+                answer=answer,
+                citations=citations,
+                graph=graph_payload,
+                evidence=evidence_rows,
+                evidence_strength=evidence,
+                debug=debug_payload,
+                telemetry=response_telemetry,
+            )
+
+        if not citations:
+            suggestions = suggest_next_investigation(payload.question, citations)
+            missing_terms = missing_focus_terms_from_debug(retrieval_debug)
+            context = ""
+            if payload.debug:
+                verbose_debug = build_debug_payload(
+                    retrieval_debug=retrieval_debug,
+                    context=context,
+                    latency_ms=(time.perf_counter() - started) * 1000.0,
+                )
+                verbose_debug["route_debug"] = route_debug
+                verbose_debug["hybrid_debug"] = route_debug.get("hybrid_debug", {})
+                debug_payload = verbose_debug
+            answer = insufficient_evidence_answer(payload.question, suggestions, missing_terms=missing_terms)
+            telemetry.record_postprocess((time.perf_counter() - postprocess_started) * 1000.0)
+            telemetry.mark_success(answer)
+            response_telemetry = finalize_and_persist_telemetry(telemetry)
+            if payload.debug:
+                debug_payload["telemetry"] = response_telemetry
+            return QueryResponse(
+                answer=answer,
+                citations=[],
+                graph=graph_payload,
+                evidence=[],
+                evidence_strength=evidence,
+                debug=debug_payload,
+                telemetry=response_telemetry,
+            )
+
+        context = build_context(citations, chunks)
+        if is_weak_evidence(evidence):
+            suggestions = suggest_next_investigation(payload.question, citations)
+            missing_terms = missing_focus_terms_from_debug(retrieval_debug)
+            response_citations = [] if missing_terms else citations
+            if payload.debug:
+                verbose_debug = build_debug_payload(
+                    retrieval_debug=retrieval_debug,
+                    context=context,
+                    latency_ms=(time.perf_counter() - started) * 1000.0,
+                )
+                verbose_debug["route_debug"] = route_debug
+                verbose_debug["hybrid_debug"] = route_debug.get("hybrid_debug", {})
+                debug_payload = verbose_debug
+            answer = insufficient_evidence_answer(payload.question, suggestions, missing_terms=missing_terms)
+            telemetry.record_postprocess((time.perf_counter() - postprocess_started) * 1000.0)
+            telemetry.mark_success(answer)
+            response_telemetry = finalize_and_persist_telemetry(telemetry)
+            if payload.debug:
+                debug_payload["telemetry"] = response_telemetry
+            return QueryResponse(
+                answer=answer,
+                citations=response_citations,
+                graph=graph_payload,
+                evidence=build_hybrid_evidence_rows(response_citations, chunks, limit=8),
+                evidence_strength=evidence,
+                debug=debug_payload,
+                telemetry=response_telemetry,
+            )
+
+        answer = generate_answer(payload.question, context, telemetry=telemetry)
         if payload.debug:
-            context = build_context(citations, chunks) if citations else ""
             verbose_debug = build_debug_payload(
                 retrieval_debug=retrieval_debug,
                 context=context,
                 latency_ms=(time.perf_counter() - started) * 1000.0,
             )
-            verbose_debug["graph"] = graph_payload
             verbose_debug["route_debug"] = route_debug
             verbose_debug["hybrid_debug"] = route_debug.get("hybrid_debug", {})
             debug_payload = verbose_debug
+        telemetry.record_postprocess((time.perf_counter() - postprocess_started) * 1000.0)
+        telemetry.mark_success(answer)
+        response_telemetry = finalize_and_persist_telemetry(telemetry)
+        if payload.debug:
+            debug_payload["telemetry"] = response_telemetry
         return QueryResponse(
             answer=answer,
             citations=citations,
@@ -5506,79 +5883,33 @@ def query(payload: QueryRequest) -> QueryResponse:
             evidence=evidence_rows,
             evidence_strength=evidence,
             debug=debug_payload,
+            telemetry=response_telemetry,
         )
-
-    if not citations:
-        suggestions = suggest_next_investigation(payload.question, citations)
-        missing_terms = missing_focus_terms_from_debug(retrieval_debug)
-        context = ""
-        if payload.debug:
-            verbose_debug = build_debug_payload(
-                retrieval_debug=retrieval_debug,
-                context=context,
-                latency_ms=(time.perf_counter() - started) * 1000.0,
-            )
-            verbose_debug["route_debug"] = route_debug
-            verbose_debug["hybrid_debug"] = route_debug.get("hybrid_debug", {})
-            debug_payload = verbose_debug
-        return QueryResponse(
-            answer=insufficient_evidence_answer(payload.question, suggestions, missing_terms=missing_terms),
-            citations=[],
-            graph=graph_payload,
-            evidence=[],
-            evidence_strength=evidence,
-            debug=debug_payload,
-        )
-
-    context = build_context(citations, chunks)
-    if is_weak_evidence(evidence):
-        suggestions = suggest_next_investigation(payload.question, citations)
-        missing_terms = missing_focus_terms_from_debug(retrieval_debug)
-        response_citations = [] if missing_terms else citations
-        if payload.debug:
-            verbose_debug = build_debug_payload(
-                retrieval_debug=retrieval_debug,
-                context=context,
-                latency_ms=(time.perf_counter() - started) * 1000.0,
-            )
-            verbose_debug["route_debug"] = route_debug
-            verbose_debug["hybrid_debug"] = route_debug.get("hybrid_debug", {})
-            debug_payload = verbose_debug
-        return QueryResponse(
-            answer=insufficient_evidence_answer(payload.question, suggestions, missing_terms=missing_terms),
-            citations=response_citations,
-            graph=graph_payload,
-            evidence=build_hybrid_evidence_rows(response_citations, chunks, limit=8),
-            evidence_strength=evidence,
-            debug=debug_payload,
-        )
-
-    try:
-        answer = generate_answer(payload.question, context)
-    except HTTPException:
+    except HTTPException as exc:
+        telemetry.mark_failure("postprocess", exc.detail)
+        finalize_and_persist_telemetry(telemetry)
         raise
     except ValidationError as exc:
+        telemetry.mark_failure("postprocess", exc)
+        finalize_and_persist_telemetry(telemetry)
         raise HTTPException(status_code=500, detail=f"Response validation error: {exc}") from exc
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"LLM generation failed: {exc}") from exc
+        stage = "llm" if telemetry.llm_latency_ms <= 0 and citations else "postprocess"
+        telemetry.mark_failure(stage, exc)
+        finalize_and_persist_telemetry(telemetry)
+        if stage == "llm":
+            raise HTTPException(status_code=502, detail=f"LLM generation failed: {exc}") from exc
+        raise HTTPException(status_code=500, detail=f"Query response postprocess failed: {exc}") from exc
 
-    if payload.debug:
-        verbose_debug = build_debug_payload(
-            retrieval_debug=retrieval_debug,
-            context=context,
-            latency_ms=(time.perf_counter() - started) * 1000.0,
-        )
-        verbose_debug["route_debug"] = route_debug
-        verbose_debug["hybrid_debug"] = route_debug.get("hybrid_debug", {})
-        debug_payload = verbose_debug
-    return QueryResponse(
-        answer=answer,
-        citations=citations,
-        graph=graph_payload,
-        evidence=evidence_rows,
-        evidence_strength=evidence,
-        debug=debug_payload,
-    )
+
+@app.post("/api/search", response_model=SearchResponse)
+def search(payload: QueryRequest) -> SearchResponse:
+    return execute_search_request(payload)
+
+
+@app.post("/api/query", response_model=QueryResponse)
+def query(payload: QueryRequest) -> QueryResponse:
+    return execute_query_request(payload)
 
 
 @app.post("/api/uploads/ingest", response_model=UploadIngestResponse)
@@ -5663,6 +5994,7 @@ async def search_with_uploads(
     files: list[UploadFile] | None = File(default=None),
     debug: str | None = Form(default=None),
     mode: str = Form("chat"),
+    ui_mode: str | None = Form(default=None),
     scope: str = Form("both"),
     project_id: str | None = Form(default=None),
     path_prefix: str | None = Form(default=None),
@@ -5675,6 +6007,7 @@ async def search_with_uploads(
         top_k=top_k,
         debug=parse_form_bool(debug),
         mode=mode,
+        ui_mode=ui_mode or mode,
         scope=scope,
         project_id=project_id,
         path_prefix=path_prefix,
@@ -5685,59 +6018,7 @@ async def search_with_uploads(
     persist = parse_form_bool(persist_uploads)
     if persist and uploaded_files:
         upsert_attachment_chunks(project_id=payload.project_id, uploaded_files=uploaded_files)
-    started = time.perf_counter()
-
-    try:
-        citations, chunks, retrieval_debug = retrieve_with_optional_uploads(
-            question=payload.question,
-            top_k=payload.top_k,
-            uploaded_files=uploaded_files,
-            mode=payload.mode,
-            scope=payload.scope,
-            project_id=payload.project_id,
-            path_prefix=payload.path_prefix,
-            language=payload.language,
-            source_type_filter=payload.source_type,
-        )
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Upload retrieval failed: {exc}") from exc
-
-    analysis = apply_mode_analysis(
-        mode=payload.mode,
-        question=payload.question,
-        citations=citations,
-        chunks=chunks,
-    )
-    citations = analysis["citations"]
-    chunks = analysis["chunks"]
-    evidence = compute_evidence_strength(
-        payload.question,
-        citations,
-        retrieval_debug,
-        mode=payload.mode,
-        mode_metrics=analysis.get("mode_metrics", {}),
-    )
-    debug_payload: dict[str, Any] = {}
-    if payload.debug:
-        context = build_context(citations, chunks)
-        debug_payload = build_debug_payload(
-            retrieval_debug=retrieval_debug,
-            context=context,
-            latency_ms=(time.perf_counter() - started) * 1000.0,
-        )
-    return SearchResponse(
-        matches=citations,
-        evidence_strength=evidence,
-        debug=debug_payload,
-        result_type=str(analysis.get("result_type", "Ranked Chunks")),
-        summary=analysis.get("summary"),
-        follow_ups=list(analysis.get("follow_ups", [])),
-        file_results=list(analysis.get("file_results", [])),
-        graph_edges=list(analysis.get("graph_edges", [])),
-        pattern_examples=list(analysis.get("pattern_examples", [])),
-    )
+    return execute_search_request(payload, uploaded_files=uploaded_files)
 
 
 @app.post("/api/query/upload", response_model=QueryResponse)
@@ -5747,6 +6028,7 @@ async def query_with_uploads(
     files: list[UploadFile] | None = File(default=None),
     debug: str | None = Form(default=None),
     mode: str = Form("chat"),
+    ui_mode: str | None = Form(default=None),
     scope: str = Form("both"),
     project_id: str | None = Form(default=None),
     path_prefix: str | None = Form(default=None),
@@ -5759,6 +6041,7 @@ async def query_with_uploads(
         top_k=top_k,
         debug=parse_form_bool(debug),
         mode=mode,
+        ui_mode=ui_mode or mode,
         scope=scope,
         project_id=project_id,
         path_prefix=path_prefix,
@@ -5769,97 +6052,4 @@ async def query_with_uploads(
     persist = parse_form_bool(persist_uploads)
     if persist and uploaded_files:
         upsert_attachment_chunks(project_id=payload.project_id, uploaded_files=uploaded_files)
-    normalized_mode = normalize_mode(payload.mode)
-    if normalized_mode in {"hybrid", "graph"}:
-        # Hybrid/graph paths are repo-structure-first and currently ignore transient uploads.
-        return query(payload)
-    started = time.perf_counter()
-
-    try:
-        citations, chunks, retrieval_debug = retrieve_with_optional_uploads(
-            question=payload.question,
-            top_k=payload.top_k,
-            uploaded_files=uploaded_files,
-            mode=payload.mode,
-            scope=payload.scope,
-            project_id=payload.project_id,
-            path_prefix=payload.path_prefix,
-            language=payload.language,
-            source_type_filter=payload.source_type,
-        )
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Upload retrieval failed: {exc}") from exc
-
-    evidence = compute_evidence_strength(
-        payload.question,
-        citations,
-        retrieval_debug,
-        mode=payload.mode,
-        mode_metrics={},
-    )
-    if not citations:
-        suggestions = suggest_next_investigation(payload.question, citations)
-        missing_terms = missing_focus_terms_from_debug(retrieval_debug)
-        debug_payload: dict[str, Any] = {}
-        if payload.debug:
-            debug_payload = build_debug_payload(
-                retrieval_debug=retrieval_debug,
-                context="",
-                latency_ms=(time.perf_counter() - started) * 1000.0,
-            )
-        return QueryResponse(
-            answer=insufficient_evidence_answer(payload.question, suggestions, missing_terms=missing_terms),
-            citations=[],
-            graph={},
-            evidence=[],
-            evidence_strength=evidence,
-            debug=debug_payload,
-        )
-
-    context = build_context(citations, chunks)
-    if is_weak_evidence(evidence):
-        suggestions = suggest_next_investigation(payload.question, citations)
-        missing_terms = missing_focus_terms_from_debug(retrieval_debug)
-        response_citations = [] if missing_terms else citations
-        debug_payload: dict[str, Any] = {}
-        if payload.debug:
-            debug_payload = build_debug_payload(
-                retrieval_debug=retrieval_debug,
-                context=context,
-                latency_ms=(time.perf_counter() - started) * 1000.0,
-            )
-        return QueryResponse(
-            answer=insufficient_evidence_answer(payload.question, suggestions, missing_terms=missing_terms),
-            citations=response_citations,
-            graph={},
-            evidence=build_hybrid_evidence_rows(response_citations, chunks, limit=8),
-            evidence_strength=evidence,
-            debug=debug_payload,
-        )
-
-    try:
-        answer = generate_answer(payload.question, context)
-    except HTTPException:
-        raise
-    except ValidationError as exc:
-        raise HTTPException(status_code=500, detail=f"Response validation error: {exc}") from exc
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"LLM generation failed: {exc}") from exc
-
-    debug_payload: dict[str, Any] = {}
-    if payload.debug:
-        debug_payload = build_debug_payload(
-            retrieval_debug=retrieval_debug,
-            context=context,
-            latency_ms=(time.perf_counter() - started) * 1000.0,
-        )
-    return QueryResponse(
-        answer=answer,
-        citations=citations,
-        graph={},
-        evidence=build_hybrid_evidence_rows(citations, chunks, limit=8),
-        evidence_strength=evidence,
-        debug=debug_payload,
-    )
+    return execute_query_request(payload, uploaded_files=uploaded_files)

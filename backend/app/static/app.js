@@ -39,6 +39,9 @@ const clearPinsBtn = document.getElementById("clearPinsBtn");
 const debugPanel = document.getElementById("debugPanel");
 const debugContent = document.getElementById("debugContent");
 const debugStateLabel = document.getElementById("debugStateLabel");
+const refreshTelemetryBtn = document.getElementById("refreshTelemetryBtn");
+const telemetrySummaryGrid = document.getElementById("telemetrySummaryGrid");
+const telemetryRecent = document.getElementById("telemetryRecent");
 const overlay = document.getElementById("overlay");
 const suggestionOverlay = document.getElementById("suggestionOverlay");
 const suggestionBtn = document.getElementById("suggestionBtn");
@@ -442,6 +445,8 @@ const state = {
   debugPanelOpen: false,
   debugTraceEnabled: false,
   lastDebugPayload: null,
+  lastTelemetrySummary: null,
+  lastTelemetryRequests: [],
   recentChats: [],
   currentSessionTitle: null,
   contextFile: "",
@@ -673,6 +678,9 @@ function setDebugPanelState(open) {
   debugPanel.classList.toggle("hidden", !state.debugPanelOpen);
   debugToggleBtn.classList.toggle("active", state.debugPanelOpen);
   debugStateLabel.textContent = state.debugPanelOpen ? "on" : "off";
+  if (state.debugPanelOpen) {
+    loadTelemetryAdmin();
+  }
 }
 
 function renderDebugPayload(payload) {
@@ -682,6 +690,153 @@ function renderDebugPayload(payload) {
     return;
   }
   debugContent.textContent = JSON.stringify(payload, null, 2);
+}
+
+function formatUsd(value) {
+  const amount = Number(value);
+  if (!Number.isFinite(amount) || amount <= 0) return "$0.000000";
+  if (amount >= 1) return `$${amount.toFixed(2)}`;
+  if (amount >= 0.01) return `$${amount.toFixed(4)}`;
+  return `$${amount.toFixed(6)}`;
+}
+
+function formatInteger(value) {
+  const amount = Number(value);
+  if (!Number.isFinite(amount)) return "0";
+  return Math.round(amount).toLocaleString();
+}
+
+function renderTelemetrySummaryCard(label, value, subtext = "") {
+  const card = document.createElement("article");
+  card.className = "telemetry-summary-card";
+
+  const labelNode = document.createElement("span");
+  labelNode.className = "telemetry-summary-label";
+  labelNode.textContent = label;
+
+  const valueNode = document.createElement("strong");
+  valueNode.className = "telemetry-summary-value";
+  valueNode.textContent = value;
+
+  card.append(labelNode, valueNode);
+  if (subtext) {
+    const sub = document.createElement("span");
+    sub.className = "telemetry-summary-subtext";
+    sub.textContent = subtext;
+    card.appendChild(sub);
+  }
+  return card;
+}
+
+function renderTelemetrySummary(summary) {
+  telemetrySummaryGrid.innerHTML = "";
+  const payload = summary && typeof summary === "object" ? summary : null;
+  if (!payload) {
+    telemetrySummaryGrid.appendChild(
+      renderTelemetrySummaryCard("Telemetry", "Unavailable", "No summary returned yet."),
+    );
+    return;
+  }
+  telemetrySummaryGrid.append(
+    renderTelemetrySummaryCard(
+      "Requests",
+      formatInteger(payload.request_count),
+      `Failure rate ${Math.round((Number(payload.failure_rate) || 0) * 100)}%`,
+    ),
+    renderTelemetrySummaryCard(
+      "Avg Latency",
+      formatDuration(Number(payload.avg_latency_ms) || 0),
+      `p95 ${formatDuration(Number(payload.p95_latency_ms) || 0)}`,
+    ),
+    renderTelemetrySummaryCard(
+      "Avg Cost",
+      formatUsd(Number(payload.avg_cost_usd_est) || 0),
+      `p50 latency ${formatDuration(Number(payload.p50_latency_ms) || 0)}`,
+    ),
+    renderTelemetrySummaryCard(
+      "Chunks",
+      `${Number(payload.average_selected_chunks || 0).toFixed(1)}`,
+      `retrieved avg ${Number(payload.average_retrieved_chunks || 0).toFixed(1)}`,
+    ),
+  );
+}
+
+function renderTelemetryRequests(requests) {
+  telemetryRecent.innerHTML = "";
+  const title = document.createElement("h4");
+  title.textContent = "Recent RAG Requests";
+  telemetryRecent.appendChild(title);
+
+  const list = document.createElement("div");
+  list.className = "telemetry-recent-list";
+  const rows = Array.isArray(requests) ? requests : [];
+  if (!rows.length) {
+    const empty = document.createElement("div");
+    empty.className = "telemetry-request-row";
+    empty.textContent = "No telemetry records persisted yet.";
+    list.appendChild(empty);
+    telemetryRecent.appendChild(list);
+    return;
+  }
+
+  rows.slice(0, 8).forEach((row) => {
+    const article = document.createElement("article");
+    article.className = "telemetry-request-row";
+
+    const head = document.createElement("div");
+    head.className = "telemetry-request-head";
+    head.append(
+      createTelemetryPill("Request", String(row.request_id || "unknown")),
+      createTelemetryPill("Mode", String(row.mode || "unknown")),
+      createTelemetryPill("Repo", String(row.repo_name || "unknown")),
+      createTelemetryPill("Status", String(row.status || "unknown"), String(row.status || "").toLowerCase()),
+    );
+
+    const metrics = document.createElement("div");
+    metrics.className = "telemetry-request-metrics";
+    metrics.append(
+      createTelemetryPill("Total", formatDuration(Number(row.total_latency_ms) || 0)),
+      createTelemetryPill("Cost", formatUsd(Number(row.total_cost_usd_est) || 0)),
+      createTelemetryPill("Pinecone RU", String(Number(row.pinecone_read_units || 0).toFixed(3))),
+      createTelemetryPill(
+        "LLM Tokens",
+        `${formatInteger(row.llm_input_tokens)} / ${formatInteger(row.llm_output_tokens)}`,
+      ),
+    );
+
+    article.append(head, metrics);
+    if (row.error_message) {
+      const error = document.createElement("div");
+      error.className = "telemetry-request-error";
+      error.textContent = String(row.error_message);
+      article.appendChild(error);
+    }
+    list.appendChild(article);
+  });
+
+  telemetryRecent.appendChild(list);
+}
+
+async function loadTelemetryAdmin() {
+  if (!telemetrySummaryGrid || !telemetryRecent) return;
+  try {
+    const [summaryResponse, requestsResponse] = await Promise.all([
+      fetch("/api/telemetry/summary"),
+      fetch("/api/telemetry/requests?limit=12"),
+    ]);
+    if (!summaryResponse.ok || !requestsResponse.ok) {
+      throw new Error("Telemetry endpoint unavailable");
+    }
+    const summary = await summaryResponse.json();
+    const recent = await requestsResponse.json();
+    state.lastTelemetrySummary = summary || null;
+    state.lastTelemetryRequests = Array.isArray(recent?.requests) ? recent.requests : [];
+    renderTelemetrySummary(state.lastTelemetrySummary);
+    renderTelemetryRequests(state.lastTelemetryRequests);
+  } catch (_err) {
+    renderTelemetrySummary(null);
+    renderTelemetryRequests([]);
+  }
 }
 
 function formatDuration(ms) {
@@ -1938,6 +2093,61 @@ function createHybridMetric(label, value, tone = "neutral") {
   return chip;
 }
 
+function createTelemetryPill(label, value, tone = "") {
+  const chip = document.createElement("div");
+  chip.className = `telemetry-pill${tone ? ` ${tone}` : ""}`;
+
+  const key = document.createElement("strong");
+  key.textContent = label;
+
+  const val = document.createElement("span");
+  val.textContent = value;
+
+  chip.append(key, val);
+  return chip;
+}
+
+function renderResponseTelemetry(bubbleWrap, telemetry) {
+  if (!telemetry || typeof telemetry !== "object" || !Object.keys(telemetry).length) return;
+  const panel = document.createElement("section");
+  panel.className = "response-telemetry";
+
+  const head = document.createElement("div");
+  head.className = "response-telemetry-head";
+  const title = document.createElement("span");
+  title.className = "response-telemetry-title";
+  title.textContent = "Request Telemetry";
+  head.appendChild(title);
+  if (telemetry.request_id) {
+    head.appendChild(createTelemetryPill("Request", String(telemetry.request_id), telemetry.status));
+  }
+  panel.appendChild(head);
+
+  const grid = document.createElement("div");
+  grid.className = "response-telemetry-grid";
+  grid.append(
+    createTelemetryPill("Retrieval", formatDuration(Number(telemetry.retrieval_latency_ms) || 0)),
+    createTelemetryPill("Generation", formatDuration(Number(telemetry.generation_latency_ms) || 0)),
+    createTelemetryPill("Total", formatDuration(Number(telemetry.total_latency_ms) || 0)),
+    createTelemetryPill("Cost", formatUsd(Number(telemetry.estimated_cost_usd) || 0)),
+    createTelemetryPill("Pinecone RU", String(Number(telemetry.pinecone_read_units || 0).toFixed(3))),
+    createTelemetryPill(
+      "LLM Tokens",
+      `${formatInteger(telemetry.llm_input_tokens)} / ${formatInteger(telemetry.llm_output_tokens)}`,
+    ),
+  );
+  panel.appendChild(grid);
+
+  const note = document.createElement("div");
+  note.className = "response-telemetry-note";
+  note.textContent =
+    `Mode ${String(telemetry.mode || "unknown")} • repo ${String(telemetry.repo_name || "unknown")} • ` +
+    `${formatInteger(telemetry.retrieved_chunk_count)} chunk(s) retrieved • ` +
+    `${formatInteger(telemetry.selected_chunk_count)} chunk(s) selected`;
+  panel.appendChild(note);
+  bubbleWrap.appendChild(panel);
+}
+
 function renderHybridArchitecturePanel(panel, graphPayload, evidenceRows = [], debugPayload = null) {
   panel.innerHTML = "";
   const title = document.createElement("h5");
@@ -2208,6 +2418,10 @@ function addMessage(role, text, citations = [], meta = {}) {
       metaRow.appendChild(debugBtn);
     }
 
+    if (meta.telemetry) {
+      renderResponseTelemetry(bubbleWrap, meta.telemetry);
+    }
+
     if (meta.modeValue === "hybrid") {
       const nextBestQuery = extractHybridNextBestQuery(renderedText);
       if (nextBestQuery) {
@@ -2427,6 +2641,7 @@ async function postMultipart(url, payload) {
   formData.append("top_k", String(payload.topK));
   formData.append("debug", payload.debug ? "true" : "false");
   formData.append("mode", payload.mode || state.mode);
+  formData.append("ui_mode", payload.uiMode || payload.mode || state.mode);
   formData.append("scope", payload.scope || state.scope);
   formData.append("project_id", payload.projectId || state.projectId);
   formData.append("persist_uploads", payload.persistUploads ? "true" : "false");
@@ -2472,6 +2687,7 @@ async function runModeQuery(mode, question, files = []) {
         files,
         debug,
         mode: apiMode,
+        uiMode,
         scope,
         projectId,
         persistUploads,
@@ -2483,6 +2699,7 @@ async function runModeQuery(mode, question, files = []) {
       top_k: topK,
       debug,
       mode: apiMode,
+      ui_mode: uiMode,
       scope,
       project_id: projectId,
     });
@@ -2498,6 +2715,7 @@ async function runModeQuery(mode, question, files = []) {
           files,
           debug,
           mode: apiMode,
+          uiMode,
           scope,
           projectId,
           persistUploads,
@@ -2507,6 +2725,7 @@ async function runModeQuery(mode, question, files = []) {
           top_k: requestTopK,
           debug,
           mode: apiMode,
+          ui_mode: uiMode,
           scope,
           project_id: projectId,
         });
@@ -2516,6 +2735,7 @@ async function runModeQuery(mode, question, files = []) {
       citations: data.citations || [],
       evidence: data.evidence_strength || {},
       debug: data.debug || null,
+      telemetry: data.telemetry || {},
       resultType: defaultResultTypeForMode(uiMode),
       followUps: [],
       hybridGraph: data.graph || {},
@@ -2532,6 +2752,7 @@ async function runModeQuery(mode, question, files = []) {
           files,
           debug,
           mode: apiMode,
+          uiMode,
           scope,
           projectId,
           persistUploads,
@@ -2541,6 +2762,7 @@ async function runModeQuery(mode, question, files = []) {
           top_k: requestTopK,
           debug,
           mode: apiMode,
+          ui_mode: uiMode,
           scope,
           project_id: projectId,
         });
@@ -2550,6 +2772,7 @@ async function runModeQuery(mode, question, files = []) {
       citations: data.citations || [],
       evidence: data.evidence_strength || {},
       debug: data.debug || null,
+      telemetry: data.telemetry || {},
       resultType: defaultResultTypeForMode(
         uiMode,
         uiMode === "diagrams" ? state.activeDiagramType : null,
@@ -2572,6 +2795,7 @@ async function runModeQuery(mode, question, files = []) {
           files,
           debug,
           mode: apiMode,
+          uiMode,
           scope,
           projectId,
           persistUploads,
@@ -2581,6 +2805,7 @@ async function runModeQuery(mode, question, files = []) {
           top_k: requestTopK,
           debug,
           mode: apiMode,
+          ui_mode: uiMode,
           scope,
           project_id: projectId,
         });
@@ -2599,6 +2824,7 @@ Validation retry:
             files,
             debug,
             mode: apiMode,
+            uiMode,
             scope,
             projectId,
             persistUploads,
@@ -2608,6 +2834,7 @@ Validation retry:
             top_k: requestTopK,
             debug,
             mode: apiMode,
+            ui_mode: uiMode,
             scope,
             project_id: projectId,
           });
@@ -2618,6 +2845,7 @@ Validation retry:
       citations: data.citations || [],
       evidence: data.evidence_strength || {},
       debug: data.debug || null,
+      telemetry: data.telemetry || {},
       resultType: defaultResultTypeForMode(
         uiMode,
         uiMode === "diagrams" ? state.activeDiagramType : null,
@@ -2638,6 +2866,7 @@ Validation retry:
       citations: matches,
       evidence: data.evidence_strength || {},
       debug: data.debug || null,
+      telemetry: data.telemetry || {},
       resultType: data.result_type || defaultResultTypeForMode(uiMode),
       followUps: normalizeFollowUps(data.follow_ups || []),
       hybridGraph: {},
@@ -2654,6 +2883,7 @@ Validation retry:
       citations: matches,
       evidence: data.evidence_strength || {},
       debug: data.debug || null,
+      telemetry: data.telemetry || {},
       resultType: data.result_type || defaultResultTypeForMode(uiMode),
       followUps: normalizeFollowUps(data.follow_ups || []),
       hybridGraph: {},
@@ -2669,6 +2899,7 @@ Validation retry:
     citations: matches,
     evidence: data.evidence_strength || {},
     debug: data.debug || null,
+    telemetry: data.telemetry || {},
     resultType: data.result_type || defaultResultTypeForMode(uiMode),
     followUps: normalizeFollowUps(data.follow_ups || []),
     hybridGraph: {},
@@ -2748,6 +2979,7 @@ async function submitQuestion(options = {}) {
       followUps: normalizeFollowUps(result.followUps || []),
       hybridGraph: result.hybridGraph || {},
       hybridEvidence: result.hybridEvidence || [],
+      telemetry: result.telemetry || {},
       debugPayload: result.debug || null,
       elapsedMs,
       resultCount: result.citations.length,
@@ -2760,6 +2992,9 @@ async function submitQuestion(options = {}) {
       if (!state.debugPanelOpen && result.debug) {
         setDebugPanelState(true);
       }
+    }
+    if (state.debugPanelOpen) {
+      loadTelemetryAdmin();
     }
 
     const contextHit = result.citations.find(
@@ -3001,6 +3236,10 @@ exploreCapabilitiesLink.addEventListener("click", (event) => {
 });
 exportBtn.addEventListener("click", exportSession);
 refreshUploadsBtn.addEventListener("click", refreshUploadLibrary);
+refreshTelemetryBtn.addEventListener("click", () => {
+  loadTelemetryAdmin();
+  setStatus("Telemetry refreshed");
+});
 clearPinsBtn.addEventListener("click", () => {
   state.pinnedSources = [];
   renderPinnedSources();
@@ -3191,6 +3430,8 @@ updateEvidencePill(null);
 renderPinnedSources();
 renderUploadLibrary();
 renderRecentChats();
+renderTelemetrySummary(null);
+renderTelemetryRequests([]);
 setDebugPanelState(false);
 renderDebugPayload(null);
 closeSuggestionModal();

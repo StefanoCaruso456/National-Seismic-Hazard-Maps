@@ -1037,7 +1037,7 @@ function buildAuditDispatch(promptText) {
   const isDefaultPrompt = String(promptText || "").trim() === AUDIT_WORKFLOW.title;
   return {
     displayText: AUDIT_WORKFLOW.title,
-    workflowPrompt: buildAuditWorkflowPrompt(isDefaultPrompt ? "" : promptText),
+    requestText: isDefaultPrompt ? "Run a full repository audit." : String(promptText || "").trim(),
   };
 }
 
@@ -1101,7 +1101,7 @@ function buildDiagramDispatch(promptText) {
   return {
     diagramType,
     displayText: DIAGRAM_WORKFLOWS[diagramType].title,
-    workflowPrompt: buildDiagramWorkflowPrompt(diagramType, promptText),
+    requestText: String(promptText || "").trim() || DIAGRAM_WORKFLOWS[diagramType].title,
   };
 }
 
@@ -1223,13 +1223,13 @@ async function onPromptSelected(promptText, mode) {
 
   if (mode === "audit") {
     const dispatch = buildAuditDispatch(promptText);
-    dispatchPrompt = dispatch.workflowPrompt;
+    dispatchPrompt = dispatch.requestText;
     displayPrompt = dispatch.displayText;
   } else if (mode === "diagrams") {
     const dispatch = buildDiagramDispatch(promptText);
     diagramType = dispatch.diagramType;
     state.activeDiagramType = dispatch.diagramType;
-    dispatchPrompt = dispatch.workflowPrompt;
+    dispatchPrompt = dispatch.requestText;
     displayPrompt = dispatch.displayText;
   }
 
@@ -2642,6 +2642,9 @@ async function postMultipart(url, payload) {
   formData.append("debug", payload.debug ? "true" : "false");
   formData.append("mode", payload.mode || state.mode);
   formData.append("ui_mode", payload.uiMode || payload.mode || state.mode);
+  if (payload.diagramType) {
+    formData.append("diagram_type", payload.diagramType);
+  }
   formData.append("scope", payload.scope || state.scope);
   formData.append("project_id", payload.projectId || state.projectId);
   formData.append("persist_uploads", payload.persistUploads ? "true" : "false");
@@ -2679,6 +2682,7 @@ async function runModeQuery(mode, question, files = []) {
   const persistUploads = state.persistUploads;
   const uiMode = mode || state.mode;
   const apiMode = apiModeForMode(uiMode);
+  const diagramType = uiMode === "diagrams" ? state.activeDiagramType : null;
   const searchRequest = async (topK) => {
     if (hasUploads) {
       return postMultipart("/api/search/upload", {
@@ -2688,6 +2692,7 @@ async function runModeQuery(mode, question, files = []) {
         debug,
         mode: apiMode,
         uiMode,
+        diagramType,
         scope,
         projectId,
         persistUploads,
@@ -2700,6 +2705,7 @@ async function runModeQuery(mode, question, files = []) {
       debug,
       mode: apiMode,
       ui_mode: uiMode,
+      diagram_type: diagramType,
       scope,
       project_id: projectId,
     });
@@ -2716,6 +2722,7 @@ async function runModeQuery(mode, question, files = []) {
           debug,
           mode: apiMode,
           uiMode,
+          diagramType,
           scope,
           projectId,
           persistUploads,
@@ -2726,6 +2733,7 @@ async function runModeQuery(mode, question, files = []) {
           debug,
           mode: apiMode,
           ui_mode: uiMode,
+          diagram_type: diagramType,
           scope,
           project_id: projectId,
         });
@@ -2753,6 +2761,7 @@ async function runModeQuery(mode, question, files = []) {
           debug,
           mode: apiMode,
           uiMode,
+          diagramType,
           scope,
           projectId,
           persistUploads,
@@ -2763,6 +2772,7 @@ async function runModeQuery(mode, question, files = []) {
           debug,
           mode: apiMode,
           ui_mode: uiMode,
+          diagram_type: diagramType,
           scope,
           project_id: projectId,
         });
@@ -2796,6 +2806,7 @@ async function runModeQuery(mode, question, files = []) {
           debug,
           mode: apiMode,
           uiMode,
+          diagramType,
           scope,
           projectId,
           persistUploads,
@@ -2806,6 +2817,7 @@ async function runModeQuery(mode, question, files = []) {
           debug,
           mode: apiMode,
           ui_mode: uiMode,
+          diagram_type: diagramType,
           scope,
           project_id: projectId,
         });
@@ -2825,6 +2837,7 @@ Validation retry:
             debug,
             mode: apiMode,
             uiMode,
+            diagramType,
             scope,
             projectId,
             persistUploads,
@@ -2835,6 +2848,7 @@ Validation retry:
             debug,
             mode: apiMode,
             ui_mode: uiMode,
+            diagram_type: diagramType,
             scope,
             project_id: projectId,
           });
@@ -2920,12 +2934,9 @@ async function submitQuestion(options = {}) {
   }
 
   let question = rawQuestion;
-  if (currentMode === "audit" && !options.skipAuditWrap) {
-    question = buildAuditWorkflowPrompt(rawQuestion);
-  } else if (currentMode === "diagrams" && !options.skipDiagramWrap) {
+  if (currentMode === "diagrams") {
     const diagramType = options.diagramType || state.activeDiagramType || inferDiagramType(rawQuestion);
     state.activeDiagramType = diagramType;
-    question = buildDiagramWorkflowPrompt(diagramType, rawQuestion);
   }
   const preparedQuestion = trimQuestionForBackend(question);
   question = preparedQuestion.value;

@@ -1378,6 +1378,7 @@ function buildMetaText(role, meta) {
   const parts = [roleLabel(role)];
   if (meta.modeLabel) parts.push(meta.modeLabel);
   if (meta.resultType) parts.push(meta.resultType);
+  if (meta.modeValue === "audit" || meta.modeValue === "diagrams") parts.push("direct scan");
   if (typeof meta.resultCount === "number") parts.push(`${meta.resultCount} sources`);
   if (meta.evidenceLabel) parts.push(`evidence ${meta.evidenceLabel}`);
   if (typeof meta.elapsedMs === "number") parts.push(formatDuration(meta.elapsedMs));
@@ -2409,7 +2410,10 @@ function addMessage(role, text, citations = [], meta = {}) {
       const debugBtn = document.createElement("button");
       debugBtn.type = "button";
       debugBtn.className = "tiny-btn";
-      debugBtn.textContent = "Show retrieval debug";
+      debugBtn.textContent =
+        meta.modeValue === "audit" || meta.modeValue === "diagrams"
+          ? "Show mode debug"
+          : "Show retrieval debug";
       debugBtn.addEventListener("click", () => {
         setDebugPanelState(true);
         renderDebugPayload(meta.debugPayload);
@@ -2454,7 +2458,10 @@ function addMessage(role, text, citations = [], meta = {}) {
     }
   }
 
-  const renderInlineCitations = !(role === "assistant" && meta.modeValue === "hybrid");
+  const renderInlineCitations = !(
+    role === "assistant" &&
+    (meta.modeValue === "hybrid" || meta.modeValue === "audit" || meta.modeValue === "diagrams")
+  );
   if (renderInlineCitations && citations.length) {
     citations.forEach((item, index) => renderCitation(citationsWrap, item, index + 1));
   } else {
@@ -2993,8 +3000,12 @@ async function submitQuestion(options = {}) {
       telemetry: result.telemetry || {},
       debugPayload: result.debug || null,
       elapsedMs,
-      resultCount: result.citations.length,
-      evidenceLabel: normalizedEvidenceLabel(result.evidence?.label),
+      resultCount:
+        state.mode === "audit" || state.mode === "diagrams" ? undefined : result.citations.length,
+      evidenceLabel:
+        state.mode === "audit" || state.mode === "diagrams"
+          ? null
+          : normalizedEvidenceLabel(result.evidence?.label),
     });
     updateEvidencePill(result.evidence || null);
 
@@ -3015,12 +3026,16 @@ async function submitQuestion(options = {}) {
       state.contextFile = String(contextHit.file_path);
     }
 
-    const count = result.citations.length;
-    setStatus(
-      `${MODE_CONFIG[state.mode].label}: ${count} source${count === 1 ? "" : "s"} in ${formatDuration(
-        elapsedMs,
-      )}`,
-    );
+    if (state.mode === "audit" || state.mode === "diagrams") {
+      setStatus(`${MODE_CONFIG[state.mode].label}: direct repo scan in ${formatDuration(elapsedMs)}`);
+    } else {
+      const count = result.citations.length;
+      setStatus(
+        `${MODE_CONFIG[state.mode].label}: ${count} source${count === 1 ? "" : "s"} in ${formatDuration(
+          elapsedMs,
+        )}`,
+      );
+    }
 
     if (state.attachments.length) {
       state.attachments = [];

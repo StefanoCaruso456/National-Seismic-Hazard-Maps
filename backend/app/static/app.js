@@ -2150,7 +2150,7 @@ function renderResponseTelemetry(bubbleWrap, telemetry) {
   bubbleWrap.appendChild(panel);
 }
 
-function renderHybridArchitecturePanel(panel, graphPayload, evidenceRows = [], debugPayload = null) {
+function renderHybridArchitecturePanel(panel, graphPayload, evidenceRows = [], debugPayload = null, fallbackCitations = []) {
   panel.innerHTML = "";
   const title = document.createElement("h5");
   title.textContent = "Architecture Context";
@@ -2182,7 +2182,9 @@ function renderHybridArchitecturePanel(panel, graphPayload, evidenceRows = [], d
   const graphMeta = hybridDebug.graph_metadata && typeof hybridDebug.graph_metadata === "object"
     ? hybridDebug.graph_metadata
     : {};
-  const evidenceCount = Array.isArray(evidenceRows) ? evidenceRows.length : 0;
+  const evidenceCount = Array.isArray(evidenceRows) && evidenceRows.length
+    ? evidenceRows.length
+    : (Array.isArray(fallbackCitations) ? fallbackCitations.length : 0);
   const fallbackReason = String(hybridDebug.fallback_reason || "");
   const quality = evidenceCount >= 3 ? "Actionable" : (processes.length > 0 || candidateFiles.length > 0 ? "Partial" : "Low");
 
@@ -2281,7 +2283,7 @@ function renderHybridArchitecturePanel(panel, graphPayload, evidenceRows = [], d
   }
 }
 
-function renderHybridEvidencePanel(panel, evidenceRows = [], graphPayload = {}, debugPayload = null) {
+function renderHybridEvidencePanel(panel, evidenceRows = [], graphPayload = {}, debugPayload = null, fallbackCitations = []) {
   panel.innerHTML = "";
   const title = document.createElement("h5");
   title.textContent = "Evidence & Citations";
@@ -2297,6 +2299,16 @@ function renderHybridEvidencePanel(panel, evidenceRows = [], graphPayload = {}, 
   const graphMeta = hybridDebug.graph_metadata && typeof hybridDebug.graph_metadata === "object"
     ? hybridDebug.graph_metadata
     : {};
+
+  if ((!Array.isArray(evidenceRows) || !evidenceRows.length) && Array.isArray(fallbackCitations) && fallbackCitations.length) {
+    const list = document.createElement("div");
+    list.className = "citations hybrid-evidence-citations";
+    fallbackCitations.slice(0, 8).forEach((entry, index) => {
+      renderCitation(list, entry, index + 1);
+    });
+    panel.appendChild(list);
+    return;
+  }
 
   if (!Array.isArray(evidenceRows) || !evidenceRows.length) {
     const empty = document.createElement("div");
@@ -2443,6 +2455,7 @@ function addMessage(role, text, citations = [], meta = {}) {
         meta.hybridGraph || {},
         meta.hybridEvidence || [],
         meta.debugPayload || null,
+        citations || [],
       );
 
       const evidencePanel = document.createElement("section");
@@ -2452,6 +2465,7 @@ function addMessage(role, text, citations = [], meta = {}) {
         meta.hybridEvidence || [],
         meta.hybridGraph || {},
         meta.debugPayload || null,
+        citations || [],
       );
 
       hybridPanels.append(architecturePanel, evidencePanel);

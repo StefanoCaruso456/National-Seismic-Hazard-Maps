@@ -133,6 +133,9 @@ DIRECT_UPLOAD_PROMPT_CHARS = 1_400
 DIRECT_SOURCE_SNIPPET_CHARS = 550
 DIRECT_FILE_PREVIEW_LINES = 80
 DIRECT_SYMBOL_PREVIEW_LIMIT = 3
+DIRECT_DIAGRAM_MAX_LANES = 6
+DIRECT_DIAGRAM_MAX_NODES = 14
+DIRECT_DIAGRAM_MAX_EDGES = 20
 TEXTUAL_CONTEXT_SUFFIXES = {
     ".c",
     ".cfg",
@@ -3789,52 +3792,301 @@ def build_direct_audit_system_prompt() -> str:
     )
 
 
-def build_direct_diagram_system_prompt(diagram_type: str) -> str:
+def direct_diagram_config(diagram_type: str) -> dict[str, Any]:
     configs = {
         "systemArchitecture": {
             "title": "system architecture diagram",
-            "header": "flowchart TD",
+            "chart_type": "flowchart",
+            "orientation": "TD",
             "goal": "Show high-level subsystems, major boundaries, and directional relationships.",
+            "lane_templates": ["Orchestration", "Regional Scripts", "Core Binaries", "Inputs / Config", "Outputs / Logs"],
         },
         "executionPipeline": {
             "title": "execution pipeline diagram",
-            "header": "flowchart LR",
+            "chart_type": "flowchart",
+            "orientation": "LR",
             "goal": "Show runtime order, branching, and stage transitions from entrypoint to outputs.",
+            "lane_templates": ["Entrypoint", "Build", "Execution", "Outputs"],
         },
         "dataFlow": {
             "title": "data flow diagram",
-            "header": "flowchart TD",
+            "chart_type": "flowchart",
+            "orientation": "TD",
             "goal": "Show inputs, transformations, and outputs with clear lineage.",
+            "lane_templates": ["Inputs", "Transforms", "Storage", "Outputs"],
         },
         "dependencyGraph": {
             "title": "dependency graph",
-            "header": "graph TD",
+            "chart_type": "graph",
+            "orientation": "TD",
             "goal": "Show the most central modules/files and their directional dependencies.",
+            "lane_templates": ["Scripts", "Sources", "Artifacts"],
         },
         "buildRuntime": {
             "title": "build and runtime environment diagram",
-            "header": "flowchart TD",
+            "chart_type": "flowchart",
+            "orientation": "TD",
             "goal": "Show compile-time stages, runtime dependencies, and produced artifacts.",
+            "lane_templates": ["Build Inputs", "Build", "Runtime", "Artifacts"],
         },
     }
     resolved_type = normalize_diagram_type(diagram_type)
-    config = configs.get(resolved_type, configs["systemArchitecture"])
+    return configs.get(resolved_type, configs["systemArchitecture"])
+
+
+def build_direct_diagram_system_prompt(diagram_type: str) -> str:
+    config = direct_diagram_config(diagram_type)
+    return (
+        "You are a principal software architect generating repository diagrams from a deterministic repo scan and curated file excerpts.\n"
+        "Use only the provided repository context. Never invent components, files, edges, or execution stages.\n"
+        "If evidence is insufficient, omit the element or label it '(hypothesis)' rather than fabricating detail.\n"
+        "Return only JSON. No markdown fences. No prose before or after the JSON object.\n"
+        f"The diagram requested is a {config['title']}.\n"
+        f"Primary goal: {config['goal']}\n\n"
+        "JSON schema:\n"
+        '{\n'
+        '  "title": "short title",\n'
+        '  "orientation": "TD or LR",\n'
+        '  "lanes": [{"id": "lane_id", "label": "Lane Label"}],\n'
+        '  "nodes": [{"id": "node_id", "label": "Node Label", "lane": "lane_id"}],\n'
+        '  "edges": [{"from": "node_id", "to": "node_id", "label": "optional edge label"}]\n'
+        '}\n\n'
+        "Diagram rules:\n"
+        f"- Prefer 3-{DIRECT_DIAGRAM_MAX_LANES} lanes and 6-{DIRECT_DIAGRAM_MAX_NODES} nodes.\n"
+        "- Lanes are swimlanes. They will be converted into Mermaid subgraph blocks.\n"
+        f"- Recommended lane titles for this diagram: {', '.join(config['lane_templates'])}.\n"
+        "- Use concise engineering labels that map to real repository paths, scripts, modules, directories, or runtime stages present in the context.\n"
+        "- Avoid placeholder names such as Component A, Service B, or Module X.\n"
+        "- Compress repeated or similar files into one representative node when possible.\n"
+        "- Show only high-signal edges. Keep the diagram deterministic and connected.\n"
+        "- If the user asks for a flow or user journey but the repo only exposes system/operator flows, model the nearest verified flow and keep labels concrete."
+    )
+
+
+def build_direct_diagram_fallback_prompt(diagram_type: str) -> str:
+    config = direct_diagram_config(diagram_type)
     return (
         "You are a principal software architect generating repository diagrams from a deterministic repo scan and curated file excerpts.\n"
         "Use only the provided repository context. Never invent components, files, edges, or execution stages.\n"
         "If evidence is insufficient, omit the element or label it '(hypothesis)' rather than fabricating detail.\n"
         "Return only valid Mermaid. No markdown fences. No prose before or after the Mermaid output.\n"
-        f"The diagram requested is a {config['title']}.\n"
-        f"The Mermaid output must begin with: {config['header']}\n"
-        f"Primary goal: {config['goal']}\n\n"
-        "Diagram rules:\n"
-        "- Prefer 6-12 nodes and a clean, readable layout.\n"
-        "- Use subgraph blocks as swimlanes when boundaries, actors, phases, or tiers improve clarity.\n"
-        "- Use concise engineering labels that map to real repository paths, scripts, modules, directories, or runtime stages present in the context.\n"
-        "- Avoid placeholder names such as Component A, Service B, or Module X.\n"
-        "- Show only high-signal edges. Keep the diagram deterministic and connected.\n"
-        "- If the user asks for a flow or user journey but the repo only exposes system/operator flows, model the nearest verified flow and keep labels concrete."
+        f"The Mermaid output must begin with: {config['chart_type']} {config['orientation']}\n"
+        f"Primary goal: {config['goal']}\n"
+        "- Use subgraph blocks as swimlanes.\n"
+        f"- Prefer 3-{DIRECT_DIAGRAM_MAX_LANES} lanes and 6-{DIRECT_DIAGRAM_MAX_NODES} nodes.\n"
+        "- Keep node labels concise and connected by only high-signal edges."
     )
+
+
+def extract_json_object_text(text: str) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return "{}"
+    fenced = re.search(r"```(?:json)?\s*([\s\S]*?)```", raw, re.IGNORECASE)
+    if fenced:
+        raw = fenced.group(1).strip()
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start >= 0 and end > start:
+        return raw[start : end + 1]
+    return raw
+
+
+def mermaid_safe_id(value: str, *, prefix: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9_]+", "_", str(value or "").strip()).strip("_").lower()
+    if not cleaned:
+        cleaned = prefix
+    if cleaned[0].isdigit():
+        cleaned = f"{prefix}_{cleaned}"
+    return f"{prefix}_{cleaned}"
+
+
+def mermaid_safe_label(value: str) -> str:
+    return " ".join(str(value or "").replace('"', "'").split()).strip() or "Unnamed"
+
+
+def normalize_direct_diagram_spec(raw_spec: dict[str, Any], diagram_type: str) -> dict[str, Any]:
+    config = direct_diagram_config(diagram_type)
+    orientation = str(raw_spec.get("orientation") or config["orientation"]).strip().upper()
+    if orientation not in {"TD", "LR"}:
+        orientation = str(config["orientation"])
+
+    raw_lanes = raw_spec.get("lanes") if isinstance(raw_spec.get("lanes"), list) else []
+    lanes: list[dict[str, str]] = []
+    lane_ids: set[str] = set()
+    for idx, lane in enumerate(raw_lanes[:DIRECT_DIAGRAM_MAX_LANES], start=1):
+        if not isinstance(lane, dict):
+            continue
+        label = mermaid_safe_label(lane.get("label") or lane.get("id") or f"Lane {idx}")
+        lane_id = mermaid_safe_id(str(lane.get("id") or label), prefix="lane")
+        if lane_id in lane_ids:
+            continue
+        lane_ids.add(lane_id)
+        lanes.append({"id": lane_id, "label": label})
+    if len(lanes) < 2:
+        fallback_labels = list(config.get("lane_templates", []))[: max(2, len(lanes) or 2)]
+        lanes = [{"id": mermaid_safe_id(label, prefix="lane"), "label": label} for label in fallback_labels]
+        lane_ids = {lane["id"] for lane in lanes}
+
+    raw_nodes = raw_spec.get("nodes") if isinstance(raw_spec.get("nodes"), list) else []
+    lane_lookup = {lane["id"]: lane["id"] for lane in lanes}
+    lane_lookup.update({mermaid_safe_id(lane["label"], prefix="lane"): lane["id"] for lane in lanes})
+    nodes: list[dict[str, str]] = []
+    node_ids: set[str] = set()
+    default_lane_id = lanes[0]["id"]
+    for idx, node in enumerate(raw_nodes[:DIRECT_DIAGRAM_MAX_NODES], start=1):
+        if not isinstance(node, dict):
+            continue
+        label = mermaid_safe_label(node.get("label") or node.get("id") or f"Node {idx}")
+        node_id = mermaid_safe_id(str(node.get("id") or label), prefix="node")
+        if node_id in node_ids:
+            continue
+        requested_lane = mermaid_safe_id(str(node.get("lane") or default_lane_id), prefix="lane")
+        lane_id = lane_lookup.get(requested_lane, default_lane_id)
+        nodes.append({"id": node_id, "label": label, "lane": lane_id})
+        node_ids.add(node_id)
+    if len(nodes) < 3:
+        raise ValueError("diagram spec did not produce enough nodes")
+
+    raw_edges = raw_spec.get("edges") if isinstance(raw_spec.get("edges"), list) else []
+    node_lookup = {node["id"]: node["id"] for node in nodes}
+    edges: list[dict[str, str]] = []
+    seen_edges: set[tuple[str, str, str]] = set()
+    for edge in raw_edges[:DIRECT_DIAGRAM_MAX_EDGES]:
+        if not isinstance(edge, dict):
+            continue
+        source = node_lookup.get(mermaid_safe_id(str(edge.get("from") or ""), prefix="node"))
+        target = node_lookup.get(mermaid_safe_id(str(edge.get("to") or ""), prefix="node"))
+        if not source or not target or source == target:
+            continue
+        label = mermaid_safe_label(edge.get("label") or "")
+        edge_key = (source, target, label)
+        if edge_key in seen_edges:
+            continue
+        seen_edges.add(edge_key)
+        edges.append({"from": source, "to": target, "label": label})
+    if len(edges) < 2:
+        raise ValueError("diagram spec did not produce enough valid edges")
+
+    return {
+        "title": mermaid_safe_label(raw_spec.get("title") or config["title"]),
+        "chart_type": config["chart_type"],
+        "orientation": orientation,
+        "lanes": lanes,
+        "nodes": nodes,
+        "edges": edges,
+    }
+
+
+def build_mermaid_from_direct_diagram_spec(spec: dict[str, Any]) -> str:
+    lanes = list(spec.get("lanes", []))
+    nodes = list(spec.get("nodes", []))
+    edges = list(spec.get("edges", []))
+    lines = [f"{spec.get('chart_type', 'flowchart')} {spec.get('orientation', 'TD')}"]
+    nodes_by_lane: dict[str, list[dict[str, str]]] = defaultdict(list)
+    for node in nodes:
+        nodes_by_lane[str(node.get("lane") or "")].append(node)
+    for lane in lanes:
+        lane_id = str(lane.get("id") or "")
+        lane_label = mermaid_safe_label(lane.get("label") or lane_id)
+        lines.append("")
+        lines.append(f'    subgraph {lane_id}["{lane_label}"]')
+        lines.append("        direction TB")
+        for node in nodes_by_lane.get(lane_id, []):
+            lines.append(f'        {node["id"]}["{mermaid_safe_label(node.get("label") or node["id"])}"]')
+        lines.append("    end")
+    lines.append("")
+    for edge in edges:
+        label = mermaid_safe_label(edge.get("label") or "")
+        if label:
+            lines.append(f'    {edge["from"]} -->|{label}| {edge["to"]}')
+        else:
+            lines.append(f'    {edge["from"]} --> {edge["to"]}')
+    return "\n".join(lines).strip()
+
+
+def parse_direct_diagram_spec(text: str, diagram_type: str) -> dict[str, Any]:
+    raw = json.loads(extract_json_object_text(text))
+    if not isinstance(raw, dict):
+        raise ValueError("diagram response was not a JSON object")
+    return normalize_direct_diagram_spec(raw, diagram_type)
+
+
+def record_direct_completion_usage(
+    completion: Any,
+    telemetry: RagRequestTelemetry | None,
+    elapsed_ms: float,
+) -> None:
+    if not telemetry:
+        return
+    usage = parse_openai_usage(getattr(completion, "usage", None))
+    telemetry.record_llm(
+        input_tokens=int(usage.get("prompt_tokens") or 0),
+        output_tokens=int(usage.get("completion_tokens") or 0),
+        cached_input_tokens=int(usage.get("cached_tokens") or 0),
+        latency_ms=elapsed_ms,
+        model_name=str(getattr(completion, "model", settings.openai_chat_model)),
+    )
+
+
+def generate_direct_diagram_answer(
+    *,
+    question: str,
+    context: str,
+    telemetry: RagRequestTelemetry | None = None,
+    diagram_type: str | None = None,
+) -> str:
+    resolved_type = normalize_diagram_type(diagram_type, question)
+    client = get_openai_client()
+    started = time.perf_counter()
+    completion = call_with_retries(
+        "openai direct diagram completion",
+        lambda: client.chat.completions.create(
+            model=settings.openai_chat_model,
+            temperature=0.0,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": build_direct_diagram_system_prompt(resolved_type)},
+                {
+                    "role": "user",
+                    "content": (
+                        f"User request:\n{question}\n\n"
+                        f"Repository context:\n{context}"
+                    ),
+                },
+            ],
+        ),
+    )
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    record_direct_completion_usage(completion, telemetry, elapsed_ms)
+    content = completion.choices[0].message.content or ""
+    try:
+        return build_mermaid_from_direct_diagram_spec(parse_direct_diagram_spec(content, resolved_type))
+    except Exception as exc:
+        logger.warning("diagram json generation failed, falling back to raw Mermaid: %s", exc)
+
+    fallback_started = time.perf_counter()
+    fallback_completion = call_with_retries(
+        "openai direct diagram fallback",
+        lambda: client.chat.completions.create(
+            model=settings.openai_chat_model,
+            temperature=0.0,
+            messages=[
+                {"role": "system", "content": build_direct_diagram_fallback_prompt(resolved_type)},
+                {
+                    "role": "user",
+                    "content": (
+                        f"User request:\n{question}\n\n"
+                        f"Repository context:\n{context}"
+                    ),
+                },
+            ],
+        ),
+    )
+    fallback_elapsed_ms = (time.perf_counter() - fallback_started) * 1000.0
+    record_direct_completion_usage(fallback_completion, telemetry, fallback_elapsed_ms)
+    fallback_content = fallback_completion.choices[0].message.content
+    return fallback_content.strip() if fallback_content else "No answer generated."
 
 
 def generate_direct_mode_answer(
@@ -3849,20 +4101,23 @@ def generate_direct_mode_answer(
     if resolved_ui_mode not in DIRECT_UI_MODES:
         raise ValueError(f"Unsupported direct mode: {ui_mode}")
 
+    if resolved_ui_mode == "diagrams":
+        return generate_direct_diagram_answer(
+            question=question,
+            context=context,
+            telemetry=telemetry,
+            diagram_type=diagram_type,
+        )
+
     client = get_openai_client()
-    system_prompt = (
-        build_direct_diagram_system_prompt(normalize_diagram_type(diagram_type, question))
-        if resolved_ui_mode == "diagrams"
-        else build_direct_audit_system_prompt()
-    )
     started = time.perf_counter()
     completion = call_with_retries(
         "openai direct mode completion",
         lambda: client.chat.completions.create(
             model=settings.openai_chat_model,
-            temperature=0.0 if resolved_ui_mode == "diagrams" else 0.15,
+            temperature=0.15,
             messages=[
-                {"role": "system", "content": system_prompt},
+                {"role": "system", "content": build_direct_audit_system_prompt()},
                 {
                     "role": "user",
                     "content": (
@@ -3874,15 +4129,7 @@ def generate_direct_mode_answer(
         ),
     )
     elapsed_ms = (time.perf_counter() - started) * 1000.0
-    if telemetry:
-        usage = parse_openai_usage(getattr(completion, "usage", None))
-        telemetry.record_llm(
-            input_tokens=int(usage.get("prompt_tokens") or 0),
-            output_tokens=int(usage.get("completion_tokens") or 0),
-            cached_input_tokens=int(usage.get("cached_tokens") or 0),
-            latency_ms=elapsed_ms,
-            model_name=str(getattr(completion, "model", settings.openai_chat_model)),
-        )
+    record_direct_completion_usage(completion, telemetry, elapsed_ms)
     content = completion.choices[0].message.content
     return content.strip() if content else "No answer generated."
 

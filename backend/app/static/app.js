@@ -65,11 +65,11 @@ const MODE_CONFIG = {
     heroCopy: "Ask about entry points, file I/O, data flow, business rules, and dependencies.",
   },
   hybrid: {
-    label: "Hybrid",
+    label: "Graph/Hybrid",
     placeholder: "Architecture-first analysis with graph-constrained citations...",
     heroTitle: "Fuse structure graph with line-level evidence",
     heroCopy:
-      "Hybrid mode uses GitNexus process/context/impact signals to constrain Pinecone retrieval, then returns architecture-first evidence with citations.",
+      "Graph/Hybrid mode uses GitNexus process/context/impact signals to constrain Pinecone retrieval, then returns architecture-first evidence with citations.",
   },
   search: {
     label: "Search",
@@ -1324,7 +1324,7 @@ function updateExplainerText() {
     (Number(info.upload_max_file_bytes) || DEFAULT_UPLOAD_LIMITS.maxFileBytes) / 1024,
   );
   scoreExplainer.querySelector("p").textContent =
-    `Hybrid relevance uses ${semanticPct}% semantic similarity + ${lexicalPct}% lexical overlap. Results below ~${minPct}% are filtered unless nothing stronger exists. Candidate pool expands by x${info.candidate_multiplier} before reranking. Attachments are chunked in temporary scope (up to ${maxFiles} files, ~${maxFileKb}KB each).`;
+    `Graph/Hybrid relevance uses ${semanticPct}% semantic similarity + ${lexicalPct}% lexical overlap. Results below ~${minPct}% are filtered unless nothing stronger exists. Candidate pool expands by x${info.candidate_multiplier} before reranking. Attachments are chunked in temporary scope (up to ${maxFiles} files, ~${maxFileKb}KB each).`;
 }
 
 function setMode(mode) {
@@ -1392,7 +1392,7 @@ function defaultResultTypeForMode(mode, detail = null) {
     const diagramType = detail || state.activeDiagramType;
     return DIAGRAM_WORKFLOWS[diagramType]?.reportType || "Mermaid Diagram";
   }
-  if (mode === "hybrid") return "Hybrid Architecture + Evidence";
+  if (mode === "hybrid") return "Graph/Hybrid Architecture + Evidence";
   if (mode === "graph") return "Graph Architecture";
   if (mode === "dependencies") return "Dependency Graph";
   if (mode === "patterns") return "Pattern Examples";
@@ -1713,7 +1713,7 @@ function buildHybridGraphModel(graphPayload) {
 
   if (!nodes.length) {
     const queryId = "query:hybrid";
-    addNode(queryId, "Hybrid Query", "query", 1.5);
+    addNode(queryId, "Graph/Hybrid Query", "query", 1.5);
     const processes = Array.isArray(graph.processes) ? graph.processes : [];
     processes.slice(0, 12).forEach((process, idx) => {
       const label = String(process?.summary || process?.id || `Process ${idx + 1}`);
@@ -3257,7 +3257,7 @@ exploreCapabilitiesLink.addEventListener("click", (event) => {
   event.preventDefault();
   closeSuggestionModal();
   setMode("chat");
-  input.value = "Show example questions I can ask in Chat, Hybrid, Search, Code Patterns, Dependencies, Diagrams, and Run Audit modes.";
+  input.value = "Show example questions I can ask in Chat, Graph/Hybrid, Search, Code Patterns, Dependencies, Diagrams, and Run Audit modes.";
   autoResize();
   setStatus("Capabilities example inserted");
 });

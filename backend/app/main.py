@@ -10,7 +10,7 @@ import shlex
 import shutil
 import subprocess
 import threading
-from collections import defaultdict
+from collections import Counter, defaultdict
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -118,6 +118,54 @@ FILTERABLE_LANGUAGES = {"fortran", "text", "pdf"}
 FILTERABLE_SOURCE_TYPES = {"repo", "upload", "temp-upload"}
 STARTUP_SMOKE_MODES = {"off", "warn", "strict"}
 QUERY_MAX_CHARS = 8000
+DIRECT_UI_MODES = {"audit", "diagrams"}
+DIRECT_DIAGRAM_TYPES = {
+    "systemArchitecture",
+    "executionPipeline",
+    "dataFlow",
+    "dependencyGraph",
+    "buildRuntime",
+}
+DIRECT_CONTEXT_MAX_FILES = 12
+DIRECT_CONTEXT_MAX_CHARS = 18_000
+DIRECT_SOURCE_PROMPT_CHARS = 1_800
+DIRECT_UPLOAD_PROMPT_CHARS = 1_400
+DIRECT_SOURCE_SNIPPET_CHARS = 550
+DIRECT_FILE_PREVIEW_LINES = 80
+DIRECT_SYMBOL_PREVIEW_LIMIT = 3
+TEXTUAL_CONTEXT_SUFFIXES = {
+    ".c",
+    ".cfg",
+    ".conf",
+    ".f",
+    ".f03",
+    ".f08",
+    ".f90",
+    ".f95",
+    ".for",
+    ".h",
+    ".inc",
+    ".ini",
+    ".json",
+    ".md",
+    ".py",
+    ".sh",
+    ".toml",
+    ".txt",
+    ".yaml",
+    ".yml",
+}
+IMPORTANT_TEXT_FILE_NAMES = {
+    ".env.example",
+    "dockerfile",
+    "makefile",
+    "package.json",
+    "procfile",
+    "pyproject.toml",
+    "readme",
+    "readme.md",
+    "requirements.txt",
+}
 IDENTIFIER_STOPWORDS = {
     "where",
     "which",
@@ -200,6 +248,7 @@ class QueryRequest(BaseModel):
     top_k: int = Field(default=5, ge=1, le=50)
     mode: str = Field(default="chat")
     ui_mode: str | None = Field(default=None, max_length=40)
+    diagram_type: str | None = Field(default=None, max_length=80)
     scope: str = Field(default="both")
     project_id: str = Field(default="nshmp-main", min_length=1, max_length=80)
     path_prefix: str | None = Field(default=None, max_length=260)
@@ -1902,6 +1951,7 @@ def validate_query_request(
     debug: bool = False,
     mode: str = "chat",
     ui_mode: str | None = None,
+    diagram_type: str | None = None,
     scope: str = "both",
     project_id: str | None = None,
     path_prefix: str | None = None,
@@ -1915,6 +1965,7 @@ def validate_query_request(
             debug=debug,
             mode=normalize_mode(mode),
             ui_mode=str(ui_mode or "").strip().lower() or None,
+            diagram_type=str(diagram_type or "").strip() or None,
             scope=normalize_scope(scope),
             project_id=normalize_project_id(project_id),
             path_prefix=normalize_path_prefix(path_prefix),
@@ -3307,6 +3358,619 @@ def file_snippet(file_path: str, line_start: int, line_end: int, pad_after: int 
     start = max(1, line_start)
     end = max(start, min(len(lines), line_end + max(pad_after, 0)))
     return "\n".join(lines[start - 1 : end]).strip()
+
+
+def normalized_ui_mode(value: QueryRequest | str | None) -> str:
+    if isinstance(value, QueryRequest):
+        raw = value.ui_mode or value.mode
+    else:
+        raw = value
+    return str(raw or "").strip().lower()
+
+
+def infer_diagram_type(text: str | None) -> str:
+    normalized = str(text or "").strip().lower()
+    if not normalized:
+        return "systemArchitecture"
+    if "execution" in normalized or "pipeline" in normalized or "runtime flow" in normalized:
+        return "executionPipeline"
+    if "data flow" in normalized or "lineage" in normalized:
+        return "dataFlow"
+    if "dependency" in normalized or "module graph" in normalized or "import" in normalized:
+        return "dependencyGraph"
+    if "build" in normalized or "runtime environment" in normalized or "compiler" in normalized:
+        return "buildRuntime"
+    return "systemArchitecture"
+
+
+def normalize_diagram_type(value: str | None, question: str = "") -> str:
+    raw = str(value or "").strip()
+    if raw in DIRECT_DIAGRAM_TYPES:
+        return raw
+    return infer_diagram_type(question)
+
+
+def clip_prompt_text(text: str, limit: int) -> str:
+    raw = str(text or "").strip()
+    if len(raw) <= max(limit, 1):
+        return raw
+    truncated = raw[: max(limit - 16, 1)].rstrip()
+    last_newline = truncated.rfind("\n")
+    if last_newline >= max(limit // 3, 80):
+        truncated = truncated[:last_newline].rstrip()
+    return f"{truncated}\n...[truncated]"
+
+
+@lru_cache(maxsize=1)
+def repo_context_inventory() -> dict[str, Any]:
+    root = repo_root_path()
+    skip_parts = {".git", ".gitnexus", ".venv", ".venv-audit", "__pycache__"}
+    top_level_entries = [
+        f"{path.name}/" if path.is_dir() else path.name
+        for path in sorted(root.iterdir(), key=lambda item: (not item.is_dir(), item.name.lower()))
+        if not path.name.startswith(".")
+    ]
+    extension_counts: Counter[str] = Counter()
+    text_paths: set[str] = set()
+    script_files: list[str] = []
+    config_files: list[str] = []
+    doc_files: list[str] = []
+    total_file_count = 0
+
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        rel_path = str(path.relative_to(root)).replace("\\", "/")
+        rel_parts = set(Path(rel_path).parts)
+        if rel_parts & skip_parts:
+            continue
+        total_file_count += 1
+        suffix = path.suffix.lower()
+        extension_counts[suffix or "[no_ext]"] += 1
+        lower_rel = rel_path.lower()
+        if suffix == ".sh":
+            script_files.append(rel_path)
+        if rel_path.startswith("conf/") or rel_path.startswith("etc/"):
+            config_files.append(rel_path)
+        if lower_rel.endswith(".md") or rel_path.startswith("docs/"):
+            doc_files.append(rel_path)
+        if suffix in TEXTUAL_CONTEXT_SUFFIXES or path.name.lower() in IMPORTANT_TEXT_FILE_NAMES:
+            text_paths.add(rel_path)
+
+    symbol_index = repo_symbol_index()
+    source_rankings: list[dict[str, Any]] = []
+    for file_path, definitions in (symbol_index.get("by_file", {}) or {}).items():
+        symbols = [str(item.get("symbol", "")).strip() for item in definitions if str(item.get("symbol", "")).strip()]
+        signatures = [str(item.get("signature", "")).strip() for item in definitions if str(item.get("signature", "")).strip()]
+        source_rankings.append(
+            {
+                "file_path": file_path,
+                "definition_count": len(definitions),
+                "line_count": len(repo_file_lines(file_path)),
+                "symbols": symbols[:8],
+                "signatures": signatures[:8],
+            }
+        )
+    source_rankings.sort(
+        key=lambda row: (int(row.get("definition_count") or 0), int(row.get("line_count") or 0), str(row.get("file_path") or "")),
+        reverse=True,
+    )
+
+    return {
+        "repo_name": root.name,
+        "repo_root": str(root),
+        "commit_hash": repo_commit_short(),
+        "top_level_entries": top_level_entries,
+        "total_file_count": total_file_count,
+        "extension_counts": dict(extension_counts),
+        "text_paths": sorted(text_paths),
+        "script_files": sorted(script_files),
+        "config_files": sorted(config_files),
+        "doc_files": sorted(doc_files),
+        "source_rankings": source_rankings,
+    }
+
+
+def build_repo_overview_text() -> str:
+    inventory = repo_context_inventory()
+    extension_counts = inventory.get("extension_counts", {}) if isinstance(inventory, dict) else {}
+    ranked_extensions = sorted(
+        ((str(ext), int(count)) for ext, count in extension_counts.items()),
+        key=lambda item: (item[1], item[0]),
+        reverse=True,
+    )[:8]
+    source_rankings = inventory.get("source_rankings", []) if isinstance(inventory, dict) else []
+    lines = [
+        f"Repository: {inventory.get('repo_name', 'unknown')}",
+        f"Repo root: {inventory.get('repo_root', '')}",
+        f"Commit: {inventory.get('commit_hash') or 'unknown'}",
+        f"Top-level entries: {', '.join(inventory.get('top_level_entries', [])[:16]) or 'n/a'}",
+        f"Total files discovered: {inventory.get('total_file_count', 0)}",
+        "File type counts: "
+        + (
+            ", ".join(f"{ext}={count}" for ext, count in ranked_extensions)
+            if ranked_extensions
+            else "n/a"
+        ),
+    ]
+    script_files = inventory.get("script_files", []) if isinstance(inventory, dict) else []
+    if script_files:
+        lines.append(f"Representative scripts: {', '.join(script_files[:6])}")
+    config_files = inventory.get("config_files", []) if isinstance(inventory, dict) else []
+    if config_files:
+        lines.append(f"Representative config/data files: {', '.join(config_files[:6])}")
+    if source_rankings:
+        lines.append("Representative source files by definition density:")
+        for row in source_rankings[:6]:
+            symbols = ", ".join(row.get("symbols", [])[:3]) or "n/a"
+            lines.append(
+                f"- {row.get('file_path', 'unknown')} ({row.get('definition_count', 0)} defs; symbols: {symbols})"
+            )
+    return "\n".join(lines)
+
+
+def rank_context_paths_for_question(question: str) -> list[str]:
+    inventory = repo_context_inventory()
+    terms = {
+        token.lower()
+        for token in IDENTIFIER_PATTERN.findall(question)
+        if len(token) >= 3
+    }
+    terms.update(
+        token.lower()
+        for token in WORD_PATTERN.findall(question)
+        if len(token) >= 4
+    )
+    if not terms:
+        return []
+
+    ranked: list[tuple[float, str]] = []
+    source_by_path = {
+        str(row.get("file_path", "")): row
+        for row in inventory.get("source_rankings", [])
+        if str(row.get("file_path", ""))
+    }
+    for path in inventory.get("text_paths", []):
+        lower_path = str(path).lower()
+        row = source_by_path.get(str(path), {})
+        symbol_blob = " ".join(str(item) for item in row.get("symbols", []))
+        signature_blob = " ".join(str(item) for item in row.get("signatures", []))
+        haystack = f"{lower_path} {symbol_blob.lower()} {signature_blob.lower()}".strip()
+        score = 0.0
+        for term in terms:
+            if term in lower_path:
+                score += 3.0
+            if f" {term}" in f" {symbol_blob.lower()}":
+                score += 4.0
+            if term in signature_blob.lower():
+                score += 2.0
+        if score > 0:
+            score += min(float(row.get("definition_count") or 0), 6.0) * 0.15
+            ranked.append((score, str(path)))
+    ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [path for _, path in ranked]
+
+
+def choose_direct_context_paths(question: str, ui_mode: str, diagram_type: str | None) -> list[str]:
+    inventory = repo_context_inventory()
+    available_paths = set(inventory.get("text_paths", []))
+    selected: list[str] = []
+
+    def add_path(path: str) -> None:
+        normalized = str(path or "").strip().replace("\\", "/")
+        if not normalized or normalized not in available_paths or normalized in selected:
+            return
+        selected.append(normalized)
+
+    baseline_paths = [
+        "README.md",
+        "Makefile",
+        "run_all_hazard.sh",
+        "backend/Procfile",
+        "backend/Dockerfile",
+        "backend/requirements.txt",
+    ]
+    for path in baseline_paths:
+        add_path(path)
+
+    source_rankings = inventory.get("source_rankings", []) if isinstance(inventory, dict) else []
+    source_paths = [str(row.get("file_path", "")) for row in source_rankings if str(row.get("file_path", ""))]
+    script_files = list(inventory.get("script_files", [])) if isinstance(inventory, dict) else []
+    config_files = [path for path in inventory.get("config_files", []) if path in available_paths] if isinstance(inventory, dict) else []
+
+    if ui_mode == "audit":
+        for path in script_files[:4]:
+            add_path(path)
+        for path in source_paths[:5]:
+            add_path(path)
+    else:
+        resolved_type = normalize_diagram_type(diagram_type, question)
+        if resolved_type == "executionPipeline":
+            for path in ["run_all_hazard.sh", "Makefile"]:
+                add_path(path)
+            for path in script_files[:6]:
+                add_path(path)
+            for path in source_paths[:2]:
+                add_path(path)
+        elif resolved_type == "dataFlow":
+            for path in ["run_all_hazard.sh", "README.md"]:
+                add_path(path)
+            for path in config_files[:4]:
+                add_path(path)
+            for path in script_files[:3]:
+                add_path(path)
+            for path in source_paths[:3]:
+                add_path(path)
+        elif resolved_type == "dependencyGraph":
+            add_path("Makefile")
+            for path in source_paths[:6]:
+                add_path(path)
+            for path in script_files[:2]:
+                add_path(path)
+        elif resolved_type == "buildRuntime":
+            for path in [
+                "Makefile",
+                "run_all_hazard.sh",
+                "backend/Dockerfile",
+                "backend/Procfile",
+                "backend/requirements.txt",
+            ]:
+                add_path(path)
+            for path in script_files[:3]:
+                add_path(path)
+        else:
+            for path in ["run_all_hazard.sh", "Makefile"]:
+                add_path(path)
+            for path in script_files[:3]:
+                add_path(path)
+            for path in source_paths[:4]:
+                add_path(path)
+
+    for path in rank_context_paths_for_question(question)[:5]:
+        add_path(path)
+
+    return selected[:DIRECT_CONTEXT_MAX_FILES]
+
+
+def build_direct_repo_source(file_path: str) -> dict[str, Any] | None:
+    normalized_path = str(file_path or "").strip().replace("\\", "/")
+    if not normalized_path:
+        return None
+    lines = repo_file_lines(normalized_path)
+    if not lines:
+        return None
+
+    definitions = (repo_symbol_index().get("by_file", {}) or {}).get(normalized_path, [])
+    prompt_excerpt = ""
+    line_start = 1
+    line_end = min(len(lines), DIRECT_FILE_PREVIEW_LINES)
+    if definitions and Path(normalized_path).suffix.lower() in FORTRAN_EXTENSIONS:
+        segments: list[str] = []
+        line_start = safe_int(definitions[0].get("line_start")) or 1
+        line_end = line_start
+        for definition in definitions[:DIRECT_SYMBOL_PREVIEW_LIMIT]:
+            seg_start = safe_int(definition.get("line_start")) or 1
+            seg_end = safe_int(definition.get("line_end")) or seg_start
+            seg_end = min(seg_end, seg_start + 18)
+            snippet = file_snippet(normalized_path, seg_start, seg_end)
+            if not snippet:
+                continue
+            header = f"{definition.get('kind', 'symbol')} {definition.get('symbol', '')} ({normalized_path}:{seg_start}-{seg_end})"
+            segments.append(f"{header}\n{snippet}")
+            line_end = max(line_end, seg_end)
+        prompt_excerpt = "\n\n".join(segments).strip()
+    if not prompt_excerpt:
+        prompt_excerpt = "\n".join(lines[:line_end]).strip()
+    if not prompt_excerpt:
+        return None
+
+    prompt_excerpt = clip_prompt_text(prompt_excerpt, DIRECT_SOURCE_PROMPT_CHARS)
+    snippet = clip_prompt_text(prompt_excerpt, DIRECT_SOURCE_SNIPPET_CHARS)
+    return {
+        "file_path": normalized_path,
+        "line_start": line_start,
+        "line_end": max(line_start, line_end),
+        "prompt_excerpt": prompt_excerpt,
+        "snippet": snippet,
+        "source_type": "repo",
+    }
+
+
+def build_direct_upload_sources(uploaded_files: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not uploaded_files:
+        return []
+    metadata_chunks, _ = build_attachment_chunks(uploaded_files, source_type="temp-upload")
+    selected: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+    for chunk in metadata_chunks:
+        file_path = str(chunk.get("file_path", "")).strip()
+        if not file_path or file_path in seen_paths:
+            continue
+        prompt_excerpt = clip_prompt_text(str(chunk.get("chunk_text", "")), DIRECT_UPLOAD_PROMPT_CHARS)
+        if not prompt_excerpt:
+            continue
+        seen_paths.add(file_path)
+        selected.append(
+            {
+                "file_path": file_path,
+                "line_start": safe_int(chunk.get("line_start")) or 1,
+                "line_end": safe_int(chunk.get("line_end")) or (safe_int(chunk.get("line_start")) or 1),
+                "prompt_excerpt": prompt_excerpt,
+                "snippet": clip_prompt_text(prompt_excerpt, DIRECT_SOURCE_SNIPPET_CHARS),
+                "source_type": str(chunk.get("source_type", "temp-upload") or "temp-upload"),
+            }
+        )
+        if len(selected) >= 4:
+            break
+    return selected
+
+
+def build_direct_mode_context(
+    question: str,
+    ui_mode: str,
+    diagram_type: str | None = None,
+    uploaded_files: list[dict[str, Any]] | None = None,
+) -> tuple[str, list[Citation], dict[str, Any]]:
+    overview = build_repo_overview_text()
+    selected_paths = choose_direct_context_paths(question, ui_mode, diagram_type)
+    repo_sources = [item for item in (build_direct_repo_source(path) for path in selected_paths) if item]
+    upload_sources = build_direct_upload_sources(uploaded_files or [])
+    all_sources = repo_sources + upload_sources
+
+    sections = [overview, "", "Selected repository excerpts:"]
+    citations: list[Citation] = []
+    included_sources: list[dict[str, Any]] = []
+    context_chars = sum(len(part) for part in sections)
+    for index, source in enumerate(all_sources, start=1):
+        block = (
+            f"[Source {index}] {source['file_path']}:{source['line_start']}-{source['line_end']}\n"
+            f"{source['prompt_excerpt']}"
+        )
+        if included_sources and context_chars + len(block) + 2 > DIRECT_CONTEXT_MAX_CHARS:
+            break
+        sections.extend(["", block])
+        context_chars += len(block) + 2
+        included_sources.append(source)
+        citations.append(
+            Citation(
+                file_path=str(source["file_path"]),
+                line_start=int(source["line_start"]),
+                line_end=int(source["line_end"]),
+                score=round(max(0.58, 0.88 - ((len(included_sources) - 1) * 0.05)), 4),
+                source_type=str(source["source_type"]),
+                snippet=str(source["snippet"]),
+            )
+        )
+
+    context = "\n".join(sections).strip()
+    metadata = {
+        "ui_mode": ui_mode,
+        "diagram_type": normalize_diagram_type(diagram_type, question) if ui_mode == "diagrams" else "",
+        "selected_source_count": len(included_sources),
+        "selected_sources": [
+            {
+                "file_path": source["file_path"],
+                "line_start": source["line_start"],
+                "line_end": source["line_end"],
+                "source_type": source["source_type"],
+            }
+            for source in included_sources
+        ],
+        "repo_overview": {
+            "repo_name": repo_context_inventory().get("repo_name"),
+            "commit_hash": repo_context_inventory().get("commit_hash"),
+            "total_file_count": repo_context_inventory().get("total_file_count"),
+            "top_level_entries": repo_context_inventory().get("top_level_entries", [])[:16],
+        },
+    }
+    return context, citations, metadata
+
+
+def build_direct_audit_system_prompt() -> str:
+    return (
+        "You are a principal software auditor reviewing a repository from a deterministic repo scan and curated file excerpts.\n"
+        "Use only the repository context and uploaded file excerpts provided in the user message.\n"
+        "Do not claim to have executed code, run tests, or inspected files that are not present in the provided context.\n"
+        "Separate verified evidence from inference. Mark uncertain claims explicitly as Hypothesis and include a verification step.\n"
+        "Prefer incremental fixes, operational clarity, and defensible engineering judgment. Do not recommend rewrites.\n\n"
+        "Return markdown in this exact section order:\n"
+        "Overview\n"
+        "Key Findings\n"
+        "Evidence (files/lines)\n"
+        "Recommendations\n"
+        "Next Actions\n\n"
+        "Audit requirements:\n"
+        "- Overview: concise system map, current repository posture, and major runtime/build boundaries.\n"
+        "- Key Findings: 3-7 findings ordered by severity. For each finding include Priority (High|Medium|Low), Why it matters, Evidence, and a recommended fix.\n"
+        "- Evidence (files/lines): list concrete file path and line anchors from the provided context.\n"
+        "- Recommendations: safe, sequenced improvements with no big-bang rewrite advice.\n"
+        "- Next Actions: immediate follow-ups and, if warranted, deeper-pass targets.\n"
+        "- Keep the tone direct, concise, and engineering-focused."
+    )
+
+
+def build_direct_diagram_system_prompt(diagram_type: str) -> str:
+    configs = {
+        "systemArchitecture": {
+            "title": "system architecture diagram",
+            "header": "flowchart TD",
+            "goal": "Show high-level subsystems, major boundaries, and directional relationships.",
+        },
+        "executionPipeline": {
+            "title": "execution pipeline diagram",
+            "header": "flowchart LR",
+            "goal": "Show runtime order, branching, and stage transitions from entrypoint to outputs.",
+        },
+        "dataFlow": {
+            "title": "data flow diagram",
+            "header": "flowchart TD",
+            "goal": "Show inputs, transformations, and outputs with clear lineage.",
+        },
+        "dependencyGraph": {
+            "title": "dependency graph",
+            "header": "graph TD",
+            "goal": "Show the most central modules/files and their directional dependencies.",
+        },
+        "buildRuntime": {
+            "title": "build and runtime environment diagram",
+            "header": "flowchart TD",
+            "goal": "Show compile-time stages, runtime dependencies, and produced artifacts.",
+        },
+    }
+    resolved_type = normalize_diagram_type(diagram_type)
+    config = configs.get(resolved_type, configs["systemArchitecture"])
+    return (
+        "You are a principal software architect generating repository diagrams from a deterministic repo scan and curated file excerpts.\n"
+        "Use only the provided repository context. Never invent components, files, edges, or execution stages.\n"
+        "If evidence is insufficient, omit the element or label it '(hypothesis)' rather than fabricating detail.\n"
+        "Return only valid Mermaid. No markdown fences. No prose before or after the Mermaid output.\n"
+        f"The diagram requested is a {config['title']}.\n"
+        f"The Mermaid output must begin with: {config['header']}\n"
+        f"Primary goal: {config['goal']}\n\n"
+        "Diagram rules:\n"
+        "- Prefer 6-12 nodes and a clean, readable layout.\n"
+        "- Use subgraph blocks as swimlanes when boundaries, actors, phases, or tiers improve clarity.\n"
+        "- Use concise engineering labels that map to real repository paths, scripts, modules, directories, or runtime stages present in the context.\n"
+        "- Avoid placeholder names such as Component A, Service B, or Module X.\n"
+        "- Show only high-signal edges. Keep the diagram deterministic and connected.\n"
+        "- If the user asks for a flow or user journey but the repo only exposes system/operator flows, model the nearest verified flow and keep labels concrete."
+    )
+
+
+def generate_direct_mode_answer(
+    *,
+    ui_mode: str,
+    question: str,
+    context: str,
+    telemetry: RagRequestTelemetry | None = None,
+    diagram_type: str | None = None,
+) -> str:
+    resolved_ui_mode = normalized_ui_mode(ui_mode)
+    if resolved_ui_mode not in DIRECT_UI_MODES:
+        raise ValueError(f"Unsupported direct mode: {ui_mode}")
+
+    client = get_openai_client()
+    system_prompt = (
+        build_direct_diagram_system_prompt(normalize_diagram_type(diagram_type, question))
+        if resolved_ui_mode == "diagrams"
+        else build_direct_audit_system_prompt()
+    )
+    started = time.perf_counter()
+    completion = call_with_retries(
+        "openai direct mode completion",
+        lambda: client.chat.completions.create(
+            model=settings.openai_chat_model,
+            temperature=0.0 if resolved_ui_mode == "diagrams" else 0.15,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": (
+                        f"User request:\n{question}\n\n"
+                        f"Repository context:\n{context}"
+                    ),
+                },
+            ],
+        ),
+    )
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    if telemetry:
+        usage = parse_openai_usage(getattr(completion, "usage", None))
+        telemetry.record_llm(
+            input_tokens=int(usage.get("prompt_tokens") or 0),
+            output_tokens=int(usage.get("completion_tokens") or 0),
+            cached_input_tokens=int(usage.get("cached_tokens") or 0),
+            latency_ms=elapsed_ms,
+            model_name=str(getattr(completion, "model", settings.openai_chat_model)),
+        )
+    content = completion.choices[0].message.content
+    return content.strip() if content else "No answer generated."
+
+
+def build_direct_mode_debug_payload(
+    *,
+    context: str,
+    metadata: dict[str, Any],
+    latency_ms: float | None = None,
+) -> dict[str, Any]:
+    payload = {
+        "route_debug": {
+            "route": "direct_agent",
+            "steps": ["repo_scan", "source_selection", "llm"],
+        },
+        "hybrid_debug": {},
+        "direct_context": metadata,
+        "final_context_preview": context[:3000],
+        "context_token_estimate": token_count(context),
+    }
+    if latency_ms is not None:
+        payload["latency_ms"] = round(latency_ms, 2)
+    return payload
+
+
+def execute_direct_ui_mode_request(
+    payload: QueryRequest,
+    telemetry: RagRequestTelemetry,
+    uploaded_files: list[dict[str, Any]] | None = None,
+) -> QueryResponse:
+    ui_mode = normalized_ui_mode(payload)
+    diagram_type = normalize_diagram_type(payload.diagram_type, payload.question) if ui_mode == "diagrams" else ""
+    context_started = time.perf_counter()
+    context, citations, metadata = build_direct_mode_context(
+        question=payload.question,
+        ui_mode=ui_mode,
+        diagram_type=diagram_type,
+        uploaded_files=uploaded_files or [],
+    )
+    context_elapsed_ms = (time.perf_counter() - context_started) * 1000.0
+    metadata["diagram_type"] = diagram_type
+    selected_files = {
+        citation.file_path
+        for citation in citations
+        if citation.file_path and not str(citation.file_path).startswith("uploaded/")
+    }
+    telemetry.record_counts(
+        retrieved_file_count=len(selected_files),
+        retrieved_chunk_count=len(citations),
+        selected_chunk_count=len(citations),
+    )
+    telemetry.mark_retrieval_complete()
+    answer = generate_direct_mode_answer(
+        ui_mode=ui_mode,
+        question=payload.question,
+        context=context,
+        telemetry=telemetry,
+        diagram_type=diagram_type,
+    )
+    telemetry.record_postprocess(context_elapsed_ms)
+    telemetry.mark_success(answer)
+    response_telemetry = finalize_and_persist_telemetry(telemetry)
+    debug_payload = {}
+    if payload.debug:
+        debug_payload = build_direct_mode_debug_payload(
+            context=context,
+            metadata=metadata,
+            latency_ms=(time.perf_counter() - telemetry._started_perf) * 1000.0,
+        )
+        debug_payload["telemetry"] = response_telemetry
+    return QueryResponse(
+        answer=answer,
+        citations=citations,
+        graph={},
+        evidence=[],
+        evidence_strength={
+            "label": "Unknown",
+            "score": None,
+            "reason": f"{ui_mode.capitalize()} mode uses direct repository scan context and bypasses retrieval scoring.",
+            "metrics": {
+                "mode": ui_mode,
+                "diagram_type": diagram_type,
+                "selected_sources": len(citations),
+            },
+        },
+        debug=debug_payload,
+        telemetry=response_telemetry,
+    )
 
 
 def citation_key(citation: Citation) -> tuple[str, int, int]:
@@ -5672,6 +6336,7 @@ def execute_query_request(
     telemetry = build_request_telemetry(payload)
     started = time.perf_counter()
     normalized_mode = normalize_mode(payload.mode)
+    normalized_ui = normalized_ui_mode(payload)
     normalized_scope = normalize_scope(payload.scope)
     normalized_project_id = normalize_project_id(payload.project_id)
     path_prefix, language, source_type_filter = normalized_request_filters(
@@ -5680,6 +6345,21 @@ def execute_query_request(
         payload.source_type,
     )
     uploaded_files = uploaded_files or []
+
+    if normalized_ui in DIRECT_UI_MODES:
+        try:
+            return execute_direct_ui_mode_request(payload, telemetry=telemetry, uploaded_files=uploaded_files)
+        except HTTPException as exc:
+            telemetry.mark_failure("postprocess", exc.detail)
+            finalize_and_persist_telemetry(telemetry)
+            raise
+        except Exception as exc:
+            stage = "llm" if telemetry.llm_latency_ms <= 0 else "postprocess"
+            telemetry.mark_failure(stage, exc)
+            finalize_and_persist_telemetry(telemetry)
+            if stage == "llm":
+                raise HTTPException(status_code=502, detail=f"Direct {normalized_ui} generation failed: {exc}") from exc
+            raise HTTPException(status_code=500, detail=f"Direct {normalized_ui} response failed: {exc}") from exc
 
     try:
         if uploaded_files and normalized_mode not in {"hybrid", "graph"}:
@@ -5995,6 +6675,7 @@ async def search_with_uploads(
     debug: str | None = Form(default=None),
     mode: str = Form("chat"),
     ui_mode: str | None = Form(default=None),
+    diagram_type: str | None = Form(default=None),
     scope: str = Form("both"),
     project_id: str | None = Form(default=None),
     path_prefix: str | None = Form(default=None),
@@ -6008,6 +6689,7 @@ async def search_with_uploads(
         debug=parse_form_bool(debug),
         mode=mode,
         ui_mode=ui_mode or mode,
+        diagram_type=diagram_type,
         scope=scope,
         project_id=project_id,
         path_prefix=path_prefix,
@@ -6029,6 +6711,7 @@ async def query_with_uploads(
     debug: str | None = Form(default=None),
     mode: str = Form("chat"),
     ui_mode: str | None = Form(default=None),
+    diagram_type: str | None = Form(default=None),
     scope: str = Form("both"),
     project_id: str | None = Form(default=None),
     path_prefix: str | None = Form(default=None),
@@ -6042,6 +6725,7 @@ async def query_with_uploads(
         debug=parse_form_bool(debug),
         mode=mode,
         ui_mode=ui_mode or mode,
+        diagram_type=diagram_type,
         scope=scope,
         project_id=project_id,
         path_prefix=path_prefix,

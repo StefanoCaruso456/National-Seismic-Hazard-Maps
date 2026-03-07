@@ -69,11 +69,39 @@ class DirectUiModeTests(unittest.TestCase):
             main.execute_direct_ui_mode_request = original_direct  # type: ignore[assignment]
             main.run_routed_retrieval_plan = original_routed  # type: ignore[assignment]
 
-    def test_build_direct_diagram_system_prompt_enforces_mermaid_only_contract(self) -> None:
+    def test_build_direct_diagram_system_prompt_enforces_json_contract(self) -> None:
         prompt = main.build_direct_diagram_system_prompt("dataFlow")
-        self.assertIn("Return only valid Mermaid", prompt)
-        self.assertIn("flowchart TD", prompt)
-        self.assertIn("Use subgraph blocks as swimlanes", prompt)
+        self.assertIn("Return only JSON", prompt)
+        self.assertIn('"lanes"', prompt)
+        self.assertIn("swimlanes", prompt)
+
+    def test_build_mermaid_from_direct_diagram_spec_uses_subgraphs(self) -> None:
+        spec = main.normalize_direct_diagram_spec(
+            {
+                "title": "National Hazard Run",
+                "orientation": "LR",
+                "lanes": [
+                    {"id": "orchestration", "label": "Orchestration"},
+                    {"id": "execution", "label": "Execution"},
+                    {"id": "outputs", "label": "Outputs"},
+                ],
+                "nodes": [
+                    {"id": "run_all", "label": "run_all_hazard.sh", "lane": "orchestration"},
+                    {"id": "hazrun", "label": "hazrun_casc_2014.sh", "lane": "execution"},
+                    {"id": "logs", "label": "logs/", "lane": "outputs"},
+                ],
+                "edges": [
+                    {"from": "run_all", "to": "hazrun", "label": "executes"},
+                    {"from": "hazrun", "to": "logs", "label": "writes"},
+                ],
+            },
+            "executionPipeline",
+        )
+        mermaid = main.build_mermaid_from_direct_diagram_spec(spec)
+        self.assertIn("flowchart LR", mermaid)
+        self.assertIn('subgraph lane_orchestration["Orchestration"]', mermaid)
+        self.assertIn('node_run_all["run_all_hazard.sh"]', mermaid)
+        self.assertIn("node_run_all -->|executes| node_hazrun", mermaid)
 
 
 if __name__ == "__main__":

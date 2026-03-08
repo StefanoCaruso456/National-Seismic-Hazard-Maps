@@ -103,6 +103,53 @@ class DirectUiModeTests(unittest.TestCase):
         self.assertIn('node_run_all["run_all_hazard.sh"]', mermaid)
         self.assertIn("node_run_all -->|executes| node_hazrun", mermaid)
 
+    def test_normalize_direct_diagram_output_strips_fences(self) -> None:
+        normalized = main.normalize_direct_diagram_output("```mermaid\nflowchart TD\nA[Start] --> B[End]\n```")
+        self.assertEqual(normalized, "flowchart TD\nA[Start] --> B[End]")
+
+    def test_normalize_direct_diagram_output_falls_back_for_invalid_text(self) -> None:
+        normalized = main.normalize_direct_diagram_output("Here is your diagram:\nA -> B")
+        self.assertEqual(normalized, "flowchart TD\nA[Diagram generation failed]")
+
+    def test_execute_direct_ui_mode_request_returns_diagram_payload(self) -> None:
+        original_context = main.build_direct_mode_context
+        original_answer = main.generate_direct_mode_answer
+        original_finalize = main.finalize_and_persist_telemetry
+        try:
+            main.build_direct_mode_context = lambda **_kwargs: (  # type: ignore[assignment]
+                "repo context",
+                [],
+                {"selected_sources": []},
+            )
+            main.generate_direct_mode_answer = lambda **_kwargs: "flowchart TD\nA[Start] --> B[End]"  # type: ignore[assignment]
+            main.finalize_and_persist_telemetry = lambda _telemetry: {"mode": "diagrams"}  # type: ignore[assignment]
+
+            response = main.execute_direct_ui_mode_request(
+                main.QueryRequest(
+                    question="Draw the retrieval flow.",
+                    mode="chat",
+                    ui_mode="diagrams",
+                    diagram_type="retrievalFlow",
+                ),
+                telemetry=main.build_request_telemetry(
+                    main.QueryRequest(
+                        question="Draw the retrieval flow.",
+                        mode="chat",
+                        ui_mode="diagrams",
+                        diagram_type="retrievalFlow",
+                    )
+                ),
+                uploaded_files=[],
+            )
+
+            self.assertEqual(response.type, "diagram")
+            self.assertEqual(response.format, "mermaid")
+            self.assertEqual(response.content, "flowchart TD\nA[Start] --> B[End]")
+        finally:
+            main.build_direct_mode_context = original_context  # type: ignore[assignment]
+            main.generate_direct_mode_answer = original_answer  # type: ignore[assignment]
+            main.finalize_and_persist_telemetry = original_finalize  # type: ignore[assignment]
+
 
 if __name__ == "__main__":
     unittest.main()

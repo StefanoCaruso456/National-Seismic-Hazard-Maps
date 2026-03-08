@@ -672,6 +672,29 @@ body {
   white-space: pre-wrap;
 }
 
+.bubble.diagram-bubble {
+  padding: 12px;
+  overflow: auto;
+}
+
+.diagram-canvas {
+  min-height: 120px;
+}
+
+.diagram-canvas svg {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 0 auto;
+}
+
+.diagram-fallback {
+  margin: 0;
+  white-space: pre-wrap;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .message.user .bubble {
   border-color: rgba(209, 115, 111, 0.4);
 }

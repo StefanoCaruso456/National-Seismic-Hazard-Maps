@@ -122,9 +122,11 @@ DIRECT_UI_MODES = {"audit", "diagrams"}
 DIRECT_DIAGRAM_TYPES = {
     "systemArchitecture",
     "executionPipeline",
+    "retrievalFlow",
     "dataFlow",
     "dependencyGraph",
     "buildRuntime",
+    "auditDiagram",
 }
 DIRECT_CONTEXT_MAX_FILES = 12
 DIRECT_CONTEXT_MAX_CHARS = 18_000
@@ -272,6 +274,9 @@ class Citation(BaseModel):
 
 class QueryResponse(BaseModel):
     answer: str
+    type: str = "text"
+    format: str = "text"
+    content: str | None = None
     citations: list[Citation] = Field(default_factory=list)
     graph: dict[str, Any] = Field(default_factory=dict)
     evidence: list[dict[str, Any]] = Field(default_factory=list)
@@ -3375,6 +3380,10 @@ def infer_diagram_type(text: str | None) -> str:
     normalized = str(text or "").strip().lower()
     if not normalized:
         return "systemArchitecture"
+    if "retrieval" in normalized or "rag" in normalized:
+        return "retrievalFlow"
+    if "audit diagram" in normalized or "risk map" in normalized or "audit view" in normalized:
+        return "auditDiagram"
     if "execution" in normalized or "pipeline" in normalized or "runtime flow" in normalized:
         return "executionPipeline"
     if "data flow" in normalized or "lineage" in normalized:
@@ -3808,6 +3817,13 @@ def direct_diagram_config(diagram_type: str) -> dict[str, Any]:
             "goal": "Show runtime order, branching, and stage transitions from entrypoint to outputs.",
             "lane_templates": ["Entrypoint", "Build", "Execution", "Outputs"],
         },
+        "retrievalFlow": {
+            "title": "retrieval flow diagram",
+            "chart_type": "flowchart",
+            "orientation": "TD",
+            "goal": "Show user input, frontend handling, backend routing, retrieval stages, answer generation, and response delivery.",
+            "lane_templates": ["User", "Frontend", "Backend", "Retrieval", "LLM / Response"],
+        },
         "dataFlow": {
             "title": "data flow diagram",
             "chart_type": "flowchart",
@@ -3828,6 +3844,13 @@ def direct_diagram_config(diagram_type: str) -> dict[str, Any]:
             "orientation": "TD",
             "goal": "Show compile-time stages, runtime dependencies, and produced artifacts.",
             "lane_templates": ["Build Inputs", "Build", "Runtime", "Artifacts"],
+        },
+        "auditDiagram": {
+            "title": "audit diagram",
+            "chart_type": "flowchart",
+            "orientation": "TD",
+            "goal": "Show major repository areas, risk concentrations, and the highest-signal audit paths from verified context.",
+            "lane_templates": ["Entrypoints", "Core Components", "Risk Areas", "Evidence", "Actions"],
         },
     }
     resolved_type = normalize_diagram_type(diagram_type)
@@ -3876,6 +3899,17 @@ def build_direct_diagram_fallback_prompt(diagram_type: str) -> str:
         f"- Prefer 3-{DIRECT_DIAGRAM_MAX_LANES} lanes and 6-{DIRECT_DIAGRAM_MAX_NODES} nodes.\n"
         "- Keep node labels concise and connected by only high-signal edges."
     )
+
+
+MERMAID_VALID_PREFIXES = (
+    "flowchart td",
+    "flowchart lr",
+    "graph td",
+    "graph lr",
+    "sequencediagram",
+    "classdiagram",
+)
+DIRECT_DIAGRAM_FAILURE_MERMAID = "flowchart TD\nA[Diagram generation failed]"
 
 
 def extract_json_object_text(text: str) -> str:
@@ -4012,6 +4046,19 @@ def parse_direct_diagram_spec(text: str, diagram_type: str) -> dict[str, Any]:
     return normalize_direct_diagram_spec(raw, diagram_type)
 
 
+def normalize_direct_diagram_output(text: str) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return DIRECT_DIAGRAM_FAILURE_MERMAID
+    fenced = re.search(r"```(?:mermaid)?\s*([\s\S]*?)```", raw, re.IGNORECASE)
+    cleaned = fenced.group(1).strip() if fenced else raw
+    cleaned = cleaned.replace("```mermaid", "").replace("```", "").strip()
+    lowered = cleaned.lower()
+    if any(lowered.startswith(prefix) for prefix in MERMAID_VALID_PREFIXES):
+        return cleaned
+    return DIRECT_DIAGRAM_FAILURE_MERMAID
+
+
 def record_direct_completion_usage(
     completion: Any,
     telemetry: RagRequestTelemetry | None,
@@ -4061,7 +4108,9 @@ def generate_direct_diagram_answer(
     record_direct_completion_usage(completion, telemetry, elapsed_ms)
     content = completion.choices[0].message.content or ""
     try:
-        return build_mermaid_from_direct_diagram_spec(parse_direct_diagram_spec(content, resolved_type))
+        return normalize_direct_diagram_output(
+            build_mermaid_from_direct_diagram_spec(parse_direct_diagram_spec(content, resolved_type))
+        )
     except Exception as exc:
         logger.warning("diagram json generation failed, falling back to raw Mermaid: %s", exc)
 
@@ -4086,7 +4135,7 @@ def generate_direct_diagram_answer(
     fallback_elapsed_ms = (time.perf_counter() - fallback_started) * 1000.0
     record_direct_completion_usage(fallback_completion, telemetry, fallback_elapsed_ms)
     fallback_content = fallback_completion.choices[0].message.content
-    return fallback_content.strip() if fallback_content else "No answer generated."
+    return normalize_direct_diagram_output(fallback_content or "")
 
 
 def generate_direct_mode_answer(
@@ -4200,8 +4249,13 @@ def execute_direct_ui_mode_request(
             latency_ms=(time.perf_counter() - telemetry._started_perf) * 1000.0,
         )
         debug_payload["telemetry"] = response_telemetry
+    response_type = "diagram" if ui_mode == "diagrams" else "text"
+    response_format = "mermaid" if ui_mode == "diagrams" else "markdown"
     return QueryResponse(
         answer=answer,
+        type=response_type,
+        format=response_format,
+        content=answer,
         citations=citations,
         graph={},
         evidence=[],

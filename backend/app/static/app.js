@@ -155,160 +155,123 @@ ${AUDIT_REPORT_CONTRACT}`,
 
 const DIAGRAM_WORKFLOWS = {
   systemArchitecture: {
-    title: "System Architecture: National Hazard Run",
+    title: "System Architecture",
     reportType: "System Architecture Diagram",
     followUps: [
       "Refine architecture diagram around ingestion and compute boundaries",
       "Add external systems and deployment boundary nodes",
       "Generate a zoomed-in diagram for the hazard engine subsystem",
     ],
-    prompt: `You are a senior software architect analyzing a code repository.
+    requestText: `Generate a Mermaid flowchart of the high-level system architecture for this codebase.
 
-Your task is to generate a HIGH-LEVEL SYSTEM ARCHITECTURE DIAGRAM for this repository.
-
-Follow these steps carefully:
-1) Scan the entire repository structure.
-2) Identify major system components including entry scripts, core computational modules, data/config folders, build tools, external dependencies, and output artifacts.
-3) Group related components into logical subsystems such as orchestration scripts, compute engine, model logic, configuration, data sources, outputs, and build system.
-4) Identify directional relationships between components.
-5) Produce a clean architecture diagram.
-
-Primary scope for this repository:
-- System boundaries centered on run orchestration, regional hazard scripts, core hazard binaries, config/data inputs, and outputs.
-
-OUTPUT FORMAT:
-- Return ONLY a Mermaid diagram.
-- Use flowchart TD.
-- Keep the diagram high level.
-- Use logical system components instead of individual files.
-- Limit the diagram to 8-12 nodes.
-- Prefer clarity over completeness.
-- At least 6 nodes must be traceable to real repository components/scripts/binaries.
-- No explanatory prose outside Mermaid.`,
+Requirements:
+- Return Mermaid only
+- Use flowchart TD
+- Show main components, services, storage layers, external dependencies, and how they interact
+- Keep the diagram high-level and engineering-friendly
+- Do not include prose`,
   },
   executionPipeline: {
-    title: "Execution Pipeline: run_all_hazard.sh",
-    reportType: "Execution Pipeline Diagram",
+    title: "Runtime Flow",
+    reportType: "Runtime Flow Diagram",
     followUps: [
       "Trace startup path from the primary run script in more detail",
       "Add optional and error branches in the pipeline",
       "Generate pipeline focused only on output generation stages",
     ],
-    prompt: `You are a software engineer investigating how a repository executes.
+    requestText: `Generate a Mermaid flowchart of the main runtime execution flow for this repository.
 
-Your task is to produce an EXECUTION PIPELINE DIAGRAM.
+Requirements:
+- Return Mermaid only
+- Use flowchart TD
+- Show the primary entrypoint, main processing steps, key branching points, and final outputs
+- Keep it readable for a new engineer onboarding to the system
+- Do not include prose`,
+  },
+  retrievalFlow: {
+    title: "Retrieval Flow",
+    reportType: "Retrieval Flow Diagram",
+    followUps: [
+      "Zoom into the retrieval and rerank stages",
+      "Expand the frontend-to-backend handoff in more detail",
+      "Generate a narrower RAG-only data flow diagram",
+    ],
+    requestText: `Generate a Mermaid flowchart of the retrieval and data flow in this system.
 
-Follow these steps:
-1) Identify all entry points such as shell scripts, main programs, run scripts, and Makefile targets.
-2) Determine execution order.
-3) Identify intermediate steps such as preprocessing, model initialization, simulation, aggregation, and output generation.
-4) Trace the runtime sequence.
-5) Generate a pipeline diagram.
+Requirements:
+- Return Mermaid only
+- Use flowchart TD
+- Show user input, API handling, retrieval steps, ranking, context assembly, model generation, and frontend output
+- Keep labels concise
+- Do not include prose`,
+  },
+  dependencyGraph: {
+    title: "Dependency Map",
+    reportType: "Dependency Map",
+    followUps: [
+      "Expand dependency graph around the most central module",
+      "Map dependency chains starting from run scripts",
+      "Highlight possible circular dependencies and shared utility overload",
+    ],
+    requestText: `Generate a Mermaid diagram showing the major module or dependency relationships in this repository.
 
-Primary scope for this repository:
-- run_all_hazard.sh sequence: environment checks -> make -> getmeanrjf.v2 preprocessing -> hazrun_casc_2014.sh / hazrun_ceus_2014.sh / hazrun_wus_2014.sh -> logs/out outputs.
+Requirements:
+- Return Mermaid only
+- Use flowchart TD
+- Show the most important modules, files, or subsystems and their relationships
+- Prioritize clarity over completeness
+- Do not include prose`,
+  },
+  auditDiagram: {
+    title: "Audit Diagram",
+    reportType: "Audit Diagram",
+    followUps: [
+      "Convert the highest-risk audit areas into a smaller follow-up diagram",
+      "Add evidence-backed risk labels to the current diagram",
+      "Generate an audit diagram focused on maintainability hotspots",
+    ],
+    requestText: `Generate a Mermaid flowchart from the repository audit results.
 
-OUTPUT FORMAT:
-- Return ONLY a Mermaid diagram.
-- Use flowchart LR.
-- Must represent execution order.
-- Use left-to-right flow.
-- Max 10 nodes.
-- Avoid low-level function names.
-- Include the orchestration and regional execution stages when evidence exists.
-- No explanatory prose outside Mermaid.`,
+Requirements:
+- Return Mermaid only
+- Use flowchart TD
+- Show the major architectural flow, system risks, and key process paths discovered in the audit
+- Keep it concise and visually readable
+- Do not include prose`,
   },
   dataFlow: {
-    title: "Data Flow: conf/* to out/*",
+    title: "Repository Data Flow",
     reportType: "Data Flow Diagram",
     followUps: [
       "Add more detail for configuration and lookup-table lineage",
       "Show intermediate datasets and transformation boundaries",
       "Generate data flow only for one critical output artifact",
     ],
-    prompt: `You are a data systems architect.
+    requestText: `Generate a Mermaid flowchart of the repository data flow.
 
-Your goal is to produce a DATA FLOW DIAGRAM for the repository.
-
-Steps:
-1) Identify major data inputs including configuration files, scientific datasets, model parameters, and lookup tables.
-2) Identify transformations that process the data.
-3) Identify outputs including generated maps, simulation results, and processed datasets.
-4) Trace how data moves through the system.
-5) Create a clean data lineage diagram.
-
-Primary scope for this repository:
-- conf/WUS, conf/CEUS, conf/CASC input files and scripts/GR tables flowing into hazard executables and then to logs/out artifacts.
-
-OUTPUT FORMAT:
-- Return ONLY a Mermaid diagram.
-- Use flowchart TD.
-- Show transformations clearly.
-- Use descriptive node names.
-- Max 12 nodes.
-- Include input -> transform -> output lineage with concrete repository anchors.
-- No explanatory prose outside Mermaid.`,
-  },
-  dependencyGraph: {
-    title: "Dependency Graph: Core Hazard Engines",
-    reportType: "Module Dependency Graph",
-    followUps: [
-      "Expand dependency graph around the most central module",
-      "Map dependency chains starting from run scripts",
-      "Highlight possible circular dependencies and shared utility overload",
-    ],
-    prompt: `You are analyzing the internal code dependencies of a repository.
-
-Your task is to create a MODULE DEPENDENCY GRAPH.
-
-Steps:
-1) Scan the source code.
-2) Identify modules, packages, or major files.
-3) Detect dependency relationships including imports, module usage, and function calls.
-4) Identify the most central modules.
-5) Focus only on the most important modules.
-
-Primary scope for this repository:
-- Core engine set: hazgridXnga13l, hazFXnga13l, hazSUBX, hazpoint, hazinterpnga and utility/build dependencies tied to Makefile and scripts.
-
-OUTPUT FORMAT:
-- Return ONLY a Mermaid graph.
-- Use graph TD.
-- Show directional dependencies.
-- Focus on the top 10 most important modules.
-- Do not include every file.
-- Prefer modules that are demonstrably central in entry scripts or build targets.
-- No explanatory prose outside Mermaid.`,
+Requirements:
+- Return Mermaid only
+- Use flowchart TD
+- Show inputs, transformations, and outputs with concrete repository anchors
+- Keep the diagram concise and engineering-friendly
+- Do not include prose`,
   },
   buildRuntime: {
-    title: "Build & Runtime: Makefile + gfortran",
-    reportType: "Build and Runtime Environment Diagram",
+    title: "Build and Runtime",
+    reportType: "Build and Runtime Diagram",
     followUps: [
       "Add CI/CD and deployment stages to the environment diagram",
       "Expand runtime dependency nodes for configs and data mounts",
       "Generate a reproducibility-focused build/run diagram",
     ],
-    prompt: `You are a build systems engineer.
+    requestText: `Generate a Mermaid flowchart of the build and runtime environment for this repository.
 
-Your task is to create a BUILD AND RUNTIME ENVIRONMENT DIAGRAM.
-
-Steps:
-1) Identify build system details such as Makefile, shell scripts, and compiler commands.
-2) Identify compiler and toolchain.
-3) Identify runtime dependencies such as datasets, environment variables, and config files.
-4) Identify the final executable/runtime target and outputs.
-
-Primary scope for this repository:
-- Makefile/gfortran build chain producing bin/* executables, then runtime scripts consuming conf/* and producing out/logs.
-
-OUTPUT FORMAT:
-- Return ONLY a Mermaid diagram.
-- Use flowchart TD.
-- Focus on build and runtime environment.
-- Avoid low-level file detail.
-- Keep the diagram readable.
-- Include both compile-time and run-time stages.
-- No explanatory prose outside Mermaid.`,
+Requirements:
+- Return Mermaid only
+- Use flowchart TD
+- Show compile-time stages, runtime dependencies, and produced artifacts
+- Keep the diagram readable
+- Do not include prose`,
   },
 };
 
@@ -396,16 +359,9 @@ const PROMPT_MODE_CATEGORIES = [
     prompts: [
       DIAGRAM_WORKFLOWS.systemArchitecture.title,
       DIAGRAM_WORKFLOWS.executionPipeline.title,
-      DIAGRAM_WORKFLOWS.dataFlow.title,
-    ],
-  },
-  {
-    key: "diagram-types-advanced",
-    title: "DIAGRAMS ADVANCED",
-    mode: "diagrams",
-    prompts: [
+      DIAGRAM_WORKFLOWS.retrievalFlow.title,
       DIAGRAM_WORKFLOWS.dependencyGraph.title,
-      DIAGRAM_WORKFLOWS.buildRuntime.title,
+      DIAGRAM_WORKFLOWS.auditDiagram.title,
     ],
   },
   {
@@ -1044,6 +1000,12 @@ function buildAuditDispatch(promptText) {
 function inferDiagramType(text) {
   const normalized = String(text || "").trim().toLowerCase();
   if (!normalized) return state.activeDiagramType || "systemArchitecture";
+  if (normalized.includes("retrieval") || normalized.includes("rag")) {
+    return "retrievalFlow";
+  }
+  if (normalized.includes("audit diagram") || normalized.includes("risk map") || normalized.includes("audit view")) {
+    return "auditDiagram";
+  }
   if (normalized.includes("execution") || normalized.includes("pipeline") || normalized.includes("runtime flow")) {
     return "executionPipeline";
   }
@@ -1075,7 +1037,7 @@ function buildDiagramWorkflowPrompt(diagramType, userIntent = "") {
   const scopeHint = NSHMP_DIAGRAM_SCOPE_HINTS[resolvedType] || NSHMP_DIAGRAM_SCOPE_HINTS.systemArchitecture;
   const repoFacts = NSHMP_DIAGRAM_REPO_FACTS.map((fact) => `- ${fact}`).join("\n");
 
-  return `${workflow.prompt}
+  return `${workflow.requestText || workflow.title}
 
 Global guardrails:
 - First scan repo, then reason, then draw.
@@ -1101,7 +1063,7 @@ function buildDiagramDispatch(promptText) {
   return {
     diagramType,
     displayText: DIAGRAM_WORKFLOWS[diagramType].title,
-    requestText: String(promptText || "").trim() || DIAGRAM_WORKFLOWS[diagramType].title,
+    requestText: DIAGRAM_WORKFLOWS[diagramType].requestText || String(promptText || "").trim() || DIAGRAM_WORKFLOWS[diagramType].title,
   };
 }
 
@@ -1622,6 +1584,70 @@ function normalizeDiagramText(text) {
     .replace(/\s*["']{1,3}$/, "")
     .trim();
   return next || raw;
+}
+
+const MERMAID_VALID_PREFIXES = [
+  "flowchart td",
+  "flowchart lr",
+  "graph td",
+  "graph lr",
+  "sequencediagram",
+  "classdiagram",
+];
+const DIAGRAM_FAILURE_MERMAID = "flowchart TD\nA[Diagram generation failed]";
+let mermaidInitialized = false;
+let mermaidRenderCount = 0;
+
+function ensureMermaid() {
+  const api = window.mermaid;
+  if (!api) return null;
+  if (!mermaidInitialized) {
+    api.initialize({
+      startOnLoad: false,
+      securityLevel: "loose",
+      theme: "neutral",
+      flowchart: { useMaxWidth: true, htmlLabels: true },
+    });
+    mermaidInitialized = true;
+  }
+  return api;
+}
+
+function normalizeDiagramResponsePayload(data) {
+  const normalized = normalizeDiagramText(data?.content || data?.answer || "");
+  const lowered = normalized.toLowerCase();
+  const looksLikeMermaid = MERMAID_VALID_PREFIXES.some((prefix) => lowered.startsWith(prefix));
+  return {
+    type: looksLikeMermaid || String(data?.type || "").toLowerCase() === "diagram" ? "diagram" : "text",
+    format: looksLikeMermaid || String(data?.format || "").toLowerCase() === "mermaid" ? "mermaid" : "text",
+    content: looksLikeMermaid ? normalized : DIAGRAM_FAILURE_MERMAID,
+  };
+}
+
+function renderMermaidFallback(target, chartText) {
+  const pre = document.createElement("pre");
+  pre.className = "diagram-fallback";
+  pre.textContent = chartText || DIAGRAM_FAILURE_MERMAID;
+  target.replaceChildren(pre);
+}
+
+async function renderMermaidDiagram(target, chartText) {
+  const api = ensureMermaid();
+  if (!api || !isLikelyMermaidDiagram(chartText)) {
+    renderMermaidFallback(target, chartText);
+    return;
+  }
+  const renderId = `mermaid-diagram-${Date.now()}-${++mermaidRenderCount}`;
+  try {
+    const { svg, bindFunctions } = await api.render(renderId, chartText);
+    target.innerHTML = svg;
+    if (typeof bindFunctions === "function") {
+      bindFunctions(target);
+    }
+  } catch (_error) {
+    renderMermaidFallback(target, chartText);
+    setStatus("Diagram render failed; showing Mermaid source", "warn");
+  }
 }
 
 const HYBRID_GRAPH_COLORS = {
@@ -2381,7 +2407,7 @@ function renderHybridEvidencePanel(panel, evidenceRows = [], graphPayload = {}, 
 
 function isLikelyMermaidDiagram(text) {
   const normalized = normalizeDiagramText(text).trim().toLowerCase();
-  return normalized.startsWith("flowchart ") || normalized.startsWith("graph ");
+  return MERMAID_VALID_PREFIXES.some((prefix) => normalized.startsWith(prefix));
 }
 
 function addMessage(role, text, citations = [], meta = {}) {
@@ -2392,13 +2418,26 @@ function addMessage(role, text, citations = [], meta = {}) {
   const citationsWrap = node.querySelector(".citations");
   const metaRow = node.querySelector(".message-meta");
   let renderedText = role === "assistant" ? stripMarkdownBold(text) : text;
+  const isDiagramResponse =
+    role === "assistant" &&
+    meta.modeValue === "diagrams" &&
+    ((meta.responseType === "diagram" && meta.responseFormat === "mermaid") || isLikelyMermaidDiagram(renderedText));
   if (role === "assistant" && meta.modeValue === "diagrams") {
     renderedText = normalizeDiagramText(renderedText);
   }
 
   article.classList.add(role);
-  bubble.textContent = renderedText;
   metaRow.textContent = buildMetaText(role, meta);
+
+  if (isDiagramResponse) {
+    bubble.classList.add("diagram-bubble");
+    const diagramCanvas = document.createElement("div");
+    diagramCanvas.className = "diagram-canvas";
+    bubble.replaceChildren(diagramCanvas);
+    renderMermaidDiagram(diagramCanvas, renderedText);
+  } else {
+    bubble.textContent = renderedText;
+  }
 
   if (role === "assistant") {
     if (meta.resultType) {
@@ -2411,7 +2450,7 @@ function addMessage(role, text, citations = [], meta = {}) {
     const copyAnswerBtn = document.createElement("button");
     copyAnswerBtn.type = "button";
     copyAnswerBtn.className = "tiny-btn";
-    copyAnswerBtn.textContent = "Copy answer";
+    copyAnswerBtn.textContent = isDiagramResponse ? "Copy Mermaid" : "Copy answer";
     copyAnswerBtn.addEventListener("click", () => {
       copyText(renderedText, "Answer copied");
     });
@@ -2812,7 +2851,7 @@ async function runModeQuery(mode, question, files = []) {
 
   if (uiMode === "diagrams") {
     const requestTopK = Math.min(20, Math.max(state.topK, 8));
-    let data = hasUploads
+    const data = hasUploads
       ? await postMultipart("/api/query/upload", {
           question,
           topK: requestTopK,
@@ -2835,41 +2874,10 @@ async function runModeQuery(mode, question, files = []) {
           scope,
           project_id: projectId,
         });
-
-    if (!isLikelyMermaidDiagram(data.answer || "")) {
-      const strictQuestion = `${question}
-
-Validation retry:
-- Return ONLY raw Mermaid syntax (no markdown fences, no prose).
-- Start with "flowchart" or "graph".
-- Use concrete repository anchors and deterministic edges.`;
-      data = hasUploads
-        ? await postMultipart("/api/query/upload", {
-            question: strictQuestion,
-            topK: requestTopK,
-            files,
-            debug,
-            mode: apiMode,
-            uiMode,
-            diagramType,
-            scope,
-            projectId,
-            persistUploads,
-          })
-        : await postJson("/api/query", {
-            question: strictQuestion,
-            top_k: requestTopK,
-            debug,
-            mode: apiMode,
-            ui_mode: uiMode,
-            diagram_type: diagramType,
-            scope,
-            project_id: projectId,
-          });
-    }
+    const diagramPayload = normalizeDiagramResponsePayload(data);
 
     return {
-      text: data.answer || "No answer returned.",
+      text: diagramPayload.content,
       citations: data.citations || [],
       evidence: data.evidence_strength || {},
       debug: data.debug || null,
@@ -2878,6 +2886,8 @@ Validation retry:
         uiMode,
         uiMode === "diagrams" ? state.activeDiagramType : null,
       ),
+      responseType: diagramPayload.type,
+      responseFormat: diagramPayload.format,
       followUps: diagramFollowUpsForType(state.activeDiagramType),
       hybridGraph: data.graph || {},
       hybridEvidence: data.evidence || [],
@@ -3001,6 +3011,8 @@ async function submitQuestion(options = {}) {
       modeLabel: MODE_CONFIG[state.mode].label,
       modeValue: state.mode,
       resultType: result.resultType || defaultResultTypeForMode(state.mode),
+      responseType: result.responseType || "text",
+      responseFormat: result.responseFormat || "text",
       followUps: normalizeFollowUps(result.followUps || []),
       hybridGraph: result.hybridGraph || {},
       hybridEvidence: result.hybridEvidence || [],
@@ -3196,7 +3208,7 @@ modeButtons.forEach((item) => {
     if (mode === "diagrams") {
       setMode("diagrams");
       openSuggestionModal({
-        filterKeys: ["diagram-types", "diagram-types-advanced"],
+        filterKeys: ["diagram-types"],
         focusKey: "diagram-types",
       });
       return;
